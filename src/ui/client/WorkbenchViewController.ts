@@ -140,21 +140,57 @@ export class WorkbenchViewController {
       this.getElementById('globalAlertBanner')?.classList.remove('visible');
     });
 
-    // 2. 顶部当前登录成员身份切换
+    // 1b. 浅色 / 深色现代主题一键切换
+    this.getElementById('btnThemeToggle')?.addEventListener('click', () => {
+      const htmlEl = document.documentElement;
+      const currentTheme = htmlEl.getAttribute('data-theme') ?? 'light';
+      const nextTheme = currentTheme === 'dark' ? 'light' : 'dark';
+      htmlEl.setAttribute('data-theme', nextTheme);
+      const btn = this.getElementById('btnThemeToggle');
+      if (btn) {
+        btn.textContent = nextTheme === 'dark' ? '☀️ 浅色' : '🌙 深色';
+      }
+    });
+
+    // 2. 顶部当前登录成员身份切换（支持胶囊按钮一键切换 & 下拉同步）
+    const switchActorIdentity = async (targetUserId: string): Promise<void> => {
+      this.apiClient.setActiveActorUserId(targetUserId);
+      const topSelect = this.getElementById<HTMLSelectElement>('actorIdentitySelect');
+      if (topSelect) {
+        topSelect.value = targetUserId;
+      }
+      document.querySelectorAll<HTMLElement>('.role-chip-btn[data-actor]').forEach((chip) => {
+        if (chip.getAttribute('data-actor') === targetUserId) {
+          chip.classList.add('active-role-chip');
+        } else {
+          chip.classList.remove('active-role-chip');
+        }
+      });
+      await this.refreshState();
+      this.connectSseStream();
+      const currentUser = this.currentState?.rbacContext?.currentUser;
+      if (currentUser) {
+        this.showBannerAlert(
+          `已切换当前登录成员为：${currentUser.displayName} (${currentUser.jobTitle}) — 页面共享完整的项目步骤、Agent 讨论结论与同事评论，你的专属步骤确认权限已生效`,
+          'success',
+        );
+      }
+    };
+
+    document.querySelectorAll<HTMLElement>('.role-chip-btn[data-actor]').forEach((chip) => {
+      chip.addEventListener('click', () => {
+        const actor = chip.getAttribute('data-actor');
+        if (actor) {
+          void switchActorIdentity(actor);
+        }
+      });
+    });
+
     this.getElementById<HTMLSelectElement>('actorIdentitySelect')?.addEventListener(
       'change',
-      async (ev) => {
+      (ev) => {
         const selectEl = ev.target as HTMLSelectElement;
-        this.apiClient.setActiveActorUserId(selectEl.value);
-        await this.refreshState();
-        this.connectSseStream();
-        const currentUser = this.currentState?.rbacContext?.currentUser;
-        if (currentUser) {
-          this.showBannerAlert(
-            `已切换当前登录成员为：${currentUser.displayName} (${currentUser.jobTitle}) — 页面共享完整的项目步骤、Agent 讨论结论与同事评论，你的专属步骤确认权限已生效`,
-            'success',
-          );
-        }
+        void switchActorIdentity(selectEl.value);
       },
     );
 
@@ -727,11 +763,13 @@ export class WorkbenchViewController {
         ? `<span class="pill pill-blue" style="font-size:10.5px;">🎯 我负责的步骤 (${meta.specialistLabel})</span>`
         : `<span class="pill pill-muted" style="font-size:10.5px;">责任人: ${meta.specialistLabel}</span>`;
 
+      const stepLabel = `STEP 0${meta.stepNumber}`;
       if (!snap) {
         card.innerHTML = `
           <div class="stage-card-header">
             <div>
-              <div class="stage-name">${meta.name}</div>
+              <span class="step-index-badge">${stepLabel}</span>
+              <div class="stage-name">${meta.shortName}</div>
               <div class="stage-role">${meta.agentDisplayName}</div>
             </div>
             <span class="pill pill-muted">待启动</span>
@@ -739,15 +777,16 @@ export class WorkbenchViewController {
           <div>${domainBadgeHtml}</div>
           <div class="stage-summary">${meta.stepGoal}</div>
           <div class="stage-metrics">
-            <span>💬 团队评论: <strong>${stageCommentsCount}</strong></span>
-            <span>点击查看本步骤详情</span>
+            <span>评论 <strong>${stageCommentsCount}</strong></span>
+            <span>查看步骤 →</span>
           </div>
         `;
       } else {
         card.innerHTML = `
           <div class="stage-card-header">
             <div>
-              <div class="stage-name">${meta.name}</div>
+              <span class="step-index-badge">${stepLabel}</span>
+              <div class="stage-name">${meta.shortName}</div>
               <div class="stage-role">${meta.agentDisplayName}</div>
             </div>
             ${StageDisplayFormatter.formatStateBadge(snap.state, snap.cacheHit)}
@@ -755,8 +794,8 @@ export class WorkbenchViewController {
           <div>${domainBadgeHtml}</div>
           <div class="stage-summary">${snap.artifactSummary}</div>
           <div class="stage-metrics">
-            <span>💬 团队评论: <strong>${stageCommentsCount}</strong></span>
-            <span>点击查看 Agent 讨论与产出 →</span>
+            <span>评论 <strong>${stageCommentsCount}</strong></span>
+            <span style="color:var(--accent-primary); font-weight:600;">查看讨论与产出 →</span>
           </div>
         `;
       }
@@ -949,22 +988,26 @@ export class WorkbenchViewController {
         for (const cmt of stageComments) {
           const card = document.createElement('div');
           card.className = 'comment-card';
+          const initialChar = cmt.authorName.trim().charAt(0) || 'U';
           const catBadge =
             cmt.category === 'APPROVAL_NOTE'
-              ? '<span class="pill pill-green">✅ 步骤签核批注</span>'
+              ? '<span class="pill pill-green">步骤签核</span>'
               : cmt.category === 'REVISION_REQUEST'
-                ? '<span class="pill pill-amber">↩️ 回退修改意见</span>'
-                : '<span class="pill pill-blue">💬 团队协同评论</span>';
+                ? '<span class="pill pill-amber">修改建议</span>'
+                : '<span class="pill pill-blue">团队评论</span>';
 
           card.innerHTML = `
             <div class="comment-header">
-              <div>
-                <strong>${cmt.authorBadge} ${cmt.authorName}</strong>
-                <span style="font-size:11px; color:var(--text-muted); margin-left:4px;">(${cmt.authorJobTitle})</span>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="avatar-circle">${initialChar}</span>
+                <div>
+                  <strong style="font-size:12.5px;">${cmt.authorName}</strong>
+                  <span style="font-size:11px; color:var(--text-muted); margin-left:4px;">${cmt.authorJobTitle}</span>
+                </div>
               </div>
               ${catBadge}
             </div>
-            <div style="font-size:12.5px; color:var(--text-primary); line-height:1.5;">${cmt.content}</div>
+            <div style="font-size:12.5px; color:var(--text-primary); line-height:1.55; padding-left:34px;">${cmt.content}</div>
           `;
           commentsListEl.appendChild(card);
         }
