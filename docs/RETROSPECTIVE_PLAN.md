@@ -1,0 +1,40 @@
+# 复盘任务与成本控制指标检测规范 (`src/telemetry/` & `src/retrospective/`)
+
+为了避免多智能体系统在企业落地中出现“Token 账单失控”、“无限重试死循环”或“意图偏离”，系统内置了独立的复盘与成本控制检测引擎。
+
+---
+
+## 一、 核心复盘指标定义
+
+### 1. 指标 (a)：双层缓存命中率 (`PromptCacheManager.ts`)
+* **设计机制**：
+  * **L1 精确上下文签名缓存 (`L1_EXACT`)**：按 `阶段 + Agent 角色 + 提案标题 + 核心需求集合 + 人类回退指令` 精确匹配。在总管 Agent 触发局部回退重跑或相同分支回归时实现 100% 拦截。
+  * **L2 归一化语义意图指纹缓存 (`L2_SEMANTIC_INTENT`)**：按 `阶段 + Agent 角色 + 识别出的意图编码 (intentCode) + 归一化需求指纹` 匹配。当不同项目提交同构模块需求时直接命中。
+* **核心公式**：
+  $$\text{Cache Hit Rate} = \frac{\text{L1 Hits} + \text{L2 Hits}}{\text{Total Lookups}} \times 100\%$$
+* **SLA 目标基线**：`>= 30.0%`，并实时统计 `savedTokensTotal`（累计节省 Tokens）与 `costSavingsRatioPercent`（缓存节流比）。
+
+### 2. 指标 (b)：意图识别到最终执行结果达成率 & 重试分布 (`IntentFulfillmentTracker.ts`)
+* **设计机制**：
+  每次 Agent 调用从 `recognizeStageIntent()` 开始建立追踪链路（`IntentExecutionTraceRecord`），记录：
+  * 首次生成即通过契约校验（`FULFILLED_ON_FIRST_TRY`）
+  * 命中缓存直通（`FULFILLED_VIA_CACHE`）
+  * 经过 $1 \sim N$ 次自愈重试后通过契约校验（`FULFILLED_AFTER_RETRY`）
+  * 协商超限上报人类（`ESCALATED_TO_HUMAN`）或契约彻底失败（`FAILED_CONTRACT`）
+* **核心统计项**：
+  1. **意图最终达成率 (`fulfillmentRatePercent`)**：目标基线 `>= 85.0%`
+  2. **首次直通率 (`firstPassSuccessRatePercent`)**：衡量无重试一次成活的比例
+  3. **平均重试次数 (`averageRetriesPerInvocation`)**：目标基线 `<= 0.65 次/调用`
+  4. **重试次数分布直方图 (`retryDistribution`)**：分别统计 `0 次重试`、`1 次重试`、`>=2 次重试` 的调用分布，以及因重试额外损耗的 `totalRetryOverheadTokens`。
+
+---
+
+## 二、 独立复盘评测任务执行方式
+
+在命令行运行以下命令即可启动多场景基准复盘任务（`src/retrospective/runRetrospective.ts`）：
+
+```bash
+npm run retrospective:eval
+```
+
+该任务会自动执行冷启动自愈重试、PM-PD 协商熔断裁决、总管对话式 DAG 分叉回退、以及同构提案热缓存命中四个完整阶段，并输出 SLA 达标诊断与优化建议。

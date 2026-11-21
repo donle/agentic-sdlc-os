@@ -1,0 +1,37 @@
+{
+  "name": "agentic-sdlc-os",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "AI 原生多智能体研发协同管理系统（单机私有化、面向对象模块化架构、DAG分叉回退、风险动态门禁、成本与复盘指标引擎）",
+  "private": true,
+  "scripts": {
+    "build:ui": "tsc -p tsconfig.ui.json",
+    "start": "npm run build:ui && node src/server/WorkbenchServer.ts",
+    "retrospective:eval": "node src/retrospective/runRetrospective.ts",
+    "typecheck:backend": "tsc -p tsconfig.json --noEmit",
+    "typecheck:frontend": "tsc -p tsconfig.ui.json --noEmit",
+    "typecheck": "npm run typecheck:backend && npm run typecheck:frontend",
+    "lint:backend": "eslint \"src/**/*.ts\" \"tests/**/*.ts\" --ignore-pattern \"src/ui/**\"",
+    "lint:frontend": "eslint \"src/ui/client/**/*.ts\"",
+    "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "format": "prettier --write \"src/**/*.{ts,html,css}\" \"tests/**/*.ts\" \"configs/**/*.yaml\" \"*.{json,mjs,md}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,html,css}\" \"tests/**/*.ts\" \"configs/**/*.yaml\" \"*.{json,mjs,md}\"",
+    "test": "node --test tests/*.spec.ts",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm test"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.15.0",
+    "prettier": "^3.10.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.73.0"
+  }
+}

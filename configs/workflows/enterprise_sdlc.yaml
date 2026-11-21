@@ -1,0 +1,91 @@
+# B 端客户可微调的声明式工作流与风险门禁配置 (Declarative Workflow DSL)
+workflow:
+  id: 'enterprise_standard_sdlc_v1'
+  name: '企业级全栈研发标准流水线 (提案至 QA 全闭环)'
+  deploymentMode: 'SINGLE_NODE_ON_PREMISE'
+
+  # 全局协商与成本熔断守卫配置
+  guardrails:
+    maxNegotiationTurns: 3
+    maxExecutionRetries: 2
+    tokenBudgetLimit: 120000
+    enableSemanticCache: true
+    enableFalseConsensusDiffGuard: true
+    highRiskScoreThreshold: 60
+
+  # 混合模型路由策略 (BYOM: 本地私有模型 + 高阶推理模型)
+  modelRouting:
+    PRIVACY_SENSITIVE:
+      provider: 'local-vllm'
+      modelName: 'qwen2.5-coder-32b-instruct-int4'
+      costPer1kTokensUsd: 0.0002
+    HIGH_REASONING:
+      provider: 'private-gateway'
+      modelName: 'claude-3-7-sonnet-enterprise'
+      costPer1kTokensUsd: 0.0030
+
+  # 阶段拓扑定义 (客户可通过增删改节点实现流程微调，无需修改核心代码)
+  stages:
+    - stageId: 'STAGE_1_PM'
+      displayName: 'Stage 1: PM 需求分析与埋点规划'
+      agentRole: 'PM_AGENT'
+      modelTier: 'HIGH_REASONING'
+      gatePolicy:
+        mode: 'RISK_BASED'
+        lowRiskAction: 'AUTO_PASS_WITH_AUDIT'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: '产品负责人 / 业务发起人'
+
+    - stageId: 'STAGE_2_PD'
+      displayName: 'Stage 2: PD 交互与 UI 规范设计'
+      agentRole: 'PD_AGENT'
+      modelTier: 'HIGH_REASONING'
+      negotiateWithStageId: 'STAGE_1_PM'
+      escalationAgentRole: 'SUPERVISOR_AGENT'
+      gatePolicy:
+        mode: 'RISK_BASED'
+        lowRiskAction: 'AUTO_PASS_WITH_AUDIT'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: '体验设计负责人 / PM'
+
+    - stageId: 'STAGE_3A_TECH_SPEC'
+      displayName: 'Stage 3a: 架构契约与表结构设计'
+      agentRole: 'TECH_LEAD_AGENT'
+      modelTier: 'HIGH_REASONING'
+      gatePolicy:
+        mode: 'RISK_BASED'
+        lowRiskAction: 'AUTO_PASS_WITH_AUDIT'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: '系统架构师 / Tech Lead'
+
+    - stageId: 'STAGE_3B_ENGINEER'
+      displayName: 'Stage 3b: 隔离沙箱编码与自测'
+      agentRole: 'ENGINEER_AGENT'
+      modelTier: 'PRIVACY_SENSITIVE'
+      gatePolicy:
+        mode: 'RISK_BASED'
+        lowRiskAction: 'AUTO_PASS_WITH_AUDIT'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: '核心研发工程师'
+
+    - stageId: 'STAGE_4_QA'
+      displayName: 'Stage 4: QA 自动化验收与回归测试'
+      agentRole: 'QA_AGENT'
+      modelTier: 'PRIVACY_SENSITIVE'
+      negotiateWithStageId: 'STAGE_3B_ENGINEER'
+      escalationAgentRole: 'SUPERVISOR_AGENT'
+      gatePolicy:
+        mode: 'FORCE_HUMAN_GATE'
+        lowRiskAction: 'BLOCK_FOR_HUMAN'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: 'QA 负责人 / 发布经理'
+
+    - stageId: 'STAGE_5_DA'
+      displayName: 'Stage 5: DA 埋点核验与发布复盘'
+      agentRole: 'DA_AGENT'
+      modelTier: 'PRIVACY_SENSITIVE'
+      gatePolicy:
+        mode: 'RISK_BASED'
+        lowRiskAction: 'AUTO_PASS_WITH_AUDIT'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: '数据分析师 / BI 负责人'

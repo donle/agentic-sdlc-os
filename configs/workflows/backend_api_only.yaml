@@ -1,0 +1,66 @@
+# B 端客户可微调的声明式工作流配置 — 纯后端 API 研发模板 (跳过 Stage 2 PD 交互设计节点)
+workflow:
+  id: 'backend_api_only_sdlc_v1'
+  name: '纯后端微服务与 API 研发流水线 (跳过 PD 节点)'
+  deploymentMode: 'SINGLE_NODE_ON_PREMISE'
+
+  guardrails:
+    maxNegotiationTurns: 2
+    maxExecutionRetries: 2
+    tokenBudgetLimit: 90000
+    enableSemanticCache: true
+    enableFalseConsensusDiffGuard: true
+    highRiskScoreThreshold: 60
+
+  modelRouting:
+    PRIVACY_SENSITIVE:
+      provider: 'local-vllm'
+      modelName: 'qwen2.5-coder-32b-instruct-int4'
+      costPer1kTokensUsd: 0.0002
+    HIGH_REASONING:
+      provider: 'private-gateway'
+      modelName: 'claude-3-7-sonnet-enterprise'
+      costPer1kTokensUsd: 0.0030
+
+  stages:
+    - stageId: 'STAGE_1_PM'
+      displayName: 'Stage 1: PM 需求分析与埋点规划'
+      agentRole: 'PM_AGENT'
+      modelTier: 'HIGH_REASONING'
+      gatePolicy:
+        mode: 'RISK_BASED'
+        lowRiskAction: 'AUTO_PASS_WITH_AUDIT'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: '后端产品经理'
+
+    - stageId: 'STAGE_3A_TECH_SPEC'
+      displayName: 'Stage 3a: 架构契约与表结构设计'
+      agentRole: 'TECH_LEAD_AGENT'
+      modelTier: 'HIGH_REASONING'
+      gatePolicy:
+        mode: 'RISK_BASED'
+        lowRiskAction: 'AUTO_PASS_WITH_AUDIT'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: '系统架构师 / Tech Lead'
+
+    - stageId: 'STAGE_3B_ENGINEER'
+      displayName: 'Stage 3b: 隔离沙箱编码与自测'
+      agentRole: 'ENGINEER_AGENT'
+      modelTier: 'PRIVACY_SENSITIVE'
+      gatePolicy:
+        mode: 'RISK_BASED'
+        lowRiskAction: 'AUTO_PASS_WITH_AUDIT'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: '核心研发工程师'
+
+    - stageId: 'STAGE_4_QA'
+      displayName: 'Stage 4: QA 自动化验收与回归测试'
+      agentRole: 'QA_AGENT'
+      modelTier: 'PRIVACY_SENSITIVE'
+      negotiateWithStageId: 'STAGE_3B_ENGINEER'
+      escalationAgentRole: 'SUPERVISOR_AGENT'
+      gatePolicy:
+        mode: 'FORCE_HUMAN_GATE'
+        lowRiskAction: 'BLOCK_FOR_HUMAN'
+        highRiskAction: 'BLOCK_FOR_HUMAN'
+        ownerRole: 'QA 负责人 / 发布经理'

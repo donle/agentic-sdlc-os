@@ -1,0 +1,46 @@
+version: "3.9"
+
+# 单机私有化一键部署编排 (Single-Node On-Premise Stack)
+services:
+  agentic-workbench:
+    build:
+      context: ..
+    container_name: agentic-sdlc-workbench
+    ports:
+      - "4300:4300"
+    environment:
+      - NODE_ENV=production
+      - PORT=4300
+      - DATABASE_URL=postgresql://sdlc_admin:sdlc_secret@postgres-pgvector:5432/agentic_sdlc
+      - LITELLM_GATEWAY_URL=http://litellm-router:4000
+      - SANDBOX_WORKTREE_ROOT=/var/lib/agentic-sdlc/worktrees
+    depends_on:
+      - postgres-pgvector
+      - litellm-router
+    restart: unless-stopped
+
+  postgres-pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: agentic-sdlc-pgvector
+    environment:
+      - POSTGRES_USER=sdlc_admin
+      - POSTGRES_PASSWORD=sdlc_secret
+      - POSTGRES_DB=agentic_sdlc
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-pgvector-schema.sql:/docker-entrypoint-initdb.d/01-init-pgvector-schema.sql:ro
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  litellm-router:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: agentic-sdlc-litellm
+    ports:
+      - "4000:4000"
+    environment:
+      - OLLAMA_API_BASE=http://host.docker.internal:11434
+    restart: unless-stopped
+
+volumes:
+  pgdata:

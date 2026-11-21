@@ -1,0 +1,691 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agentic SDLC OS — AI 原生多智能体研发协同管控工作台</title>
+    <link rel="stylesheet" href="/styles/workbench.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <!-- 左侧企业级网站导航与当前登录成员卡片 -->
+      <aside class="app-sidebar">
+        <div class="sidebar-brand">
+          <span class="brand-badge">SDLC OS</span>
+          <div>
+            <div class="brand-title">Agentic SDLC 协同网</div>
+            <div class="brand-subtitle">全员共享项目与多 Agent 协作平台</div>
+          </div>
+        </div>
+
+        <!-- 当前登录成员身份卡片 -->
+        <div class="user-identity-card admin-tier" id="sidebarUserIdentityCard">
+          <div style="display: flex; justify-content: space-between; align-items: center">
+            <span class="pill pill-purple" id="sidebarUserBadge">👑 ADMIN</span>
+            <span class="pill pill-cyan" id="sidebarUserTierTag">项目管理员</span>
+          </div>
+          <div style="font-size: 14px; font-weight: 700; margin-top: 2px" id="sidebarUserName">
+            王总管
+          </div>
+          <div style="font-size: 11.5px; color: var(--text-secondary)" id="sidebarUserTitle">
+            研发体系最高管理员 / PMO 总监
+          </div>
+          <div
+            style="
+              font-size: 11px;
+              color: var(--text-muted);
+              border-top: 1px dashed var(--border-subtle);
+              padding-top: 6px;
+              margin-top: 2px;
+            "
+            id="sidebarUserOwnedStages"
+          >
+            负责步骤: 全流程协同管理与跨步骤签核
+          </div>
+        </div>
+
+        <!-- 网站级多页面导航 -->
+        <nav class="sidebar-nav">
+          <div class="nav-section-label">项目与分步协同工作区 (全员共享)</div>
+          <button class="nav-item" data-route="projects" id="navRouteProjects">
+            <span>🏠 项目总览大厅 (Projects Hub)</span>
+          </button>
+          <button class="nav-item active-nav" data-route="workspace" id="navRouteWorkspace">
+            <span>📋 项目分步协同工作台 (Steps)</span>
+          </button>
+          <button class="nav-item" data-route="gate-center" id="navRouteGateCenter">
+            <span>⚖️ 待办确认与方案拍板中心</span>
+            <span class="pill pill-amber" id="navGateCountBadge">0</span>
+          </button>
+          <button class="nav-item" data-route="dag-supervisor" id="navRouteDagSupervisor">
+            <span>🌿 总管对话与版本演进历史</span>
+          </button>
+
+          <div class="nav-section-label">交付成果与团队空间</div>
+          <button class="nav-item" data-route="sandbox-explorer" id="navRouteSandboxExplorer">
+            <span>💻 交付源码与自动化测试</span>
+          </button>
+          <button class="nav-item" data-route="audit-rag" id="navRouteAuditRag">
+            <span>📜 协同动态与团队经验库</span>
+          </button>
+          <button class="nav-item" data-route="admin-governance" id="navRouteAdminGovernance">
+            <span>👥 团队角色权限与流程设置</span>
+          </button>
+        </nav>
+
+        <div style="font-size: 11px; color: var(--text-muted); padding: 6px">
+          <div>🟢 所有成员共享相同项目步骤与评论</div>
+          <div>🎯 步骤确认按钮按各成员专长权限开放</div>
+        </div>
+      </aside>
+
+      <!-- 右侧网站主内容区 -->
+      <div class="app-main-area">
+        <!-- 顶部网站全局栏：项目切换 + 新建项目 + 登录成员身份切换 -->
+        <header class="app-topbar">
+          <div class="topbar-group">
+            <span class="topbar-label">当前协作项目:</span>
+            <select
+              class="select-control"
+              id="projectRunSelect"
+              aria-label="切换当前协作项目"
+            ></select>
+            <button class="btn btn-primary" id="btnOpenNewProposalModal">+ 发起新研发项目</button>
+          </div>
+
+          <div class="topbar-group">
+            <span class="topbar-label">当前登录成员 (切换员工体验相同页面与不同权限):</span>
+            <select class="select-control" id="actorIdentitySelect" aria-label="切换当前登录用户">
+              <option value="user-admin-01">👑 王总管 — 项目最高管理员 (PROJECT_ADMIN)</option>
+              <option value="user-pm-01">📋 陈工 — 产品经理 (负责步骤 1 需求与步骤 2 拍板)</option>
+              <option value="user-pd-01">🎨 林工 — 体验设计师 (负责步骤 2 UI 与交互方案)</option>
+              <option value="user-tech-01">🏛️ 赵工 — 系统架构师 (负责步骤 3a 架构与表设计)</option>
+              <option value="user-eng-01">💻 刘工 — 研发工程师 (负责步骤 3b 代码实现)</option>
+              <option value="user-qa-01">🛡️ 孙工 — 测试负责人 (负责步骤 4 质量验收)</option>
+              <option value="user-da-01">📊 周工 — 数据分析师 (负责步骤 5 数据埋点归因)</option>
+            </select>
+
+            <select
+              class="select-control"
+              id="workflowTemplateSelect"
+              aria-label="声明式 YAML 工作流模板切换"
+            >
+              <option value="enterprise_sdlc.yaml">流程模板：全栈 6 步骤标准研发流</option>
+              <option value="backend_api_only.yaml">
+                流程模板：纯后端 4 步骤研发流 (跳过 UI 设计)
+              </option>
+            </select>
+
+            <span class="pill pill-muted" id="sseStatusPill">⚪ 正在同步...</span>
+          </div>
+        </header>
+
+        <!-- 全局提示横幅 -->
+        <div class="alert-banner" id="globalAlertBanner">
+          <span id="globalAlertText"></span>
+          <button class="btn" id="btnCloseAlertBanner" style="padding: 3px 8px; font-size: 11px">
+            关闭
+          </button>
+        </div>
+
+        <main class="workbench-container">
+          <!-- 当前项目顶部概览条（全员共享） -->
+          <section class="run-summary-bar" id="runSummaryBar">
+            <div class="run-meta">
+              <h2>
+                <span id="runTitle">正在加载研发项目...</span>
+                <span class="pill pill-amber" id="runStatusPill">LOADING</span>
+              </h2>
+              <div style="color: var(--text-secondary); font-size: 12.5px" id="runSubtitle"></div>
+              <div
+                style="font-size: 12px; color: #93c5fd; margin-top: 2px"
+                id="rolePerspectiveHint"
+              ></div>
+            </div>
+            <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap">
+              <span class="pill pill-blue" id="activeBranchPill">当前版本分支: branch-v1-main</span>
+              <span class="pill pill-amber" id="pendingActionBadge">待确认步骤: 0</span>
+            </div>
+          </section>
+
+          <!-- ================================================================== -->
+          <!-- 页面 1 (#/projects)：🏠 项目总览大厅 (Projects Hub & Portfolio) -->
+          <!-- ================================================================== -->
+          <div class="view-section" id="view-projects">
+            <section class="panel">
+              <div class="panel-header">
+                <div class="panel-title">
+                  <span>🏠 企业研发项目总览大厅 (全员共享项目进度、Agent 状态与团队讨论热度)</span>
+                </div>
+                <button class="btn btn-primary" id="btnNewProjectFromHub">
+                  + 发起新研发项目立项
+                </button>
+              </div>
+              <p style="font-size: 12.5px; color: var(--text-secondary); margin-bottom: 14px">
+                所有团队成员（产品经理、设计师、架构师、工程师、QA、数据分析师及管理员）登录后均共享下方所有项目的实时进展。点击任意项目即可进入【项目分步协同工作台】，查看每个步骤的
+                Agent 工作进展、讨论历史结论以及团队同事留下的评论。
+              </p>
+              <div class="project-portfolio-grid" id="projectsPortfolioGrid"></div>
+            </section>
+          </div>
+
+          <!-- ================================================================== -->
+          <!-- 页面 2 (#/workspace)：📋 项目分步协同工作台 (Step-by-Step Collaborative Workspace) -->
+          <!-- ================================================================== -->
+          <div class="view-section active-view" id="view-workspace">
+            <!-- 顶部步骤导航轨 -->
+            <section class="panel">
+              <div class="panel-header">
+                <div class="panel-title">
+                  <span>
+                    📋 项目研发步骤拆解导航 (点击任意步骤查看：Agent 在做什么 · Agent 讨论历史结论 ·
+                    本步骤产出文档 · 团队成员评论)
+                  </span>
+                </div>
+                <span style="font-size: 12px; color: var(--text-secondary)">
+                  高亮蓝色标签代表你当前登录角色负责把关的步骤
+                </span>
+              </div>
+              <div class="pipeline-grid" id="pipelineGrid"></div>
+            </section>
+
+            <!-- 当前选中步骤的沉浸式双栏协同工作区 -->
+            <div class="step-workspace-split">
+              <!-- 左栏：Agent 正在做什么 + Agent 讨论过程与历史结论 + 步骤确认操作 + 产出交付物 -->
+              <div class="col-stack">
+                <!-- 1. Agent 在做什么 & 工作流交互状态 -->
+                <section class="panel">
+                  <div class="panel-header">
+                    <div class="panel-title">
+                      <span id="stepActivityHeaderTitle">
+                        🤖 1. 本步骤 Agent 正在做什么 &amp; 执行动作分解
+                      </span>
+                    </div>
+                    <span class="pill pill-cyan" id="stageInspectorAccessPill"
+                      >全员共享透明视图</span
+                    >
+                  </div>
+                  <div id="stepAgentActivityContainer"></div>
+                </section>
+
+                <!-- 2. Agent 间工作流交互讨论过程与历史结论 + 步骤内直接拍板/确认 -->
+                <section class="panel">
+                  <div class="panel-header">
+                    <div class="panel-title">
+                      <span>🗣️ 2. Agent 跨角色工作流讨论记录与历史结论</span>
+                    </div>
+                    <span class="pill pill-blue">Multi-Agent Dialogue &amp; Conclusion</span>
+                  </div>
+                  <div id="stepAgentDiscussionContainer"></div>
+                  <!-- 如果当前步骤处于等待团队确认/拍板状态，直接在此展示角色确认操作栏 -->
+                  <div id="stepInlineGateActionContainer" style="margin-top: 12px"></div>
+                </section>
+
+                <!-- 3. 本步骤核心产出文档与方案明细 -->
+                <section class="panel">
+                  <div class="panel-header">
+                    <div class="panel-title">
+                      <span id="stageInspectorTitle">📄 3. 本步骤结构化交付物与方案文档</span>
+                    </div>
+                  </div>
+                  <div id="stageInspectorBody"></div>
+                </section>
+              </div>
+
+              <!-- 右栏：团队成员在该步骤留下的评论信息与协同讨论流 -->
+              <div class="col-stack">
+                <section class="panel">
+                  <div class="panel-header">
+                    <div class="panel-title">
+                      <span id="stepCommentsPanelTitle">💬 4. 团队成员评论与评审意见</span>
+                    </div>
+                    <span class="pill pill-green" id="stepCommentsCountBadge">0 条评论</span>
+                  </div>
+                  <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 12px">
+                    所有岗位的同事均可在当前步骤下留下评审意见、技术提醒或设计建议。留下的评论将对全团队可见，也可一键让总管
+                    Agent 按最新评论重新执行本步骤：
+                  </p>
+
+                  <!-- 评论列表 -->
+                  <div
+                    class="col-stack"
+                    style="gap: 10px; margin-bottom: 14px"
+                    id="stepTeamCommentsList"
+                  ></div>
+
+                  <!-- 发表新评论输入框 (所有登录角色均可评论) -->
+                  <div
+                    style="
+                      border-top: 1px solid var(--border-subtle);
+                      padding-top: 12px;
+                      display: flex;
+                      flex-direction: column;
+                      gap: 8px;
+                    "
+                  >
+                    <div style="font-size: 12px; font-weight: 600" id="commentComposerLabel">
+                      发表我的团队评论：
+                    </div>
+                    <textarea
+                      class="textarea-control"
+                      id="stepCommentInput"
+                      rows="3"
+                      placeholder="在此输入你对本步骤 Agent 方案或讨论结论的评论、建议或补充要求..."
+                    ></textarea>
+                    <div class="form-row">
+                      <button class="btn btn-primary" id="btnPostStepComment">
+                        💬 发表评论至本步骤
+                      </button>
+                      <button class="btn btn-warning" id="btnReviseStepWithComment">
+                        ↩️ 让 Agent 按该评论意见重做本步骤
+                      </button>
+                    </div>
+                  </div>
+                </section>
+
+                <!-- 项目底层沙箱与模板状态卡片 -->
+                <section class="panel">
+                  <div class="panel-header">
+                    <div class="panel-title">
+                      <span>⚙️ 当前项目流程模板与环境摘要</span>
+                    </div>
+                  </div>
+                  <div class="diagnosis-list" id="engineeringRuntimeSummary"></div>
+                </section>
+              </div>
+            </div>
+          </div>
+
+          <!-- ================================================================== -->
+          <!-- 页面 3 (#/gate-center)：⚖️ 待办确认与方案拍板中心 -->
+          <!-- ================================================================== -->
+          <div class="view-section" id="view-gate-center">
+            <section class="panel">
+              <div class="panel-header">
+                <div class="panel-title">
+                  <span>⚖️ 项目各步骤待确认事项与方案拍板汇总</span>
+                </div>
+                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
+                  <button class="btn btn-primary" id="btnFilterAllGates">
+                    查看全部步骤确认记录
+                  </button>
+                  <button class="btn" id="btnFilterMyDomainGates">
+                    仅看由我专长领域负责确认的步骤
+                  </button>
+                  <span class="pill pill-amber" id="inboxCountTag">0 条待办</span>
+                </div>
+              </div>
+
+              <div class="form-row" style="margin-bottom: 14px">
+                <span style="font-size: 12px; color: var(--text-secondary)">
+                  签核/拍板意见说明 (将同步显示在对应步骤的团队评论区与责任记录中)：
+                </span>
+                <input
+                  type="text"
+                  class="input-control"
+                  id="gateDecisionCommentInput"
+                  value="经本领域负责人审阅，当前步骤 Agent 方案与讨论结论符合要求，确认通过。"
+                  placeholder="输入审批或驳回理由..."
+                />
+              </div>
+
+              <div class="notification-list" id="notificationList"></div>
+            </section>
+          </div>
+
+          <!-- ================================================================== -->
+          <!-- 页面 4 (#/dag-supervisor)：🌿 总管对话与版本演进历史 -->
+          <!-- ================================================================== -->
+          <div class="view-section" id="view-dag-supervisor">
+            <section class="panel">
+              <div class="panel-header">
+                <div class="panel-title">
+                  <span>🌿 总管 Agent (Supervisor) 自然语言调度与多分支版本演进历史</span>
+                </div>
+                <span class="pill pill-cyan">历史版本完整保留 · 无脏数据覆盖</span>
+              </div>
+              <div class="supervisor-form">
+                <p style="font-size: 12px; color: var(--text-secondary)">
+                  当团队在某个下游步骤发现需要调整上游方案时，可直接在此对总管 Agent
+                  下达自然语言指令。系统会保留旧分支完整讨论与产物作为历史对照，同时切出新分支重新执行目标步骤及下游流程：
+                </p>
+                <div class="form-row">
+                  <select class="select-control" id="rollbackStageSelect">
+                    <option value="">自动从自然语言识别目标步骤与 Agent</option>
+                    <option value="STAGE_1_PM">回到步骤 1: PM Agent (产品需求与埋点)</option>
+                    <option value="STAGE_2_PD">回到步骤 2: PD Agent (UI 交互设计)</option>
+                    <option value="STAGE_3A_TECH_SPEC">
+                      回到步骤 3a: Tech Lead Agent (架构与表设计)
+                    </option>
+                    <option value="STAGE_3B_ENGINEER">
+                      回到步骤 3b: Engineer Agent (代码实现)
+                    </option>
+                    <option value="STAGE_4_QA">回到步骤 4: QA Agent (自动化测试)</option>
+                  </select>
+                  <input
+                    type="text"
+                    class="input-control"
+                    id="rollbackInstructionInput"
+                    value="回退到 PD Agent，把交互布局改为右侧双栏折叠抽屉并重新执行下游阶段"
+                    placeholder="输入给总管 Agent 的回退重做指令..."
+                  />
+                  <button class="btn btn-primary" id="btnSendRollback">向总管发送回退指令</button>
+                </div>
+              </div>
+
+              <div style="margin-top: 16px">
+                <div
+                  style="
+                    font-size: 12.5px;
+                    font-weight: 700;
+                    margin-bottom: 8px;
+                    color: var(--text-secondary);
+                  "
+                >
+                  项目各分支步骤版本演进全记录（包含当前生效分支与历史迭代旧版）：
+                </div>
+                <div class="stream-list" id="dagSnapshotHistoryList"></div>
+              </div>
+            </section>
+          </div>
+
+          <!-- ================================================================== -->
+          <!-- 页面 5 (#/sandbox-explorer)：💻 交付物与代码沙箱浏览中心 -->
+          <!-- ================================================================== -->
+          <div class="view-section" id="view-sandbox-explorer">
+            <section class="panel">
+              <div class="panel-header">
+                <div class="panel-title">
+                  <span>💻 项目代码沙箱仓库与自动化测试运行中心 (Git Worktree)</span>
+                </div>
+                <div style="display: flex; gap: 10px; align-items: center">
+                  <span class="pill pill-cyan" id="sandboxBranchBadge"
+                    >worktree/branch-v1-main</span
+                  >
+                  <button class="btn btn-success" id="btnRunLiveSandboxTest">
+                    ▶ 运行沙箱自动化单测 &amp; 安全扫描
+                  </button>
+                </div>
+              </div>
+
+              <div class="sandbox-explorer-layout">
+                <div>
+                  <div
+                    style="
+                      font-size: 12px;
+                      font-weight: 700;
+                      margin-bottom: 8px;
+                      color: var(--text-secondary);
+                    "
+                  >
+                    当前项目已生成的源码与脚本文件树 (点击文件阅读完整代码)：
+                  </div>
+                  <div class="col-stack" style="gap: 8px" id="sandboxFileTreeList"></div>
+                </div>
+                <div class="col-stack">
+                  <div>
+                    <div
+                      style="
+                        font-size: 12px;
+                        font-weight: 700;
+                        margin-bottom: 6px;
+                        color: var(--text-secondary);
+                      "
+                      id="sandboxActiveFileHeader"
+                    >
+                      📄 源码阅读器：请选择左侧文件
+                    </div>
+                    <pre class="code-preview-block" id="sandboxCodeViewerBlock"></pre>
+                  </div>
+                  <div>
+                    <div
+                      style="
+                        font-size: 12px;
+                        font-weight: 700;
+                        margin-bottom: 6px;
+                        color: var(--text-secondary);
+                      "
+                    >
+                      🧪 自动化测试执行与安全扫描日志：
+                    </div>
+                    <pre class="code-preview-block" id="sandboxTerminalOutputBlock"></pre>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <!-- ================================================================== -->
+          <!-- 页面 6 (#/audit-rag)：📜 协同动态与团队避坑经验库 -->
+          <!-- ================================================================== -->
+          <div class="view-section" id="view-audit-rag">
+            <div class="main-grid">
+              <section class="panel">
+                <div class="panel-header">
+                  <div class="panel-title">
+                    <span>📜 项目全链路协同动态与签核记录</span>
+                  </div>
+                  <span class="pill pill-blue">全员透明可追溯</span>
+                </div>
+                <div class="stream-list" id="liveEventStreamList"></div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-header">
+                  <div class="panel-title">
+                    <span>🧠 团队历史评审避坑经验知识库 (自动注入给对应步骤 Agent)</span>
+                  </div>
+                  <span class="pill pill-purple">语义相似度匹配</span>
+                </div>
+
+                <div class="supervisor-form" style="margin-bottom: 14px">
+                  <div class="form-row">
+                    <select class="select-control" id="ragStageSelect">
+                      <option value="STAGE_1_PM">步骤 1: PM 需求与埋点</option>
+                      <option value="STAGE_2_PD">步骤 2: PD 交互设计</option>
+                      <option value="STAGE_3A_TECH_SPEC" selected>
+                        步骤 3a: Tech Lead 架构与表设计
+                      </option>
+                      <option value="STAGE_3B_ENGINEER">步骤 3b: Engineer 代码实现</option>
+                      <option value="STAGE_4_QA">步骤 4: QA 自动化测试</option>
+                    </select>
+                    <input
+                      type="text"
+                      class="input-control"
+                      id="ragInputText"
+                      placeholder="输入关键词检索历史经验，或录入新的团队设计/架构红线..."
+                      value="数据库分布式乐观锁与幂等键设计"
+                    />
+                  </div>
+                  <div class="form-row">
+                    <button class="btn btn-primary" id="btnRagSearch">🔍 检索相关历史经验</button>
+                    <button class="btn btn-warning" id="btnRagIngest">
+                      ➕ 沉淀为团队共享避坑经验
+                    </button>
+                  </div>
+                </div>
+
+                <div class="stream-list" id="ragLessonList"></div>
+              </section>
+            </div>
+          </div>
+
+          <!-- ================================================================== -->
+          <!-- 页面 7 (#/admin-governance)：👥 团队角色权限与流程设置 -->
+          <!-- ================================================================== -->
+          <div class="view-section" id="view-admin-governance">
+            <section class="panel">
+              <div class="panel-header">
+                <div class="panel-title">
+                  <span>
+                    👥 1. 团队成员目录与步骤分工权限表
+                    (全员共享完整项目信息，按专长环节分配确认权限)
+                  </span>
+                </div>
+                <span class="pill pill-blue">点击右侧按钮可一键切换该成员视角</span>
+              </div>
+              <div style="overflow-x: auto">
+                <table class="rbac-table" id="rbacRosterTable"></table>
+              </div>
+            </section>
+
+            <div class="main-grid">
+              <section class="panel">
+                <div class="panel-header">
+                  <div class="panel-title">
+                    <span>👑 2. 项目流程与讨论规则设置 (仅项目管理员可修改)</span>
+                  </div>
+                  <span class="pill pill-purple" id="adminGovernanceAccessBadge">
+                    PROJECT_ADMIN 专属
+                  </span>
+                </div>
+                <div class="supervisor-form">
+                  <div class="form-row">
+                    <label style="min-width: 220px; font-size: 12.5px">
+                      Agent 自动讨论最大轮次上限:
+                    </label>
+                    <input
+                      type="number"
+                      class="input-control"
+                      id="adminMaxTurnsInput"
+                      min="1"
+                      max="10"
+                      value="3"
+                    />
+                  </div>
+                  <div class="form-row">
+                    <label style="min-width: 220px; font-size: 12.5px">
+                      需人工确认的风险分数线 (0-100):
+                    </label>
+                    <input
+                      type="number"
+                      class="input-control"
+                      id="adminRiskThresholdInput"
+                      min="20"
+                      max="100"
+                      value="60"
+                    />
+                  </div>
+                  <div class="form-row">
+                    <label style="display: flex; align-items: center; gap: 8px; font-size: 12.5px">
+                      <input type="checkbox" id="adminAllowCrossRollbackCheckbox" checked />
+                      允许各环节负责人通过总管 Agent 发起跨步骤回退
+                    </label>
+                  </div>
+                  <div class="form-row" style="margin-top: 6px">
+                    <button class="btn btn-purple" id="btnSaveAdminGovernance">
+                      💾 保存流程规则设置
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-header">
+                  <div class="panel-title">
+                    <span>📈 3. Agent 协同效率与复用指标统计</span>
+                  </div>
+                  <span class="pill pill-green" id="retroHealthBadge">运行健康</span>
+                </div>
+                <div class="telemetry-kpi-grid" id="telemetryKpiGrid"></div>
+                <div class="diagnosis-list" id="retroDiagnosisList"></div>
+              </section>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <!-- 新建研发项目弹窗 -->
+    <div class="modal-backdrop" id="newProposalModal">
+      <div class="modal-card">
+        <div
+          style="
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-subtle);
+            padding-bottom: 10px;
+          "
+        >
+          <h3 style="font-size: 15px">🚀 发起新研发项目 (自动拆解为多 Agent 协同步骤)</h3>
+          <button class="btn" id="btnCloseProposalModal">✕</button>
+        </div>
+
+        <div class="supervisor-form">
+          <div style="font-size: 12px; color: var(--text-secondary)">
+            填写自定义研发项目名称、业务背景与核心功能诉求：
+          </div>
+          <input
+            type="text"
+            class="input-control"
+            id="customProposalTitleInput"
+            value="企业级供应链智能合同风控与审批中台"
+            placeholder="输入项目名称..."
+          />
+          <input
+            type="text"
+            class="input-control"
+            id="customProposalSummaryInput"
+            value="构建合同条款风险识别、多角色审批流转与沙箱自动化合规校验闭环"
+            placeholder="输入项目背景与目标..."
+          />
+          <textarea
+            class="textarea-control"
+            id="customProposalReqsInput"
+            rows="4"
+            placeholder="每行一条核心功能需求，格式 REQ_CODE: 需求描述"
+          >
+REQ_CONTRACT_SCAN: 支持合同敏感条款自动识别与风险分级
+REQ_APPROVAL_CHAIN: 支持多级角色权限门禁与会签流转
+REQ_AUDIT_ARCHIVE: 支持合同审批全链路不可变审计归档</textarea>
+          <div class="form-row" style="font-size: 12px; color: var(--text-secondary)">
+            <label style="display: flex; align-items: center; gap: 6px">
+              <input type="checkbox" id="customProposalDdlCheck" checked />
+              包含数据库表结构变更 (步骤 3a 需架构师确认)
+            </label>
+            <label style="display: flex; align-items: center; gap: 6px">
+              <input type="checkbox" id="customProposalAuthCheck" checked />
+              涉及核心权限/支付安全域
+            </label>
+            <label style="display: flex; align-items: center; gap: 6px">
+              <input type="checkbox" id="customProposalConflictCheck" />
+              演示步骤 2 UI 设计师与产品经理多轮讨论分歧
+            </label>
+          </div>
+          <button class="btn btn-primary" id="btnSubmitCustomProposal">
+            ✅ 立即创建项目并启动多智能体分步协同
+          </button>
+        </div>
+
+        <div
+          style="
+            border-top: 1px solid var(--border-subtle);
+            padding-top: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+          "
+        >
+          <div style="font-size: 12px; color: var(--text-secondary)">或快速切换示例项目场景：</div>
+          <div class="form-row">
+            <button class="btn btn-primary" id="btnPresetConflict">
+              示例 1：PM 与 PD 3轮讨论分歧 + 架构表设计
+            </button>
+            <button class="btn" id="btnPresetLowRisk">
+              示例 2：常规迭代项目直达步骤 4 QA 验收
+            </button>
+            <button class="btn btn-warning" id="btnPresetScopeDiff">
+              示例 3：需求范围变更提醒项目
+            </button>
+            <button class="btn btn-success" id="btnPresetCacheHit">
+              示例 4：复用历史方案加速交付项目
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/dist/main.js"></script>
+  </body>
+</html>
