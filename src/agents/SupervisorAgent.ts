@@ -39,6 +39,8 @@ import {
   StageSnapshotMemento,
 } from '../domain/models.ts';
 import { WorkflowEventBus } from '../patterns/EventBus.ts';
+import { ModelRouterGateway } from '../patterns/ModelRouterGateway.ts';
+import { JsonExtractor } from './prompt/JsonExtractor.ts';
 
 /**
  * 命令模式顶层接口 (Command Interface)
@@ -129,8 +131,11 @@ export class SupervisorAgent {
   public readonly role = AgentRole.SUPERVISOR;
   private readonly eventBus: WorkflowEventBus;
 
-  public constructor(eventBus: WorkflowEventBus) {
+  private modelRouter: ModelRouterGateway | null;
+
+  public constructor(eventBus: WorkflowEventBus, modelRouter?: ModelRouterGateway) {
     this.eventBus = eventBus;
+    this.modelRouter = modelRouter ?? null;
   }
 
   /**
@@ -144,10 +149,10 @@ export class SupervisorAgent {
    * 解析人类与总管 Agent 的自然语言对话指令，定位要回退到的目标阶段与职能 Agent
    * 支持显式指定 targetStageId，也支持直接从自然语言（如“回退到 PD 把布局改成侧边抽屉”）自动识别。
    */
-  public parseNaturalLanguageRollback(
+  public async parseNaturalLanguageRollback(
     userDialogue: string,
     explicitTargetStageId?: WorkflowStageId,
-  ): ParsedRollbackDirective {
+  ): Promise<ParsedRollbackDirective> {
     const text = userDialogue.trim();
     if (explicitTargetStageId) {
       return new ParsedRollbackDirective({
@@ -157,6 +162,54 @@ export class SupervisorAgent {
       });
     }
 
+    // C3：先尝试 LLM 解析（离线/失败 → 回退到关键词匹配）
+    const llmResult = await this.tryLlmParse(text);
+    if (llmResult) {
+      return llmResult;
+    }
+    return this.keywordParse(text);
+  }
+
+  /** C3：LLM 结构化输出 {targetStageId, cleanInstruction}；失败返回 null */
+  private async tryLlmParse(text: string): Promise<ParsedRollbackDirective | null> {
+    if (!this.modelRouter) {
+      return null;
+    }
+    try {
+      const stageList = Object.values(WorkflowStageId)
+        .filter((id) => id !== 'STAGE_0_INITIATION')
+        .join(', ');
+      const llm = await this.modelRouter.invokeChatCompletion({
+        tier: 'HIGH_REASONING_HYBRID' as never,
+        systemPrompt: `你是研发流水线总管 Agent。用户会给你一段中文回退指令。请从中解析出目标阶段 ID。
+可选阶段 ID（必须精确匹配其中一个）：${stageList}
+仅输出 JSON：{"targetStageId": "...", "cleanInstruction": "改写后的可执行指令"}。不要输出其他内容。`,
+        userPrompt: text,
+        fallbackContentGenerator: () => '',
+      });
+      if (!llm.usedLiveGateway) {
+        return null;
+      }
+      const extracted = JsonExtractor.extract(llm.content);
+      if (!extracted.ok) {
+        return null;
+      }
+      const parsed = extracted.value as { targetStageId?: string; cleanInstruction?: string };
+      const stageId = parsed.targetStageId;
+      if (!stageId || !Object.values(WorkflowStageId).includes(stageId as never)) {
+        return null;
+      }
+      return new ParsedRollbackDirective({
+        targetStageId: stageId as WorkflowStageId,
+        targetAgentRole: this.mapStageToRole(stageId as WorkflowStageId),
+        cleanInstruction: parsed.cleanInstruction ?? text,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  private keywordParse(text: string): ParsedRollbackDirective {
     const upper = text.toUpperCase();
     if (upper.includes('PM') || text.includes('需求') || text.includes('PRD')) {
       return new ParsedRollbackDirective({

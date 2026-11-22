@@ -1,45 +1,16 @@
 /**
  * @file AbstractWorkerAgent.ts
- * @description 抽象职能 Agent 基类 —— 采用【模板方法模式 (Template Method Pattern)】定义所有专业 Agent 的统一执行骨架。
+ * @description 抽象职能 Agent 基类 —— 模板方法模式固化 7 步标准生命周期（BACKEND_TODO_DESIGN A1/A2/A3 定稿）。
  *
- * ============================================================================
- * 【Agent 模块核心工作流程详细说明 (7-Step Lifecycle)】
- * ============================================================================
- * 任何一个专业职能 Agent（PM / PD / TechLead / Engineer / QA / DA）在被状态机调度时，
- * 严禁直接裸调大模型或跳过校验，必须严格执行本基类固化在 `executeStagePipeline()` 中的 7 个标准步骤：
- *
- *   [步骤 1] 上下文组装与负向经验注入 (Context Assembly & Negative RAG)
- *            - 读取上游已批准快照的交付物契约 (Upstream Artifacts)
- *            - 从审计账本检索历史上人类驳回同类方案的批注 (Rejected History Lessons)，防止重犯
- *
- *   [步骤 2] 意图识别与目标对齐 (Intent Recognition & Alignment)
- *            - 调用子类 `recognizeStageIntent()` 解析本次任务的具体工程意图与置信度
- *            - 通过 EventBus 向前端实时广播 `RECOGNIZING_INTENT` 状态，让用户看到 AI 当前正在识别什么意图
- *
- *   [步骤 3] 双层缓存前置拦截 (Two-Tier Cache Lookup — 成本控制第一道防线)
- *            - 计算 L1 精确上下文签名与 L2 归一化语义意图指纹
- *            - 查询 `PromptCacheManager`：若命中缓存，立即广播 `CACHE_HIT` 状态，零 Token 返回产物，
- *              并在复盘追踪器记为 `FULFILLED_VIA_CACHE`
- *
- *   [步骤 4] 混合模型路由与自愈重试循环 (BYOM Routing & Self-Healing Retry Loop)
- *            - 根据该 Agent 绑定的 `ModelRoutingTier`（本地私有模型 vs 高阶推理模型）选择推理端点
- *            - 调用子类 `synthesizeArtifact()` 生成结构化领域契约对象 (`IDomainArtifactContract`)
- *            - 执行契约完整性自检 (`validateContractIntegrity()`)：
- *              若校验失败或触发模拟瞬态异常，且未超过 `maxExecutionRetries` 上限，
- *              则递增 `retryCount`，向前端广播 `RETRYING` 状态，附带自愈修正提示词重新执行
- *
- *   [步骤 5] 防“虚假共识”与需求范围篡改校验 (False Consensus & Scope Diff Guard)
- *            - 调用 `FalseConsensusGuard` 比对原始提案的 `coreRequirementIds` 与当前交付物的需求列表
- *            - 若发现 Agent 在协商或生成中擅自砍掉了原始核心需求，立即生成 `ScopeDiffReport` 告警
- *
- *   [步骤 6] 优质契约产物缓存回填 (Verified Artifact Cache Write-Back)
- *            - 若契约完整性通过且无未授权范围篡改，将产物回填至 L1 与 L2 缓存池，供后续分支回退或相似需求复用
- *
- *   [步骤 7] 复盘遥测与成本记账上报 (Telemetry & Intent Fulfillment Recording)
- *            - 将本次调用的 `recognizedIntentCode`、`retryCount`、`cacheHit`、`tokensConsumed`、`costUsd`
- *              以及最终达成状态 (`FULFILLED_ON_FIRST_TRY` / `FULFILLED_AFTER_RETRY` / `FAILED_CONTRACT`)
- *              写入 `IntentFulfillmentTracker`，支撑自动化复盘任务。
- * ============================================================================
+ * 相比仿真内核的关键变化：
+ * 1. 【A1】步骤 4 通过 `ModelRouterGateway.invokeChatCompletion` 生成产物：
+ *    Prompt 由 `StagePromptSpecs`（角色纪律 + 任务 + JSON Schema 提示）+ 结构化输入组装；
+ *    LLM JSON 经 `JsonExtractor` 提取、`ArtifactContractFactory` 反序列化为强类型契约；
+ *    原模板实现降级为 `fallbackContentGenerator`（网关不可达时平滑回落，结果带 usedFallbackTemplate 标记）。
+ * 2. 【A2】自愈重试真实化：契约校验违规/JSON 解析失败会收集 violations，构造修复提示词重试；
+ *    超限抛 `StageContractError`，由编排器捕获并暂停（禁止打穿 HTTP）。
+ * 3. 【A3】Token/成本使用网关返回的真实 usage（缺失时长度估算并标记 usageEstimated）。
+ * 4. 【B3】每次 attempt 前检查 `tokenBudgetRemaining`，超预算抛 `TokenBudgetExceededError`（不重试）。
  */
 
 import { type IDomainArtifactContract, ProjectProposalContract } from '../domain/contracts.ts';
@@ -50,15 +21,55 @@ import {
   SnapshotLifecycleState,
   WorkflowStageId,
 } from '../domain/enums.ts';
+import type { ScenarioHints } from '../domain/scenario.ts';
 import { ScopeDiffReport } from '../domain/models.ts';
 import { WorkflowDomainEvent, WorkflowEventBus } from '../patterns/EventBus.ts';
 import { FalseConsensusGuard } from '../patterns/FalseConsensusGuard.ts';
 import { ModelRouterGateway } from '../patterns/ModelRouterGateway.ts';
+import { ArtifactContractFactory } from './deserialize/ArtifactContractFactory.ts';
+import { JsonExtractor } from './prompt/JsonExtractor.ts';
+import { STAGE_PROMPT_SPECS } from './prompt/StagePromptSpecs.ts';
 import {
   IntentExecutionTraceRecord,
   IntentFulfillmentTracker,
 } from '../telemetry/IntentFulfillmentTracker.ts';
 import { PromptCacheManager } from '../telemetry/PromptCacheManager.ts';
+import { UpstreamCompressor } from './context/UpstreamCompressor.ts';
+import { ToolRegistry } from './context/ToolRegistry.ts';
+import { STAGE_CONTEXT_NEEDS } from './context/types.ts';
+import type { ContextNeed } from './context/types.ts';
+
+/** 契约生成失败（可重试）——编排器捕获后暂停流水线并推送人工通知（D-5） */
+export class StageContractError extends Error {
+  public readonly stageId: WorkflowStageId;
+  public readonly violations: ReadonlyArray<string>;
+  public readonly retryCount: number;
+
+  public constructor(
+    stageId: WorkflowStageId,
+    violations: ReadonlyArray<string>,
+    retryCount: number,
+  ) {
+    super(`[${stageId}] 在 ${retryCount} 次自愈重试后仍未通过契约校验：${violations.join(' | ')}`);
+    this.name = 'StageContractError';
+    this.stageId = stageId;
+    this.violations = [...violations];
+    this.retryCount = retryCount;
+  }
+}
+
+/** Token 预算超限（不重试，直接暂停流水线） */
+export class TokenBudgetExceededError extends Error {
+  public readonly stageId: WorkflowStageId;
+  public readonly budgetRemaining: number;
+
+  public constructor(stageId: WorkflowStageId, budgetRemaining: number) {
+    super(`[${stageId}] Token 预算不足（剩余 ${budgetRemaining}），执行已按守卫策略熔断`);
+    this.name = 'TokenBudgetExceededError';
+    this.stageId = stageId;
+    this.budgetRemaining = budgetRemaining;
+  }
+}
 
 /**
  * 传入职能 Agent 执行管道的上下文对象
@@ -70,7 +81,12 @@ export class AgentExecutionInputContext {
   public readonly upstreamArtifacts: ReadonlyMap<WorkflowStageId, IDomainArtifactContract>;
   public readonly historicalRejectionLessons: ReadonlyArray<string>;
   public readonly humanFeedbackDirective: string | null;
-  public readonly forceTransientRetryOnce: boolean;
+  /** 演示/测试场景开关（J1：自提案契约迁出） */
+  public readonly scenarioHints: ScenarioHints;
+  /** B3：本 run 的剩余 Token 预算（-1 = 未启用预算守卫） */
+  public readonly tokenBudgetRemaining: number;
+  /** 步骤 4：Facade 侧 LLM 意图分析推断的动态上下文需求（类型已过目录白名单；离线为空） */
+  public readonly dynamicContextNeeds: ReadonlyArray<ContextNeed>;
 
   public constructor(params: {
     runId: string;
@@ -79,7 +95,9 @@ export class AgentExecutionInputContext {
     upstreamArtifacts: ReadonlyMap<WorkflowStageId, IDomainArtifactContract>;
     historicalRejectionLessons?: ReadonlyArray<string>;
     humanFeedbackDirective?: string | null;
-    forceTransientRetryOnce?: boolean;
+    scenarioHints?: ScenarioHints;
+    tokenBudgetRemaining?: number;
+    dynamicContextNeeds?: ReadonlyArray<ContextNeed>;
   }) {
     this.runId = params.runId;
     this.branchId = params.branchId;
@@ -89,12 +107,14 @@ export class AgentExecutionInputContext {
       ? [...params.historicalRejectionLessons]
       : [];
     this.humanFeedbackDirective = params.humanFeedbackDirective ?? null;
-    this.forceTransientRetryOnce = Boolean(params.forceTransientRetryOnce);
+    this.scenarioHints = params.scenarioHints ?? {};
+    this.tokenBudgetRemaining = params.tokenBudgetRemaining ?? -1;
+    this.dynamicContextNeeds = params.dynamicContextNeeds ?? [];
   }
 }
 
 /**
- * 意图识别结果值对象
+ * 意图识别结果值对象（A4 计划 LLM 化，当前保持规则实现以支撑缓存键）
  */
 export class RecognizedStageIntent {
   public readonly intentCode: string;
@@ -119,6 +139,8 @@ export class AgentExecutionOutcome<T extends IDomainArtifactContract = IDomainAr
   public readonly retryCount: number;
   public readonly tokensConsumed: number;
   public readonly costUsd: number;
+  public readonly usageEstimated: boolean;
+  public readonly usedFallbackTemplate: boolean;
   public readonly scopeDiffReport: ScopeDiffReport;
   public readonly recognizedIntent: RecognizedStageIntent;
 
@@ -130,6 +152,8 @@ export class AgentExecutionOutcome<T extends IDomainArtifactContract = IDomainAr
     retryCount: number;
     tokensConsumed: number;
     costUsd: number;
+    usageEstimated: boolean;
+    usedFallbackTemplate: boolean;
     scopeDiffReport: ScopeDiffReport;
     recognizedIntent: RecognizedStageIntent;
   }) {
@@ -140,6 +164,8 @@ export class AgentExecutionOutcome<T extends IDomainArtifactContract = IDomainAr
     this.retryCount = params.retryCount;
     this.tokensConsumed = params.tokensConsumed;
     this.costUsd = params.costUsd;
+    this.usageEstimated = params.usageEstimated;
+    this.usedFallbackTemplate = params.usedFallbackTemplate;
     this.scopeDiffReport = params.scopeDiffReport;
     this.recognizedIntent = params.recognizedIntent;
   }
@@ -160,6 +186,9 @@ export abstract class AbstractWorkerAgent<
   protected readonly modelRouter: ModelRouterGateway;
   protected readonly falseConsensusGuard: FalseConsensusGuard;
   protected readonly maxExecutionRetries: number;
+  protected contextRegistry: ToolRegistry | null = null;
+  /** A4：上次同阶段 LLM 顺带输出的意图（缓存键依赖同步签名，避免单独一次 LLM 往返） */
+  private lastLlmIntent: RecognizedStageIntent | null = null;
 
   protected constructor(params: {
     role: AgentRole;
@@ -183,17 +212,58 @@ export abstract class AbstractWorkerAgent<
     this.maxExecutionRetries = params.maxExecutionRetries ?? 2;
   }
 
+  /** C1：注入 ToolRegistry（外部知识预取） */
+  public setContextRegistry(registry: ToolRegistry): void {
+    this.contextRegistry = registry;
+  }
+
   /**
-   * 【模板方法 (Template Method)】
-   * 固化 Agent 7 步标准工作流，子类不得覆盖本方法，仅实现受保护的钩子方法。
+   * A4：意图解析入口（同步签名，缓存键依赖）——优先复用上次同阶段 LLM 顺带输出的 `__intent`，
+   * 无缓存/离线时回落到子类规则实现（M5 兜底）。
    */
-  public executeStagePipeline(
+  private resolveStageIntent(context: AgentExecutionInputContext): RecognizedStageIntent {
+    if (this.lastLlmIntent) {
+      return this.lastLlmIntent;
+    }
+    return this.recognizeStageIntent(context);
+  }
+
+  /**
+   * A4：从 LLM 主输出的 JSON 顶层捕获 `__intent` 并缓存（校验失败静默忽略 → 继续用规则意图）。
+   */
+  private captureLlmIntent(raw: Record<string, unknown>): void {
+    const intent = raw['__intent'] as
+      { intentCode?: unknown; intentDescription?: unknown; confidenceScore?: unknown } | undefined;
+    if (!intent || typeof intent.intentCode !== 'string' || intent.intentCode.trim().length === 0) {
+      return;
+    }
+    const description =
+      typeof intent.intentDescription === 'string' && intent.intentDescription.trim().length > 0
+        ? intent.intentDescription.trim()
+        : 'LLM 识别的阶段意图';
+    const confidence =
+      typeof intent.confidenceScore === 'number' &&
+      intent.confidenceScore > 0 &&
+      intent.confidenceScore <= 1
+        ? intent.confidenceScore
+        : 0.99;
+    this.lastLlmIntent = new RecognizedStageIntent(
+      intent.intentCode.trim().slice(0, 64),
+      description.slice(0, 120),
+      confidence,
+    );
+  }
+
+  /**
+   * 【模板方法 (Template Method)】固化 Agent 7 步标准工作流（异步：LLM 调用为 IO）。
+   */
+  public async executeStagePipeline(
     context: AgentExecutionInputContext,
-  ): AgentExecutionOutcome<TArtifact> {
+  ): Promise<AgentExecutionOutcome<TArtifact>> {
     const endpoint = this.modelRouter.resolveEndpoint(this.modelTier);
 
     // 步骤 1 & 2：意图识别并向前端实时广播交互状态
-    const recognizedIntent = this.recognizeStageIntent(context);
+    const recognizedIntent = this.resolveStageIntent(context);
     this.broadcastProgress(
       context,
       SnapshotLifecycleState.RECOGNIZING_INTENT,
@@ -204,7 +274,7 @@ export abstract class AbstractWorkerAgent<
       },
     );
 
-    // 步骤 3：双层缓存检索（L1 精确签名 + L2 语义意图指纹）
+    // 步骤 3：双层缓存检索（L1 精确签名 + L2 语义意图向量，G1）
     const exactKey = this.cacheManager.buildExactCacheKey({
       stageId: this.stageId,
       agentRole: this.role,
@@ -212,15 +282,15 @@ export abstract class AbstractWorkerAgent<
       requirementIds: context.proposal.coreRequirementIds,
       feedbackInstruction: context.humanFeedbackDirective ?? undefined,
     });
-    const semanticKey = this.cacheManager.buildSemanticIntentKey({
+    const semanticIntentText = this.cacheManager.buildSemanticIntentText({
       stageId: this.stageId,
       agentRole: this.role,
-      intentCode: recognizedIntent.intentCode,
-      requirementIds: context.proposal.coreRequirementIds,
+      intentDescription: recognizedIntent.intentDescription,
+      requirementDescriptions: context.proposal.requirementDescriptions,
       feedbackInstruction: context.humanFeedbackDirective ?? undefined,
     });
 
-    const cacheOutcome = this.cacheManager.lookup<TArtifact>(exactKey, semanticKey);
+    const cacheOutcome = await this.cacheManager.lookup<TArtifact>(exactKey, semanticIntentText);
     if (cacheOutcome.isHit && cacheOutcome.cachedArtifact !== null) {
       this.broadcastProgress(
         context,
@@ -264,28 +334,60 @@ export abstract class AbstractWorkerAgent<
         retryCount: 0,
         tokensConsumed: 0,
         costUsd: 0,
+        usageEstimated: false,
+        usedFallbackTemplate: false,
         scopeDiffReport: scopeDiff,
         recognizedIntent,
       });
     }
 
-    // 步骤 4：未命中缓存，进入模型路由调用与自愈重试循环
+    // 步骤 4：LLM 生成（含自愈重试循环）——A1/A2/A3
+    let violations: string[] = [];
     let attemptIndex = 0;
     let retryCount = 0;
     const retryReasons: string[] = [];
     let totalTokensConsumed = 0;
     let retryOverheadTokens = 0;
     let totalCostUsd = 0;
-    let synthesizedArtifact: TArtifact | null = null;
+    let usageEstimated = false;
+    let usedFallbackTemplate = false;
+    let candidate: TArtifact | null = null;
 
     while (attemptIndex <= this.maxExecutionRetries) {
       const isRetryAttempt = attemptIndex > 0;
+      // B3：预算守卫（每次 attempt 前检查；估算按输入长度保守估计）
+      if (context.tokenBudgetRemaining >= 0) {
+        const estimatedInputTokens = Math.ceil(this.estimatePromptChars(context, violations) / 1.5);
+        const estimatedTotal = estimatedInputTokens + 400; // 400 = 输出保守余量
+        if (estimatedTotal > context.tokenBudgetRemaining) {
+          this.fulfillmentTracker.recordTrace(
+            new IntentExecutionTraceRecord({
+              traceId: `TRACE-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+              runId: context.runId,
+              branchId: context.branchId,
+              stageId: this.stageId,
+              agentRole: this.role,
+              recognizedIntentCode: recognizedIntent.intentCode,
+              intentConfidence: recognizedIntent.confidenceScore,
+              retryCount,
+              retryReasons: [...retryReasons, 'TOKEN_BUDGET_EXCEEDED'],
+              cacheHit: false,
+              fulfillmentStatus: IntentFulfillmentStatus.FAILED_CONTRACT,
+              tokensConsumed: totalTokensConsumed,
+              retryOverheadTokens,
+              costUsd: totalCostUsd,
+            }),
+          );
+          throw new TokenBudgetExceededError(this.stageId, context.tokenBudgetRemaining);
+        }
+      }
+
       if (isRetryAttempt) {
         this.broadcastProgress(
           context,
           SnapshotLifecycleState.RETRYING,
-          `[${this.role}] 执行第 ${attemptIndex}/${this.maxExecutionRetries} 次自愈重试：修正契约 Schema 约束...`,
-          { attemptIndex, retryReasons },
+          `[${this.role}] 执行第 ${attemptIndex}/${this.maxExecutionRetries} 次自愈重试：修正契约违规...`,
+          { attemptIndex, violations },
         );
       } else {
         this.broadcastProgress(
@@ -296,40 +398,70 @@ export abstract class AbstractWorkerAgent<
         );
       }
 
-      const tokenEstimate = this.estimateTokenUsage(context, attemptIndex);
-      const receipt = this.modelRouter.MeterInvocation(
-        this.modelTier,
-        tokenEstimate.promptTokens,
-        tokenEstimate.completionTokens,
-      );
-      totalTokensConsumed += receipt.totalTokens;
-      totalCostUsd += receipt.estimatedCostUsd;
-      if (isRetryAttempt) {
-        retryOverheadTokens += receipt.totalTokens;
-      }
-
-      // 若外部注入了“模拟首次瞬态契约格式偏差”以测试重试自愈能力
-      if (context.forceTransientRetryOnce && attemptIndex === 0) {
+      // J1 演示开关：Stage 1 首次执行注入瞬态契约偏差，验证自愈重试（离线模板模式下有效）
+      if (
+        context.scenarioHints?.forceTransientRetry === true &&
+        this.stageId === WorkflowStageId.STAGE_1_PM &&
+        attemptIndex === 0
+      ) {
         retryCount += 1;
-        retryReasons.push('首次生成 JSON 契约缺少必填验收字段，触发自动 Schema 修复重试');
+        violations = ['首次生成 JSON 契约缺少必填验收字段，触发自动 Schema 修复重试'];
+        retryReasons.push(...violations);
         attemptIndex += 1;
         continue;
       }
 
-      const candidate = this.synthesizeArtifact(context, attemptIndex);
-      const validation = candidate.validateContractIntegrity();
+      try {
+        const prompt = this.buildStagePrompt(context, attemptIndex, violations);
+        const llm = await this.modelRouter.invokeChatCompletion({
+          tier: this.modelTier,
+          systemPrompt: prompt.systemPrompt,
+          userPrompt: prompt.userPrompt,
+          fallbackContentGenerator: () =>
+            JSON.stringify(this.synthesizeTemplateArtifact(context, attemptIndex)),
+        });
+        totalTokensConsumed += llm.receipt.totalTokens;
+        totalCostUsd += llm.receipt.estimatedCostUsd;
+        usageEstimated = usageEstimated || llm.receipt.usageEstimated;
+        usedFallbackTemplate = usedFallbackTemplate || !llm.usedLiveGateway;
+        if (isRetryAttempt) {
+          retryOverheadTokens += llm.receipt.totalTokens;
+        }
 
-      if (validation.isValid()) {
-        synthesizedArtifact = candidate;
-        break;
+        const extracted = JsonExtractor.extract(llm.content);
+        if (!extracted.ok) {
+          violations = [`OUTPUT_NOT_JSON: ${extracted.error ?? ''}`];
+        } else {
+          // A4：先捕获 LLM 顺带输出的 __intent（工厂解析忽略未知字段，互不影响）
+          this.captureLlmIntent(extracted.value as Record<string, unknown>);
+          const parsed = ArtifactContractFactory.parse(
+            this.stageId,
+            extracted.value as Record<string, unknown>,
+          );
+          if (!parsed.ok) {
+            violations = [...parsed.violations];
+          } else {
+            const validation = (parsed.artifact as TArtifact).validateContractIntegrity();
+            if (validation.isValid()) {
+              candidate = parsed.artifact as TArtifact;
+              violations = [];
+              break;
+            }
+            violations = [...validation.getViolations()];
+          }
+        }
+      } catch (err) {
+        if (err instanceof TokenBudgetExceededError) {
+          throw err; // 预算超限不重试（B3）
+        }
+        violations = [err instanceof Error ? err.message.slice(0, 200) : String(err)];
       }
 
       retryCount += 1;
-      retryReasons.push(validation.getViolations().join('; '));
       attemptIndex += 1;
     }
 
-    if (synthesizedArtifact === null) {
+    if (candidate === null) {
       this.fulfillmentTracker.recordTrace(
         new IntentExecutionTraceRecord({
           traceId: `TRACE-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -348,23 +480,21 @@ export abstract class AbstractWorkerAgent<
           costUsd: totalCostUsd,
         }),
       );
-      throw new Error(
-        `[${this.role}] 在重试 ${retryCount} 次后仍未通过阶段契约校验：${retryReasons.join(' | ')}`,
-      );
+      throw new StageContractError(this.stageId, retryReasons, retryCount);
     }
 
-    // 步骤 5：防“虚假共识”与需求范围缩减校验
+    // 步骤 5：防“虚假共识”与需求范围缩减校验（演示开关走 ScenarioHints，J1）
     const scopeDiffReport = this.falseConsensusGuard.evaluateScopeIntegrity(
       context.proposal,
-      synthesizedArtifact,
+      candidate,
     );
 
     // 步骤 6：若未发生非法范围阉割，则将合格契约产物写入双层缓存
     if (!scopeDiffReport.hasUnauthorizedScopeReduction) {
-      this.cacheManager.storeVerifiedArtifact({
+      await this.cacheManager.storeVerifiedArtifact({
         exactKey,
-        semanticKey,
-        artifact: synthesizedArtifact,
+        semanticIntentText,
+        artifact: candidate,
         estimatedTokens: totalTokensConsumed - retryOverheadTokens,
         estimatedCostUsd: totalCostUsd,
       });
@@ -396,13 +526,15 @@ export abstract class AbstractWorkerAgent<
     );
 
     return new AgentExecutionOutcome<TArtifact>({
-      artifact: synthesizedArtifact,
+      artifact: candidate,
       modelUsed: endpoint.modelIdentifier,
       cacheHit: false,
       cacheLayer: 'MISS',
       retryCount,
       tokensConsumed: totalTokensConsumed,
       costUsd: Number(totalCostUsd.toFixed(6)),
+      usageEstimated,
+      usedFallbackTemplate,
       scopeDiffReport,
       recognizedIntent,
     });
@@ -429,25 +561,95 @@ export abstract class AbstractWorkerAgent<
   }
 
   /**
-   * 子类钩子 1：识别当前阶段的专业意图编码与描述
+   * 组装阶段 Prompt（A1 改进版）：
+   * 1. 上游产物走 UpstreamCompressor 压缩（省 Token：只发关键决策字段，不发全文）
+   * 2. 外部上下文走 ToolRegistry 预取（Agent 可看到代码结构/DB Schema/组件清单等外部知识）
+   * 3. rejectionLessons / humanDirective 保持不变
+   */
+  protected buildStagePrompt(
+    context: AgentExecutionInputContext,
+    attemptIndex: number,
+    violations: ReadonlyArray<string>,
+  ): { systemPrompt: string; userPrompt: string } {
+    const spec = STAGE_PROMPT_SPECS[this.stageId] ?? {
+      systemPrompt: `你是研发流水线职能 Agent（${this.role}）。仅输出一个 JSON 对象。`,
+      taskInstruction: '依据输入的结构化上下文完成本阶段契约产出。',
+      jsonSchemaHint: '输出 JSON 需包含 summary 与 coreRequirementIds 字段。',
+    };
+
+    // 省 Token：上游产物压缩（关键决策字段而非全文）
+    const compressor = new UpstreamCompressor();
+    const upstreamDigests = compressor.compress(
+      [...context.upstreamArtifacts.entries()].map(([stageId, artifact]) => ({
+        stageId,
+        artifact,
+      })),
+    );
+
+    // 外部上下文注入（使用 runCache 已预取的结果；步骤 4：静态声明 + LLM 动态需求合并）
+    const staticNeeds = STAGE_CONTEXT_NEEDS[this.stageId] ?? [];
+    const seenTypes = new Set(staticNeeds.map((n) => n.type));
+    const dynamicExtras = context.dynamicContextNeeds.filter((n) => !seenTypes.has(n.type));
+    const contextNeeds: ReadonlyArray<ContextNeed> = [...staticNeeds, ...dynamicExtras];
+    const externalContexts = contextNeeds
+      .map((need) => {
+        const cachedResult = this.contextRegistry?.getCached(
+          context.runId,
+          need.type,
+          this.stageId,
+        );
+        if (cachedResult) {
+          return { type: need.type, content: cachedResult.content, source: cachedResult.source };
+        }
+        return null;
+      })
+      .filter((c): c is { type: string; content: string; source: string } => c !== null);
+
+    const payload = {
+      task: spec.taskInstruction,
+      proposal: context.proposal.toSerializableRecord(),
+      upstreamDigests, // 压缩后的上游摘要（非全文）
+      externalContext: externalContexts.length > 0 ? externalContexts : undefined,
+      rejectionLessons: context.historicalRejectionLessons.slice(0, 5),
+      humanDirective: context.humanFeedbackDirective,
+      attemptIndex,
+      priorViolations: violations.slice(0, 5),
+    };
+    return {
+      systemPrompt: spec.systemPrompt,
+      userPrompt: `${spec.jsonSchemaHint}\n\n另外必须在 JSON 顶层包含 "__intent" 字段：{ "intentCode": "稳定的英文大写下划线意图编码", "intentDescription": "一句话中文意图描述", "confidenceScore": 0到1之间的小数 }。\n\n以下为本阶段的全部结构化输入（JSON）：\n${JSON.stringify(payload)}`,
+    };
+  }
+
+  /** 降级/预算估算用：粗估 prompt 字符量 */
+  private estimatePromptChars(
+    context: AgentExecutionInputContext,
+    violations: ReadonlyArray<string>,
+  ): number {
+    return (
+      JSON.stringify(context.proposal.toSerializableRecord()).length +
+      [...context.upstreamArtifacts.values()].reduce(
+        (acc, a) => acc + JSON.stringify(a).length,
+        0,
+      ) +
+      violations.join('').length +
+      (context.humanFeedbackDirective?.length ?? 0)
+    );
+  }
+
+  /**
+   * 子类钩子 1：识别当前阶段的专业意图编码与描述（A4 计划 LLM 化）
    */
   protected abstract recognizeStageIntent(
     context: AgentExecutionInputContext,
   ): RecognizedStageIntent;
 
   /**
-   * 子类钩子 2：执行该职能角色的核心契约构建逻辑
+   * 子类钩子 2：离线降级模板产物（D-2）。LLM 在线时不再走此路径；
+   * 保留理由：断网/无 Key 的单机演示与测试确定性。
    */
-  protected abstract synthesizeArtifact(
+  protected abstract synthesizeTemplateArtifact(
     context: AgentExecutionInputContext,
     attemptIndex: number,
   ): TArtifact;
-
-  /**
-   * 子类钩子 3：估算该角色的 Prompt 与 Completion Token 消耗
-   */
-  protected abstract estimateTokenUsage(
-    context: AgentExecutionInputContext,
-    attemptIndex: number,
-  ): { promptTokens: number; completionTokens: number };
 }

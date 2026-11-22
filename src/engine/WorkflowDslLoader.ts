@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 
 import { AgentRole, ModelRoutingTier, WorkflowStageId } from '../domain/enums.ts';
+import { AgentRegistry } from '../agents/AgentRegistry.ts';
 
 export type DslGatePolicyMode = 'RISK_BASED' | 'FORCE_HUMAN_GATE';
 
@@ -98,6 +99,11 @@ export class WorkflowDslConfiguration {
       desc.gatePolicy.lowRiskAction === 'BLOCK_FOR_HUMAN'
     );
   }
+
+  /** B2：按 DSL 声明返回该阶段的协商目标（如 QA → 3b Engineer；PD → 1 PM） */
+  public findNegotiationTarget(stageId: WorkflowStageId): WorkflowStageId | null {
+    return this.findStageDescriptor(stageId)?.negotiateWithStageId ?? null;
+  }
 }
 
 interface RawYamlRoot {
@@ -129,6 +135,8 @@ interface RawYamlRoot {
       negotiateWithStageId?: string;
       escalationAgentRole?: string;
       enabled?: boolean;
+      /** J2：自定义节点的 RBAC 门禁角色映射（缺省仅最高管理员） */
+      requiredHumanRoles?: string[];
       gatePolicy?: {
         mode?: string;
         lowRiskAction?: string;
@@ -139,8 +147,7 @@ interface RawYamlRoot {
   };
 }
 
-const VALID_STAGE_IDS = new Set<string>(Object.values(WorkflowStageId));
-const VALID_AGENT_ROLES = new Set<string>(Object.values(AgentRole));
+const CORE_AGENT_ROLES = new Set<string>(Object.values(AgentRole));
 
 export class WorkflowDslLoader {
   public static getDefaultYamlPath(): string {
@@ -179,6 +186,7 @@ export class WorkflowDslLoader {
   public static parseFromString(
     rawYaml: string,
     sourceLabel = 'inline.yaml',
+    registryForParsing?: AgentRegistry,
   ): WorkflowDslConfiguration {
     const parsed = parseYaml(rawYaml) as RawYamlRoot | null;
     if (!parsed || typeof parsed !== 'object' || !parsed.workflow) {
@@ -204,6 +212,11 @@ export class WorkflowDslLoader {
 
     if (guardrails.maxNegotiationTurns < 1) {
       throw new Error(`工作流 DSL [${sourceLabel}] maxNegotiationTurns 必须 >= 1`);
+    }
+    if (!Number.isFinite(guardrails.tokenBudgetLimit) || guardrails.tokenBudgetLimit < 1000) {
+      throw new Error(
+        `工作流 DSL [${sourceLabel}] tokenBudgetLimit 必须 >= 1000（预算守卫 B3 的硬下限）`,
+      );
     }
 
     const modelRouting = new Map<ModelRoutingTier, DslModelEndpointConfig>();
@@ -231,17 +244,39 @@ export class WorkflowDslLoader {
       throw new Error(`工作流 DSL [${sourceLabel}] 必须包含非空的 stages 阶段列表`);
     }
 
+    // J2：注册表口径——DSL 声明的**新节点**（阶段键/角色键不在核心枚举）动态注册，
+    // 不再以裸枚举白名单拦截（两遍解析：先注册全部自定义节点，再构建描述符，
+    // 使 negotiateWithStageId 可指向后文声明的自定义阶段）。
+    const registry = registryForParsing ?? AgentRegistry.default();
+    for (const rawStage of wf.stages) {
+      if (rawStage.enabled === false) {
+        continue;
+      }
+      const stageIdStr = String(rawStage.stageId ?? '').trim();
+      if (!registry.isValidStageId(stageIdStr)) {
+        registry.registerCustomStage({
+          stageId: stageIdStr,
+          agentRole: String(rawStage.agentRole ?? '').trim(),
+          displayName: String(rawStage.displayName ?? '').trim() || stageIdStr,
+          requiredHumanRoles: ((rawStage.requiredHumanRoles as string[] | undefined) ?? []).map(
+            String,
+          ),
+        });
+      }
+    }
+
     const stages: DslStageDescriptor[] = [];
     for (const rawStage of wf.stages) {
       if (rawStage.enabled === false) {
         continue;
       }
       const stageIdStr = String(rawStage.stageId ?? '').trim();
-      if (!VALID_STAGE_IDS.has(stageIdStr)) {
+      if (!registry.isValidStageId(stageIdStr)) {
         throw new Error(`工作流 DSL [${sourceLabel}] 包含未知阶段标识: ${stageIdStr}`);
       }
       const agentRoleStr = String(rawStage.agentRole ?? '').trim();
-      if (!VALID_AGENT_ROLES.has(agentRoleStr)) {
+      const isCustomStage = registry.isCustomStage(stageIdStr);
+      if (!isCustomStage && !CORE_AGENT_ROLES.has(agentRoleStr)) {
         throw new Error(
           `工作流 DSL [${sourceLabel}] 阶段 [${stageIdStr}] 包含未知角色: ${agentRoleStr}`,
         );
@@ -256,7 +291,7 @@ export class WorkflowDslLoader {
       let negotiateWithStageId: WorkflowStageId | null = null;
       if (rawStage.negotiateWithStageId) {
         const negStageStr = String(rawStage.negotiateWithStageId).trim();
-        if (!VALID_STAGE_IDS.has(negStageStr)) {
+        if (!registry.isValidStageId(negStageStr)) {
           throw new Error(`工作流 DSL [${sourceLabel}] 协商目标阶段非法: ${negStageStr}`);
         }
         negotiateWithStageId = negStageStr as WorkflowStageId;
@@ -265,7 +300,7 @@ export class WorkflowDslLoader {
       let escalationAgentRole: AgentRole | null = null;
       if (rawStage.escalationAgentRole) {
         const escRoleStr = String(rawStage.escalationAgentRole).trim();
-        if (VALID_AGENT_ROLES.has(escRoleStr)) {
+        if (registry.isValidAgentRole(escRoleStr)) {
           escalationAgentRole = escRoleStr as AgentRole;
         }
       }

@@ -38,19 +38,47 @@ export class BoundedNegotiationOutcome {
   }
 }
 
+/** B1：LLM 轮次执行器接口（Facade 提供实现，离线降级到剧本路径） */
+export interface NegotiationRoundRunner {
+  runTurn(input: {
+    turnIndex: number;
+    maxTurns: number;
+    challenger: string;
+    responder: string;
+    challengeContext: string;
+    topic: string;
+  }): Promise<{
+    responseResolution: string;
+    consensusReached: boolean;
+    optionAProposal: string;
+    optionBProposal: string;
+  } | null>;
+}
+
 export class BoundedNegotiationMediator {
   private maxNegotiationTurns: number;
   private readonly eventBus: WorkflowEventBus;
   private readonly negotiationHistory: NegotiationTurnRecord[];
 
-  public constructor(eventBus: WorkflowEventBus, maxNegotiationTurns = 3) {
+  private roundRunner: NegotiationRoundRunner | null = null;
+
+  public constructor(
+    eventBus: WorkflowEventBus,
+    maxNegotiationTurns = 3,
+    roundRunner?: NegotiationRoundRunner,
+  ) {
     this.eventBus = eventBus;
     this.maxNegotiationTurns = maxNegotiationTurns;
+    this.roundRunner = roundRunner ?? null;
     this.negotiationHistory = [];
   }
 
   public getMaxNegotiationTurns(): number {
     return this.maxNegotiationTurns;
+  }
+
+  public setRoundRunner(runner: NegotiationRoundRunner | null): void {
+    this.roundRunner = runner;
   }
 
   public setMaxNegotiationTurns(turns: number): void {
@@ -62,15 +90,16 @@ export class BoundedNegotiationMediator {
   /**
    * 协调下游质询 Agent 与上游响应 Agent 的受限轮次博弈
    */
-  public mediateChallenge(params: {
+  public async mediateChallenge(params: {
     runId: string;
     branchId: string;
     stageId: WorkflowStageId;
     challengerRole: AgentRole;
     responderRole: AgentRole;
     initialChallengePoint: string;
+    topic?: string;
     forceDeadlockToMaxTurns: boolean;
-  }): BoundedNegotiationOutcome {
+  }): Promise<BoundedNegotiationOutcome> {
     const turns: NegotiationTurnRecord[] = [];
     const totalTurnsToRun = params.forceDeadlockToMaxTurns ? this.maxNegotiationTurns : 1;
 
@@ -79,9 +108,35 @@ export class BoundedNegotiationMediator {
       const consensusReached = !params.forceDeadlockToMaxTurns;
       const escalated = params.forceDeadlockToMaxTurns && reachedMax;
 
-      const responseText = consensusReached
-        ? `[${params.responderRole}] 已采纳 [${params.challengerRole}] 的工程约束反馈，补充了异常边界说明且未删减核心业务范围。`
-        : `[第 ${turnIndex}/${this.maxNegotiationTurns} 轮分歧] [${params.responderRole}] 坚持保留原高复杂度实时交互指标，而 [${params.challengerRole}] 评估现有组件库与工期无法同时满足。`;
+      // B1：有 LLM runner 且在线 → 用 LLM 生成真实协商内容；否则走剧本
+      let responseText: string;
+      let llmConsensus: boolean | null = null;
+      let llmOptionA = '';
+      let llmOptionB = '';
+      if (this.roundRunner && !params.forceDeadlockToMaxTurns) {
+        const llmTurn = await this.roundRunner.runTurn({
+          turnIndex,
+          maxTurns: this.maxNegotiationTurns,
+          challenger: params.challengerRole,
+          responder: params.responderRole,
+          challengeContext: params.initialChallengePoint,
+          topic: params.topic ?? 'DESIGN_REVIEW',
+        });
+        if (llmTurn) {
+          responseText = llmTurn.responseResolution;
+          llmConsensus = llmTurn.consensusReached;
+          llmOptionA = llmTurn.optionAProposal;
+          llmOptionB = llmTurn.optionBProposal;
+        } else {
+          responseText = consensusReached
+            ? `[${params.responderRole}] 已采纳 [${params.challengerRole}] 的工程约束反馈，补充了异常边界说明且未删减核心业务范围。`
+            : `[第 ${turnIndex}/${this.maxNegotiationTurns} 轮分歧] [${params.responderRole}] 坚持保留原高复杂度实时交互指标，而 [${params.challengerRole}] 评估现有组件库与工期无法同时满足。`;
+        }
+      } else {
+        responseText = consensusReached
+          ? `[${params.responderRole}] 已采纳 [${params.challengerRole}] 的工程约束反馈，补充了异常边界说明且未删减核心业务范围。`
+          : `[第 ${turnIndex}/${this.maxNegotiationTurns} 轮分歧] [${params.responderRole}] 坚持保留原高复杂度实时交互指标，而 [${params.challengerRole}] 评估现有组件库与工期无法同时满足。`;
+      }
 
       this.eventBus.publishEvent(
         new WorkflowDomainEvent({
@@ -102,21 +157,25 @@ export class BoundedNegotiationMediator {
         }),
       );
 
+      const finalConsensusReached = llmConsensus !== null ? llmConsensus : consensusReached;
       const record = new NegotiationTurnRecord({
         negotiationId: `NEG-${Date.now()}-${turnIndex}`,
         runId: params.runId,
         branchId: params.branchId,
+        topic: params.topic,
         turnIndex,
         maxTurnsAllowed: this.maxNegotiationTurns,
         challengerRole: params.challengerRole,
         responderRole: params.responderRole,
         challengePoint: params.initialChallengePoint,
         responseResolution: responseText,
-        consensusReached,
+        consensusReached: finalConsensusReached,
         escalatedToSupervisor: escalated,
         optionAProposal:
+          llmOptionA ||
           '方案 A（PD 推荐）：采用企业标准双栏折叠抽屉组件替代三维实时画布（零额外工期，符合 Design System 规范）',
         optionBProposal:
+          llmOptionB ||
           '方案 B（PM 推荐）：立项扩展自定义 WebGL 画布组件以保留完整视觉交互（工期增加 2 人日，需前端架构师协审）',
       });
 
@@ -125,6 +184,11 @@ export class BoundedNegotiationMediator {
     }
 
     return new BoundedNegotiationOutcome(turns);
+  }
+
+  /** D1：恢复历史协商记录（不广播观察者） */
+  public restoreTurn(record: NegotiationTurnRecord): void {
+    this.negotiationHistory.push(record);
   }
 
   public getNegotiationHistory(runId?: string): ReadonlyArray<NegotiationTurnRecord> {

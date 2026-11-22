@@ -9,7 +9,8 @@
 ### 1. 指标 (a)：双层缓存命中率 (`PromptCacheManager.ts`)
 * **设计机制**：
   * **L1 精确上下文签名缓存 (`L1_EXACT`)**：按 `阶段 + Agent 角色 + 提案标题 + 核心需求集合 + 人类回退指令` 精确匹配。在总管 Agent 触发局部回退重跑或相同分支回归时实现 100% 拦截。
-  * **L2 归一化语义意图指纹缓存 (`L2_SEMANTIC_INTENT`)**：按 `阶段 + Agent 角色 + 识别出的意图编码 (intentCode) + 归一化需求指纹` 匹配。当不同项目提交同构模块需求时直接命中。
+  * **L2 语义意图向量缓存 (`L2_SEMANTIC_INTENT`，G1 已实现)**：意图文本（含需求**描述**而非仅 ID）经网关 `/v1/embeddings` 向量化，命中条件为余弦相似度 ≥ 0.86（`SEMANTIC_CACHE_THRESHOLD`）。措辞不同的相似意图命中、同条数不同语义的需求不再误命中；embedding 端点不可用时本次检索降级为仅 L1（`embeddingUnavailableLookups` 如实记账）。实现细节见 `G1_SEMANTIC_CACHE_EMBEDDING.md`。
+  * 附加层：**L0 提供商侧前缀缓存**（免费）——6 个职能 Agent 的 systemPrompt 共享逐字节相同的公共纪律前缀（`COMMON_DISCIPLINE` 前置），命中 LLM 提供商的 KV 前缀缓存。
 * **核心公式**：
   $$\text{Cache Hit Rate} = \frac{\text{L1 Hits} + \text{L2 Hits}}{\text{Total Lookups}} \times 100\%$$
 * **SLA 目标基线**：`>= 30.0%`，并实时统计 `savedTokensTotal`（累计节省 Tokens）与 `costSavingsRatioPercent`（缓存节流比）。

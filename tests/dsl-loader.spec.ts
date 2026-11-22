@@ -37,7 +37,7 @@ describe('Block 1 — 声明式可配置工作流 DSL 引擎 (WorkflowDslLoader)
     assert.equal(privacyRoute.provider, 'local-vllm');
   });
 
-  it('2. 加载纯后端模板 (backend_api_only.yaml) 时，状态机应动态跳过 Stage 2 PD 与 Stage 5 DA 节点', () => {
+  it('2. 加载纯后端模板 (backend_api_only.yaml) 时，状态机应动态跳过 Stage 2 PD 与 Stage 5 DA 节点', async () => {
     const currentDir = path.dirname(fileURLToPath(import.meta.url));
     const backendYamlPath = path.resolve(currentDir, '../configs/workflows/backend_api_only.yaml');
     const orchestrator = new WorkflowOrchestratorFacade({
@@ -53,10 +53,9 @@ describe('Block 1 — 声明式可配置工作流 DSL 引擎 (WorkflowDslLoader)
       },
       involvesDatabaseMigration: false,
       involvesPermissionOrPayment: false,
-      simulateNegotiationConflict: false,
     });
 
-    const runState = orchestrator.startProposalWorkflow({
+    const runState = await orchestrator.startProposalWorkflow({
       proposal: lowRiskApiProposal,
       initiatorActor: '后端架构师-赵工',
     });
@@ -104,10 +103,12 @@ workflow:
     ]);
     assert.equal(parsed.isForceHumanGate(WorkflowStageId.STAGE_3B_ENGINEER), true);
 
+    // J2 后：合法格式的新阶段键会被注册表自动收录为自定义节点（不再抛"未知阶段"）；
+    // 仍被拒绝的是**格式非法**的键（小写/超长等）与核心枚举阶段的角色非法声明。
     assert.throws(() => {
       WorkflowDslLoader.parseFromString(
-        'workflow:\n  id: "bad"\n  name: "bad"\n  stages:\n    - stageId: "INVALID_STAGE"\n      agentRole: "PM_AGENT"',
+        'workflow:\n  id: "bad"\n  name: "bad"\n  stages:\n    - stageId: "invalid_stage"\n      agentRole: "PM_AGENT"',
       );
-    }, /未知阶段标识/);
+    }, /非法/);
   });
 });

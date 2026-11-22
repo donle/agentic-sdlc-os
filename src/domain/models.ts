@@ -19,6 +19,12 @@ import {
  * 范围篡改检测报告 (Scope Diff Report — 防“虚假共识”机制产出)
  */
 export class ScopeDiffReport {
+  public static fromJSON(raw: Record<string, unknown> | undefined | null): ScopeDiffReport {
+    const baseline = (raw?.baselineRequirementIds as string[] | undefined) ?? [];
+    const current = (raw?.currentRequirementIds as string[] | undefined) ?? baseline;
+    return new ScopeDiffReport(baseline, current);
+  }
+
   public readonly baselineRequirementIds: ReadonlyArray<string>;
   public readonly currentRequirementIds: ReadonlyArray<string>;
   public readonly droppedRequirementIds: ReadonlyArray<string>;
@@ -141,9 +147,30 @@ export class StageSnapshotMemento {
  * Agent 间受限协商单轮记录实体
  */
 export class NegotiationTurnRecord {
+  public static fromJSON(raw: Record<string, unknown>): NegotiationTurnRecord {
+    return new NegotiationTurnRecord({
+      negotiationId: String(raw.negotiationId ?? ''),
+      runId: String(raw.runId ?? ''),
+      branchId: String(raw.branchId ?? ''),
+      topic: raw.topic ? String(raw.topic) : undefined,
+      turnIndex: Number(raw.turnIndex ?? 1),
+      maxTurnsAllowed: Number(raw.maxTurnsAllowed ?? 3),
+      challengerRole: String(raw.challengerRole ?? 'PD_AGENT') as never,
+      responderRole: String(raw.responderRole ?? 'PM_AGENT') as never,
+      challengePoint: String(raw.challengePoint ?? ''),
+      responseResolution: String(raw.responseResolution ?? ''),
+      consensusReached: Boolean(raw.consensusReached),
+      escalatedToSupervisor: Boolean(raw.escalatedToSupervisor),
+      optionAProposal: raw.optionAProposal ? String(raw.optionAProposal) : undefined,
+      optionBProposal: raw.optionBProposal ? String(raw.optionBProposal) : undefined,
+    });
+  }
+
   public readonly negotiationId: string;
   public readonly runId: string;
   public readonly branchId: string;
+  /** B2：协商主题（DESIGN_REVIEW / QA_REPAIR），缺省为设计评审 */
+  public readonly topic: string;
   public readonly turnIndex: number;
   public readonly maxTurnsAllowed: number;
   public readonly challengerRole: AgentRole;
@@ -160,6 +187,7 @@ export class NegotiationTurnRecord {
     negotiationId: string;
     runId: string;
     branchId: string;
+    topic?: string;
     turnIndex: number;
     maxTurnsAllowed: number;
     challengerRole: AgentRole;
@@ -174,6 +202,7 @@ export class NegotiationTurnRecord {
     this.negotiationId = params.negotiationId;
     this.runId = params.runId;
     this.branchId = params.branchId;
+    this.topic = params.topic ?? 'DESIGN_REVIEW';
     this.turnIndex = params.turnIndex;
     this.maxTurnsAllowed = params.maxTurnsAllowed;
     this.challengerRole = params.challengerRole;
@@ -194,6 +223,19 @@ export class NegotiationTurnRecord {
  * 人类或自动策略门禁裁决账本记录实体 (核心追责依据)
  */
 export class HumanDecisionRecord {
+  public static fromJSON(raw: Record<string, unknown>): HumanDecisionRecord {
+    return new HumanDecisionRecord({
+      decisionId: String(raw.decisionId ?? ''),
+      runId: String(raw.runId ?? ''),
+      snapshotId: String(raw.snapshotId ?? ''),
+      branchId: String(raw.branchId ?? ''),
+      stageId: String(raw.stageId ?? 'STAGE_1_PM') as never,
+      reviewerActor: String(raw.reviewerActor ?? ''),
+      verdict: String(raw.verdict ?? 'APPROVE') as never,
+      comment: String(raw.comment ?? ''),
+    });
+  }
+
   public readonly decisionId: string;
   public readonly runId: string;
   public readonly snapshotId: string;

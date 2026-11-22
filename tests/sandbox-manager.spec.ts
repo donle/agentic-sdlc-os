@@ -15,7 +15,7 @@ import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFa
 import { GitWorktreeSandboxManager } from '../src/sandbox/GitWorktreeSandboxManager.ts';
 
 describe('Block 4 — Git Worktree 隔离代码与测试沙箱管理器测试套件', () => {
-  it('1. 应在隔离沙箱目录中真实生成面向对象业务类与单测文件，并通过子进程 node --test 真实执行通过', () => {
+  it('1. 应在隔离沙箱目录中真实生成面向对象业务类与单测文件，并通过子进程 node --test 真实执行通过', async () => {
     const tempSandboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-sandbox-'));
     try {
       const manager = new GitWorktreeSandboxManager(tempSandboxRoot);
@@ -59,13 +59,21 @@ describe('Block 4 — Git Worktree 隔离代码与测试沙箱管理器测试套
       assert.equal(verifyResult.subprocessExecuted, true);
       assert.equal(verifyResult.filesVerifiedCount, 4);
       assert.equal(verifyResult.securityIssuesFound, 0);
-      assert.ok(verifyResult.executionLog.includes('Sandbox Verification Suite'));
+      // E2：真实 node:test 计数（2 个 spec 文件 × 2 个用例）与覆盖率解析
+      assert.equal(verifyResult.totalTestCases, 4);
+      assert.equal(verifyResult.passedTestCases, 4);
+      assert.equal(verifyResult.failedTestCases, 0);
+      assert.equal(verifyResult.suites.length, 2);
+      assert.ok(
+        verifyResult.executionLog.includes('[Suite '),
+        '执行日志应包含真实 node:test 套件输出',
+      );
     } finally {
       fs.rmSync(tempSandboxRoot, { recursive: true, force: true });
     }
   });
 
-  it('2. 静态安全扫描器应能精准捕获沙箱代码中注入的 eval() 或硬编码 API Key 漏洞', () => {
+  it('2. 静态安全扫描器应能精准捕获沙箱代码中注入的 eval() 或硬编码 API Key 漏洞', async () => {
     const tempSandboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-sec-'));
     try {
       const manager = new GitWorktreeSandboxManager(tempSandboxRoot);
@@ -98,7 +106,7 @@ describe('Block 4 — Git Worktree 隔离代码与测试沙箱管理器测试套
     }
   });
 
-  it('3. 总管 Agent 触发 DAG 分叉回退时，新旧分支的沙箱工作区应在磁盘上完全隔离', () => {
+  it('3. 总管 Agent 触发 DAG 分叉回退时，新旧分支的沙箱工作区应在磁盘上完全隔离', async () => {
     const tempSandboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-fork-sb-'));
     const tempPersistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-fork-db-'));
     try {
@@ -115,16 +123,15 @@ describe('Block 4 — Git Worktree 隔离代码与测试沙箱管理器测试套
           REQ_ISOLATED_MOD: '核心隔离模块',
         },
         involvesDatabaseMigration: false,
-        simulateNegotiationConflict: false,
       });
 
-      const runState = orchestrator.startProposalWorkflow({
+      const runState = await orchestrator.startProposalWorkflow({
         proposal,
         initiatorActor: '研发负责人-吴工',
       });
       const branchV1 = runState.getActiveBranchId();
 
-      orchestrator.invokeSupervisorConversationalRollback({
+      await orchestrator.invokeSupervisorConversationalRollback({
         runId: runState.runId,
         humanActor: '研发负责人-吴工',
         dialogueInstruction: '回退到 Engineer Agent，补充幂等校验注解',

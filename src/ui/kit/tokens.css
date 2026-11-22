@@ -1,0 +1,252 @@
+/**
+ * @file tokens.css
+ * @description Meridian UI 设计令牌层。
+ *
+ * 命名空间统一为 `--m-`，与旧版 workbench.css 的 `--bg-*` / `--text-*` 完全隔离，
+ * 因此两套样式可以在同一个页面并存，便于新旧对照评估；重构完成后再整体移除旧层。
+ *
+ * 三个核心主张：
+ * 1. 排版有度量（measure）—— 正文永远不铺满容器，按 ch 限宽；
+ * 2. 密度是令牌 —— 紧凑/标准/宽松三档靠切换 data-density 生效，无需重写样式；
+ * 3. 语义色承载状态 —— 组件不直接用颜色语义，只用语义色令牌。
+ */
+
+:root {
+  /* ═══════════════════════════════════════════════════════════════
+     1. 颜色 —— 浅色（默认）
+     ═══════════════════════════════════════════════════════════════ */
+  --m-canvas: #f4f5f7;
+  --m-surface: #ffffff;
+  --m-surface-2: #f8f9fb;
+  --m-surface-3: #eef0f4;
+  --m-surface-inset: #f2f4f7;
+  --m-overlay: rgb(16 19 26 / 45%);
+
+  --m-line: #e3e6eb;
+  --m-line-2: #cbd1da;
+  --m-line-3: #aeb6c2;
+
+  --m-ink: #10131a;
+  --m-ink-2: #4a5262;
+  --m-ink-3: #737c8c;
+  --m-ink-4: #9aa2b0;
+  --m-ink-inverse: #ffffff;
+
+  /* 语义色 —— 每个语义同时给出 strong(文字) / soft(背景) / line(边框) 三档 */
+  --m-brand: #2f54eb;
+  --m-brand-strong: #2440c4;
+  --m-brand-soft: rgb(47 84 235 / 9%);
+  --m-brand-line: rgb(47 84 235 / 26%);
+
+  --m-jade: #0e9f6e;
+  --m-jade-strong: #07764f;
+  --m-jade-soft: rgb(14 159 110 / 11%);
+  --m-jade-line: rgb(14 159 110 / 28%);
+
+  --m-amber: #c77700;
+  --m-amber-strong: #9a5c00;
+  --m-amber-soft: rgb(199 119 0 / 12%);
+  --m-amber-line: rgb(199 119 0 / 30%);
+
+  --m-coral: #dc2b2b;
+  --m-coral-strong: #b41f1f;
+  --m-coral-soft: rgb(220 43 43 / 10%);
+  --m-coral-line: rgb(220 43 43 / 28%);
+
+  --m-violet: #7b3fe4;
+  --m-violet-strong: #5f2cb5;
+  --m-violet-soft: rgb(123 63 228 / 10%);
+  --m-violet-line: rgb(123 63 228 / 26%);
+
+  --m-cyan: #0e7490;
+  --m-cyan-strong: #0a566b;
+  --m-cyan-soft: rgb(14 116 144 / 11%);
+  --m-cyan-line: rgb(14 116 144 / 26%);
+
+  --m-code-bg: #0f172a;
+  --m-code-ink: #c8d0de;
+  --m-code-dim: #5a6478;
+
+  /* ═══════════════════════════════════════════════════════════════
+     2. 字阶 —— 只有 6 级，禁止在组件里临时定义字号
+     ═══════════════════════════════════════════════════════════════ */
+  --m-font:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  --m-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --m-fs-display: 28px;
+  --m-fs-h1: 20px;
+  --m-fs-h2: 16px;
+  --m-fs-h3: 14px;
+  --m-fs-body: 13.5px;
+  --m-fs-sm: 12.5px;
+  --m-fs-xs: 11.5px;
+  --m-fs-micro: 10.5px;
+
+  --m-lh-display: 1.15;
+  --m-lh-h1: 1.3;
+  --m-lh-h2: 1.35;
+  --m-lh-h3: 1.4;
+  --m-lh-body: 1.6;
+  --m-lh-tight: 1.45;
+
+  --m-fw-regular: 400;
+  --m-fw-medium: 500;
+  --m-fw-semibold: 600;
+  --m-fw-bold: 700;
+
+  --m-tracking-display: -0.02em;
+  --m-tracking-label: 0.06em;
+
+  /* ═══════════════════════════════════════════════════════════════
+     3. 排版度量 —— 这组令牌直接解决"文字铺满组件"
+     正文 / 列表项 / 行内摘要 各有独立上限，永远不铺满容器
+     ═══════════════════════════════════════════════════════════════ */
+  --m-measure-prose: 68ch; /* 长段落阅读上限 */
+  --m-measure-list: 56ch; /* 列表项摘要上限 */
+  --m-measure-inline: 44ch; /* 行内短摘要上限 */
+  --m-measure-label: 18ch; /* 键名列固定宽 */
+
+  /* ═══════════════════════════════════════════════════════════════
+     4. 间距 / 圆角 / 阴影
+     ═══════════════════════════════════════════════════════════════ */
+  --m-sp-1: 4px;
+  --m-sp-2: 8px;
+  --m-sp-3: 12px;
+  --m-sp-4: 16px;
+  --m-sp-5: 20px;
+  --m-sp-6: 24px;
+  --m-sp-8: 32px;
+  --m-sp-10: 40px;
+  --m-sp-12: 48px;
+
+  --m-r-xs: 4px;
+  --m-r-sm: 6px;
+  --m-r-md: 10px;
+  --m-r-lg: 14px;
+  --m-r-pill: 999px;
+
+  --m-shadow-xs: 0 1px 2px rgb(16 19 26 / 5%);
+  --m-shadow-sm: 0 1px 3px rgb(16 19 26 / 6%), 0 1px 2px rgb(16 19 26 / 4%);
+  --m-shadow-md: 0 4px 14px rgb(16 19 26 / 8%);
+  --m-shadow-lg: 0 16px 40px rgb(16 19 26 / 12%);
+  --m-shadow-focus: 0 0 0 3px var(--m-brand-soft);
+
+  /* ═══════════════════════════════════════════════════════════════
+     5. 动效
+     ═══════════════════════════════════════════════════════════════ */
+  --m-dur-1: 120ms;
+  --m-dur-2: 180ms;
+  --m-dur-3: 260ms;
+  --m-dur-4: 420ms;
+  --m-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --m-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --m-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* ═══════════════════════════════════════════════════════════════
+     6. 密度（默认 comfortable）—— 改这三个令牌即可整体切换
+     ═══════════════════════════════════════════════════════════════ */
+  --m-density: 'comfortable';
+  --m-row-h: 34px;
+  --m-control-h: 32px;
+  --m-control-h-sm: 26px;
+  --m-pad-x: 16px;
+  --m-pad-y: 12px;
+  --m-gap: 12px;
+  --m-cell-pad-y: 10px;
+  --m-cell-pad-x: 12px;
+  --m-section-gap: 16px;
+  --m-body-fs: var(--m-fs-body);
+  --m-body-lh: var(--m-lh-body);
+}
+
+[data-theme='dark'] {
+  --m-canvas: #0b0d12;
+  --m-surface: #12151c;
+  --m-surface-2: #171b24;
+  --m-surface-3: #1e2430;
+  --m-surface-inset: #0e1116;
+  --m-overlay: rgb(3 5 8 / 62%);
+
+  --m-line: #232a36;
+  --m-line-2: #333c4c;
+  --m-line-3: #4b5567;
+
+  --m-ink: #eef1f6;
+  --m-ink-2: #a3adbd;
+  --m-ink-3: #7a8496;
+  --m-ink-4: #5b6475;
+  --m-ink-inverse: #0b0d12;
+
+  --m-brand: #5c7cfa;
+  --m-brand-strong: #7c95fb;
+  --m-brand-soft: rgb(92 124 250 / 16%);
+  --m-brand-line: rgb(92 124 250 / 34%);
+
+  --m-jade: #22c58b;
+  --m-jade-strong: #4bd7a6;
+  --m-jade-soft: rgb(34 197 139 / 15%);
+  --m-jade-line: rgb(34 197 139 / 34%);
+
+  --m-amber: #f0a92b;
+  --m-amber-strong: #f5c163;
+  --m-amber-soft: rgb(240 169 43 / 15%);
+  --m-amber-line: rgb(240 169 43 / 34%);
+
+  --m-coral: #ff5c5c;
+  --m-coral-strong: #ff8080;
+  --m-coral-soft: rgb(255 92 92 / 14%);
+  --m-coral-line: rgb(255 92 92 / 34%);
+
+  --m-violet: #a77bf5;
+  --m-violet-strong: #c0a0f8;
+  --m-violet-soft: rgb(167 123 245 / 15%);
+  --m-violet-line: rgb(167 123 245 / 34%);
+
+  --m-cyan: #22b8cf;
+  --m-cyan-strong: #56cbdf;
+  --m-cyan-soft: rgb(34 184 207 / 15%);
+  --m-cyan-line: rgb(34 184 207 / 34%);
+
+  --m-code-bg: #090b10;
+  --m-code-ink: #c8d0de;
+  --m-code-dim: #5a6478;
+
+  --m-shadow-xs: 0 1px 2px rgb(0 0 0 / 30%);
+  --m-shadow-sm: 0 2px 6px rgb(0 0 0 / 35%);
+  --m-shadow-md: 0 8px 24px rgb(0 0 0 / 45%);
+  --m-shadow-lg: 0 20px 48px rgb(0 0 0 / 55%);
+  --m-shadow-focus: 0 0 0 3px var(--m-brand-soft);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   7. 密度档位 —— 同一套组件，三种信息密度
+   ═══════════════════════════════════════════════════════════════ */
+[data-density='compact'] {
+  --m-row-h: 28px;
+  --m-control-h: 26px;
+  --m-control-h-sm: 22px;
+  --m-pad-x: 12px;
+  --m-pad-y: 9px;
+  --m-gap: 8px;
+  --m-cell-pad-y: 6px;
+  --m-cell-pad-x: 10px;
+  --m-section-gap: 12px;
+  --m-body-fs: var(--m-fs-sm);
+  --m-body-lh: var(--m-lh-tight);
+}
+
+[data-density='spacious'] {
+  --m-row-h: 42px;
+  --m-control-h: 38px;
+  --m-control-h-sm: 32px;
+  --m-pad-x: 20px;
+  --m-pad-y: 16px;
+  --m-gap: 16px;
+  --m-cell-pad-y: 14px;
+  --m-cell-pad-x: 16px;
+  --m-section-gap: 22px;
+  --m-body-fs: var(--m-fs-h3);
+  --m-body-lh: 1.7;
+}

@@ -12,6 +12,7 @@
  */
 
 import { AgentRole, WorkflowStageId } from '../domain/enums.ts';
+import { AgentRegistry } from '../agents/AgentRegistry.ts';
 import {
   EnterpriseUserAccount,
   SpecialistDomain,
@@ -23,8 +24,11 @@ import {
 export class RbacGovernanceService {
   private readonly users: Map<string, EnterpriseUserAccount>;
   private allowSpecialistCrossStageRollback: boolean;
+  /** J2：可插拔节点注册表（自定义节点的 RBAC 角色映射来源） */
+  private readonly agentRegistry: AgentRegistry;
 
-  public constructor() {
+  public constructor(agentRegistry?: AgentRegistry) {
+    this.agentRegistry = agentRegistry ?? AgentRegistry.default();
     this.users = new Map<string, EnterpriseUserAccount>();
     this.allowSpecialistCrossStageRollback = true;
     this.seedEnterpriseRoster();
@@ -202,6 +206,11 @@ export class RbacGovernanceService {
   }
 
   public getRequiredRolesForStage(stageId: WorkflowStageId): ReadonlyArray<string> {
+    // J2：自定义节点（注册表声明）的角色映射配置化；核心阶段走下方硬编码矩阵
+    const customRoles = this.agentRegistry.getRequiredHumanRoles(String(stageId));
+    if (customRoles !== null) {
+      return customRoles;
+    }
     switch (stageId) {
       case WorkflowStageId.STAGE_0_INITIATION:
       case WorkflowStageId.STAGE_1_PM:

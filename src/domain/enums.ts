@@ -95,6 +95,10 @@ export const NotificationCategory = {
   AUTO_PASSED_TRACE: 'AUTO_PASSED_TRACE',
   ROLLBACK_EXECUTED: 'ROLLBACK_EXECUTED',
   STAGE_PROGRESS: 'STAGE_PROGRESS',
+  /** B3：Token 预算守卫熔断（人工提高预算后可继续） */
+  TOKEN_BUDGET_EXCEEDED: 'TOKEN_BUDGET_EXCEEDED',
+  /** A2：阶段契约在自愈重试耗尽后仍失败（人工可重试本阶段） */
+  STAGE_CONTRACT_FAILED: 'STAGE_CONTRACT_FAILED',
 } as const;
 export type NotificationCategory = (typeof NotificationCategory)[keyof typeof NotificationCategory];
 
@@ -117,5 +121,6 @@ export type IntentFulfillmentStatus =
 export const ModelRoutingTier = {
   PRIVACY_SENSITIVE_LOCAL: 'PRIVACY_SENSITIVE_LOCAL',
   HIGH_REASONING_HYBRID: 'HIGH_REASONING_HYBRID',
+  EMBEDDING: 'EMBEDDING',
 } as const;
 export type ModelRoutingTier = (typeof ModelRoutingTier)[keyof typeof ModelRoutingTier];

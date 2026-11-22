@@ -3,7 +3,7 @@
  * @description 企业级多角色前端 REST API 与 SSE (Server-Sent Events) 客户端，自动携带当前登录角色身份 (`X-Actor-Id`)。
  */
 
-import type { DashboardStateDto, RagQueryMatchDto } from './types.ts';
+import type { DashboardStateDto, ModelBaselineCheckDto, RagQueryMatchDto } from './types.ts';
 
 interface ApiResponseEnvelope<T> {
   readonly ok: boolean;
@@ -231,6 +231,20 @@ export class WorkbenchApiClient {
       throw new Error(json.error ?? '检索负向经验向量库失败');
     }
     return json.data.matches;
+  }
+
+  /** A4：执行模型能力基线体检（admin-only；两级端点各 3 个固定 JSON 任务） */
+  public async runModelBaseline(): Promise<ModelBaselineCheckDto> {
+    const res = await fetch('/api/admin/model-baseline', {
+      method: 'POST',
+      headers: this.buildHeaders(),
+      body: JSON.stringify({}),
+    });
+    const json = (await res.json()) as ApiResponseEnvelope<ModelBaselineCheckDto>;
+    if (!json.ok || !json.data) {
+      throw new Error(json.error ?? '模型体检请求失败');
+    }
+    return json.data;
   }
 
   public async ingestNegativeExperienceLesson(

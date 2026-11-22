@@ -72,14 +72,14 @@ export class ProductManagerAgent extends AbstractWorkerAgent<PrdArtifactContract
     );
   }
 
-  protected override synthesizeArtifact(
+  protected override synthesizeTemplateArtifact(
     context: AgentExecutionInputContext,
     _attemptIndex: number,
   ): PrdArtifactContract {
     const allReqIds = [...context.proposal.coreRequirementIds];
     // 如果提案配置了“模拟虚假共识删减需求”，则故意在协商后丢弃最后一项需求，用于触发 FalseConsensusGuard 告警
     const effectiveReqIds =
-      context.proposal.simulateScopeReductionAttempt && allReqIds.length > 1
+      context.scenarioHints?.forceScopeReduction === true && allReqIds.length > 1
         ? allReqIds.slice(0, allReqIds.length - 1)
         : allReqIds;
 
@@ -121,17 +121,5 @@ export class ProductManagerAgent extends AbstractWorkerAgent<PrdArtifactContract
       trackingPlanEvents,
       nonFunctionalConstraints,
     });
-  }
-
-  protected override estimateTokenUsage(
-    context: AgentExecutionInputContext,
-    attemptIndex: number,
-  ): { promptTokens: number; completionTokens: number } {
-    const basePrompt = 1400 + context.proposal.coreRequirementIds.length * 180;
-    const baseCompletion = 950 + context.proposal.coreRequirementIds.length * 150;
-    return {
-      promptTokens: basePrompt + attemptIndex * 300,
-      completionTokens: baseCompletion,
-    };
   }
 }

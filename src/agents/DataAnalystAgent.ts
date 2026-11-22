@@ -52,7 +52,7 @@ export class DataAnalystAgent extends AbstractWorkerAgent<DataAnalysisArtifactCo
     );
   }
 
-  protected override synthesizeArtifact(
+  protected override synthesizeTemplateArtifact(
     context: AgentExecutionInputContext,
     _attemptIndex: number,
   ): DataAnalysisArtifactContract {
@@ -84,15 +84,5 @@ export class DataAnalystAgent extends AbstractWorkerAgent<DataAnalysisArtifactCo
         },
       ],
     });
-  }
-
-  protected override estimateTokenUsage(
-    context: AgentExecutionInputContext,
-    attemptIndex: number,
-  ): { promptTokens: number; completionTokens: number } {
-    return {
-      promptTokens: 1200 + context.proposal.coreRequirementIds.length * 140 + attemptIndex * 180,
-      completionTokens: 850,
-    };
   }
 }

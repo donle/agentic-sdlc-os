@@ -65,7 +65,7 @@ export class ProductDesignerAgent extends AbstractWorkerAgent<UiDesignArtifactCo
     );
   }
 
-  protected override synthesizeArtifact(
+  protected override synthesizeTemplateArtifact(
     context: AgentExecutionInputContext,
     _attemptIndex: number,
   ): UiDesignArtifactContract {
@@ -94,9 +94,10 @@ export class ProductDesignerAgent extends AbstractWorkerAgent<UiDesignArtifactCo
       ],
     }));
 
-    const challengeNote = context.proposal.simulateNegotiationConflict
-      ? 'PD 质询：PRD 要求的「移动端三维实时拓扑拖拽」超出当前企业组件库性能边界，建议降级为双栏折叠抽屉或申请 2 人日新增自定义画布组件'
-      : null;
+    const challengeNote =
+      context.scenarioHints?.forceNegotiationDeadlock === true
+        ? 'PD 质询：PRD 要求的「移动端三维实时拓扑拖拽」超出当前企业组件库性能边界，建议降级为双栏折叠抽屉或申请 2 人日新增自定义画布组件'
+        : null;
 
     return new UiDesignArtifactContract({
       summary: `已产出 UI/UX 组件规范（采用 ${preferredContainer} 布局，映射 ${componentMappings.length} 组核心视图）${context.humanFeedbackDirective ? ` [已执行回退修正: ${context.humanFeedbackDirective}]` : ''}`,
@@ -108,15 +109,5 @@ export class ProductDesignerAgent extends AbstractWorkerAgent<UiDesignArtifactCo
       ],
       designChallengeNote: challengeNote,
     });
-  }
-
-  protected override estimateTokenUsage(
-    context: AgentExecutionInputContext,
-    attemptIndex: number,
-  ): { promptTokens: number; completionTokens: number } {
-    return {
-      promptTokens: 1650 + context.proposal.coreRequirementIds.length * 160 + attemptIndex * 250,
-      completionTokens: 1100,
-    };
   }
 }

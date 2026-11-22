@@ -17,7 +17,7 @@ import { UserHierarchyTier } from '../src/domain/rbac.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
 
 describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测试套件', () => {
-  it('1. 所有环节员工均应共享完整工作流视图，但仅专长领域负责人或顶层管理员可签核对应阶段门禁', () => {
+  it('1. 所有环节员工均应共享完整工作流视图，但仅专长领域负责人或顶层管理员可签核对应阶段门禁', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-rbac-'));
     try {
       const orchestrator = new WorkflowOrchestratorFacade({ persistenceDir: tempDir });
@@ -30,12 +30,12 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
         },
         involvesDatabaseMigration: true,
         involvesPermissionOrPayment: true,
-        simulateNegotiationConflict: true,
       });
 
-      const runState = orchestrator.startProposalWorkflow({
+      const runState = await orchestrator.startProposalWorkflow({
         proposal,
         initiatorActor: '陈工 (PM)',
+        scenarioHints: { forceNegotiationDeadlock: true },
       });
 
       // 当前卡在 Stage 2 (STAGE_2_PD)
@@ -46,7 +46,7 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
       // QA 员工 (user-qa-01) 可以完整查看共享工作流状态，但尝试拍板 Stage 2 PD 门禁应被 RBAC 拦截
       const qaDashboard = orchestrator.buildWorkbenchDashboardState(runState.runId, 'user-qa-01');
       assert.equal(qaDashboard.hasActiveRun, true);
-      assert.throws(() => {
+      await assert.rejects(
         orchestrator.submitHumanGateDecision({
           runId: runState.runId,
           snapshotId: stage2Snap.snapshotId,
@@ -54,11 +54,12 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
           actorUserId: 'user-qa-01',
           verdict: DecisionVerdict.ARBITRATE_OPTION_A,
           comment: 'QA 尝试越权拍板 UI 设计冲突',
-        });
-      }, /RBAC 权限拦截/);
+        }),
+        /RBAC 权限拦截/,
+      );
 
       // PD 专长设计师 (user-pd-01) 属于 Stage 2 领域负责人，拍板应成功通过并推进到 Stage 3a (Tech Spec DDL 门禁)
-      orchestrator.submitHumanGateDecision({
+      await orchestrator.submitHumanGateDecision({
         runId: runState.runId,
         snapshotId: stage2Snap.snapshotId,
         reviewerActor: '林工 (PD/UX)',
@@ -72,7 +73,7 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
       assert.ok(stage3aSnap);
 
       // PM 员工 (user-pm-01) 尝试签核 Stage 3a 架构师 DDL 门禁，应被 RBAC 拦截
-      assert.throws(() => {
+      await assert.rejects(
         orchestrator.submitHumanGateDecision({
           runId: runState.runId,
           snapshotId: stage3aSnap.snapshotId,
@@ -80,11 +81,12 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
           actorUserId: 'user-pm-01',
           verdict: DecisionVerdict.APPROVE,
           comment: 'PM 尝试越权签核数据库 DDL',
-        });
-      }, /RBAC 权限拦截/);
+        }),
+        /RBAC 权限拦截/,
+      );
 
       // 顶层管理员 (user-admin-01) 拥有最高权限 (Admin Override)，可跨阶段签核 Stage 3a 并推进至 Stage 4 QA
-      orchestrator.submitHumanGateDecision({
+      await orchestrator.submitHumanGateDecision({
         runId: runState.runId,
         snapshotId: stage3aSnap.snapshotId,
         reviewerActor: '王总管',
@@ -99,7 +101,7 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
     }
   });
 
-  it('2. 仅顶层管理员 (PROJECT_ADMIN) 可修改全局工作流治理参数，普通专长员工调用将被拦截', () => {
+  it('2. 仅顶层管理员 (PROJECT_ADMIN) 可修改全局工作流治理参数，普通专长员工调用将被拦截', async () => {
     const orchestrator = new WorkflowOrchestratorFacade();
     const adminUser = orchestrator.rbacService.getUserOrThrow('user-admin-01');
     const engUser = orchestrator.rbacService.getUserOrThrow('user-eng-01');
@@ -135,7 +137,7 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
     });
   });
 
-  it('3. 任何角色的团队成员均可在任意项目步骤下发表共享评论，且签核或回退操作自动记入步骤评论流', () => {
+  it('3. 任何角色的团队成员均可在任意项目步骤下发表共享评论，且签核或回退操作自动记入步骤评论流', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-cmt-'));
     try {
       const orchestrator = new WorkflowOrchestratorFacade({ persistenceDir: tempDir });
@@ -147,7 +149,7 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
           REQ_COLLAB: '支持跨角色评论协同',
         },
       });
-      const runState = orchestrator.startProposalWorkflow({
+      const runState = await orchestrator.startProposalWorkflow({
         proposal,
         initiatorActor: '陈工 (PM)',
       });

@@ -154,6 +154,24 @@ export interface RagQueryMatchDto {
   readonly similarityScore: number;
 }
 
+/** A4：单条模型能力基线体检报告 */
+export interface ModelBaselineReportDto {
+  readonly tier: string;
+  readonly modelIdentifier: string;
+  readonly jsonSchemaAdherencePassed: boolean;
+  readonly requiredKeysVerified: ReadonlyArray<string>;
+  readonly missingKeys: ReadonlyArray<string>;
+  readonly desensitizationActive: boolean;
+  readonly recommendation: string;
+  readonly taskName?: string;
+}
+
+/** A4：模型体检汇总（offline = 未启用在线网关，未执行） */
+export interface ModelBaselineCheckDto {
+  readonly offline: boolean;
+  readonly reports: ReadonlyArray<ModelBaselineReportDto>;
+}
+
 export interface RetrospectiveDiagnosisDto {
   readonly metricName: string;
   readonly targetThreshold: string;
@@ -196,6 +214,21 @@ export interface AuditEntryDto {
   readonly timestampIso: string;
 }
 
+/**
+ * Agent 生命周期实时事件 (对应后端 WorkflowDomainEvent，经 liveInteractionStream 下发)
+ */
+export interface WorkflowDomainEventDto {
+  readonly eventId: string;
+  readonly runId: string;
+  readonly branchId: string;
+  readonly stageId: string;
+  readonly agentRole: string;
+  readonly lifecycleState: string;
+  readonly headline: string;
+  readonly detailPayload: Readonly<Record<string, unknown>>;
+  readonly timestampIso: string;
+}
+
 export interface RunSummaryDto {
   readonly runId: string;
   readonly title: string;
@@ -226,6 +259,7 @@ export interface DashboardStateDto {
   readonly teamComments?: ReadonlyArray<TeamCommentDto>;
   readonly negativeExperienceRecords?: ReadonlyArray<NegativeExperienceRecordDto>;
   readonly auditTimeline?: ReadonlyArray<AuditEntryDto>;
+  readonly liveInteractionStream?: ReadonlyArray<WorkflowDomainEventDto>;
   readonly retrospectiveReport?: RetrospectiveReportDto;
   readonly workflowDslSummary?: {
     readonly workflowId: string;
@@ -254,4 +288,20 @@ export interface DashboardStateDto {
     readonly negativeExperienceLessonsCount: number;
     readonly lastSyncedAtIso: string;
   };
+}
+
+/** 流程图单个阶段节点的渲染输入 */
+export interface FlowNodeInput {
+  readonly stageId: string;
+  readonly activeBranchSnapshot: SnapshotRecordDto | null;
+  readonly supersededVersionCount: number;
+  readonly rejectedCount: number;
+  readonly hasPendingGateNotification: boolean;
+}
+
+/** PM↔PD 协商弧线提示 */
+export interface FlowNegotiationHint {
+  readonly turnIndex: number;
+  readonly maxTurnsAllowed: number;
+  readonly escalated: boolean;
 }

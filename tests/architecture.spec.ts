@@ -18,7 +18,7 @@ import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFa
 import { RetrospectiveBenchmarkSuite } from '../src/retrospective/runRetrospective.ts';
 
 describe('Agentic SDLC OS — 面向对象多智能体协同框架核心测试套件', () => {
-  it('1. 低风险提案应自动通过前序阶段并强制留存审计追踪痕迹，直达 Stage 4 QA 终审门禁', () => {
+  it('1. 低风险提案应自动通过前序阶段并强制留存审计追踪痕迹，直达 Stage 4 QA 终审门禁', async () => {
     const orchestrator = new WorkflowOrchestratorFacade();
     const lowRiskProposal = new ProjectProposalContract({
       proposalId: 'TEST-LOW-001',
@@ -30,10 +30,9 @@ describe('Agentic SDLC OS — 面向对象多智能体协同框架核心测试�
       },
       involvesDatabaseMigration: false,
       involvesPermissionOrPayment: false,
-      simulateNegotiationConflict: false,
     });
 
-    const runState = orchestrator.startProposalWorkflow({
+    const runState = await orchestrator.startProposalWorkflow({
       proposal: lowRiskProposal,
       initiatorActor: '测试发起人-小李',
     });
@@ -54,7 +53,7 @@ describe('Agentic SDLC OS — 面向对象多智能体协同框架核心测试�
     assert.equal(decisions[0].verdict, DecisionVerdict.AUTO_PASS_LOW_RISK);
   });
 
-  it('2. PM 与 PD 协商超出最大讨论限制 (Max Turns = 3) 时应触发熔断，由总管 Agent 接管并推送待裁决提醒', () => {
+  it('2. PM 与 PD 协商超出最大讨论限制 (Max Turns = 3) 时应触发熔断，由总管 Agent 接管并推送待裁决提醒', async () => {
     const orchestrator = new WorkflowOrchestratorFacade({
       maxNegotiationTurns: 3,
       highRiskThreshold: 60,
@@ -68,12 +67,13 @@ describe('Agentic SDLC OS — 面向对象多智能体协同框架核心测试�
         REQ_DDL_AUDIT: '新增拓扑节点审计表',
       },
       involvesDatabaseMigration: true,
-      simulateNegotiationConflict: true,
+      involvesPermissionOrPayment: true,
     });
 
-    const runState = orchestrator.startProposalWorkflow({
+    const runState = await orchestrator.startProposalWorkflow({
       proposal: conflictProposal,
       initiatorActor: '产品经理-周工',
+      scenarioHints: { forceNegotiationDeadlock: true },
     });
 
     // 应在 Stage 2 (PD) 触发 3 轮协商熔断并暂停
@@ -93,7 +93,7 @@ describe('Agentic SDLC OS — 面向对象多智能体协同框架核心测试�
     assert.equal(conflictNotif.requiresHumanAction, true);
   });
 
-  it('3. 通过与总管 Agent 自然语言对话回退时，应 Fork 出新 DAG 分支并将旧分支下游快照标记为 SUPERSEDED', () => {
+  it('3. 通过与总管 Agent 自然语言对话回退时，应 Fork 出新 DAG 分支并将旧分支下游快照标记为 SUPERSEDED', async () => {
     const orchestrator = new WorkflowOrchestratorFacade();
     const proposal = new ProjectProposalContract({
       proposalId: 'TEST-ROLLBACK-003',
@@ -103,17 +103,16 @@ describe('Agentic SDLC OS — 面向对象多智能体协同框架核心测试�
         REQ_TICKET_FLOW: '支持工单状态流转',
       },
       involvesDatabaseMigration: false,
-      simulateNegotiationConflict: false,
     });
 
-    const runState = orchestrator.startProposalWorkflow({
+    const runState = await orchestrator.startProposalWorkflow({
       proposal,
       initiatorActor: '研发主管-孙工',
     });
 
     // 此时已到达 Stage 4 QA，用户对总管 Agent 说：“回退到 PD Agent，把弹窗改为侧边抽屉”
     const previousBranch = runState.getActiveBranchId();
-    orchestrator.invokeSupervisorConversationalRollback({
+    await orchestrator.invokeSupervisorConversationalRollback({
       runId: runState.runId,
       humanActor: '研发主管-孙工',
       dialogueInstruction: '回退到 PD Agent，把弹窗交互改为双栏折叠抽屉布局',
@@ -135,9 +134,9 @@ describe('Agentic SDLC OS — 面向对象多智能体协同框架核心测试�
     );
   });
 
-  it('4. 复盘任务应准确统计 (a) 双层缓存命中率 与 (b) 意图达成率及重试次数分布', () => {
+  it('4. 复盘任务应准确统计 (a) 双层缓存命中率 与 (b) 意图达成率及重试次数分布', async () => {
     const benchmark = new RetrospectiveBenchmarkSuite();
-    const report = benchmark.runFullSuite();
+    const report = await benchmark.runFullSuite();
 
     assert.equal(report.overallHealthy, true, '基准复盘任务所有成本与质量 SLA 应全部达标');
     assert.ok(

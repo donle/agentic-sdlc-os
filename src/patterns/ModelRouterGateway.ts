@@ -110,6 +110,8 @@ export class ModelInvocationReceipt {
   public readonly estimatedCostUsd: number;
   public readonly redactedCount: number;
   public readonly redactedCategories: ReadonlyArray<string>;
+  /** A3：true = 网关未返回 usage，按长度估算；false = 真实账单口径 */
+  public readonly usageEstimated: boolean;
 
   public constructor(params: {
     endpoint: ModelEndpointDescriptor;
@@ -117,6 +119,7 @@ export class ModelInvocationReceipt {
     completionTokens: number;
     redactedCount?: number;
     redactedCategories?: ReadonlyArray<string>;
+    usageEstimated?: boolean;
   }) {
     this.modelIdentifier = params.endpoint.modelIdentifier;
     this.providerName = params.endpoint.providerName;
@@ -129,6 +132,7 @@ export class ModelInvocationReceipt {
     );
     this.redactedCount = params.redactedCount ?? 0;
     this.redactedCategories = params.redactedCategories ? [...params.redactedCategories] : [];
+    this.usageEstimated = params.usageEstimated ?? true;
   }
 }
 
@@ -164,6 +168,23 @@ export type ModelHttpTransport = (
   headers: Record<string, string>,
 ) => Promise<OpenAiCompatibleChatResponse>;
 
+/** G1：OpenAI 兼容 `/v1/embeddings` 请求体 */
+export interface OpenAiCompatibleEmbeddingRequest {
+  readonly model: string;
+  readonly input: string;
+}
+
+export interface OpenAiCompatibleEmbeddingResponse {
+  readonly data: ReadonlyArray<{ readonly embedding: ReadonlyArray<number> }>;
+  readonly usage?: { readonly prompt_tokens: number; readonly total_tokens: number };
+}
+
+export type EmbeddingHttpTransport = (
+  url: string,
+  payload: OpenAiCompatibleEmbeddingRequest,
+  headers: Record<string, string>,
+) => Promise<OpenAiCompatibleEmbeddingResponse>;
+
 export interface ModelBaselineEvalReport {
   readonly tier: ModelRoutingTier;
   readonly modelIdentifier: string;
@@ -172,17 +193,21 @@ export interface ModelBaselineEvalReport {
   readonly missingKeys: ReadonlyArray<string>;
   readonly desensitizationActive: boolean;
   readonly recommendation: string;
+  /** A4：产生该报告的体检任务名（单任务评估时缺省） */
+  readonly taskName?: string;
 }
 
 export class ModelRouterGateway {
   private readonly endpoints: Map<ModelRoutingTier, ModelEndpointDescriptor>;
   private readonly desensitizer: PayloadDesensitizer;
   private customHttpTransport: ModelHttpTransport | null;
+  private customEmbeddingTransport: EmbeddingHttpTransport | null;
 
   public constructor(customHttpTransport?: ModelHttpTransport) {
     this.endpoints = new Map<ModelRoutingTier, ModelEndpointDescriptor>();
     this.desensitizer = new PayloadDesensitizer();
     this.customHttpTransport = customHttpTransport ?? null;
+    this.customEmbeddingTransport = null;
 
     // 默认注册企业单机私有化双层模型路由配置
     this.registerEndpoint(
@@ -203,10 +228,25 @@ export class ModelRouterGateway {
         isLocalPrivateModel: false,
       }),
     );
+    // G1/G2：embedding 层（单机私有化默认指向本地 Ollama/vLLM 兼容端点）
+    this.registerEndpoint(
+      new ModelEndpointDescriptor({
+        tier: ModelRoutingTier.EMBEDDING,
+        providerName: 'Local-Embedding-OnPremise',
+        modelIdentifier: process.env.EMBEDDING_MODEL ?? 'bge-m3-local',
+        costPer1kTokensUsd: 0.00002,
+        isLocalPrivateModel: true,
+      }),
+    );
   }
 
   public setHttpTransport(transport: ModelHttpTransport | null): void {
     this.customHttpTransport = transport;
+  }
+
+  /** G1/G2：注入 embedding 专用传输适配器（测试 mock 用）；null 恢复默认 fetch */
+  public setEmbeddingTransport(transport: EmbeddingHttpTransport | null): void {
+    this.customEmbeddingTransport = transport;
   }
 
   public getDesensitizer(): PayloadDesensitizer {
@@ -290,7 +330,7 @@ export class ModelRouterGateway {
         { role: 'system', content: sanitizedSystem.sanitizedText },
         { role: 'user', content: sanitizedUser.sanitizedText },
       ],
-      temperature: 0.1,
+      temperature: 0,
       response_format: { type: 'json_object' },
     };
 
@@ -308,10 +348,12 @@ export class ModelRouterGateway {
         const transport: ModelHttpTransport =
           this.customHttpTransport ??
           (async (url, payload, hdrs) => {
+            const timeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 60000);
             const response = await fetch(url, {
               method: 'POST',
               headers: hdrs,
               body: JSON.stringify(payload),
+              signal: AbortSignal.timeout(timeoutMs),
             });
             if (!response.ok) {
               throw new Error(`HTTP ${response.status}`);
@@ -321,6 +363,7 @@ export class ModelRouterGateway {
 
         const apiRes = await transport(targetUrl, requestPayload, headers);
         const content = apiRes.choices[0]?.message?.content ?? params.fallbackContentGenerator();
+        const usageEstimated = !apiRes.usage;
         const promptTokens =
           apiRes.usage?.prompt_tokens ?? Math.ceil(sanitizedUser.sanitizedText.length / 3);
         const completionTokens = apiRes.usage?.completion_tokens ?? Math.ceil(content.length / 3);
@@ -333,6 +376,7 @@ export class ModelRouterGateway {
             completionTokens,
             redactedCount: totalRedacted,
             redactedCategories: mergedCategories,
+            usageEstimated,
           }),
           usedLiveGateway: true,
         };
@@ -362,12 +406,86 @@ export class ModelRouterGateway {
   }
 
   /**
+   * G1/G2：调用 OpenAI 兼容 `/v1/embeddings` 获取文本向量（自动脱敏；不可达时抛错由调用方降级）
+   */
+  public async invokeEmbedding(params: { text: string; tier?: ModelRoutingTier }): Promise<{
+    readonly embedding: ReadonlyArray<number>;
+    readonly receipt: ModelInvocationReceipt;
+    readonly usedLiveGateway: boolean;
+  }> {
+    const tier = params.tier ?? ModelRoutingTier.EMBEDDING;
+    const endpoint = this.resolveEndpoint(tier);
+    const sanitized = this.preparePromptForTier(tier, params.text);
+
+    const requestPayload: OpenAiCompatibleEmbeddingRequest = {
+      model: endpoint.modelIdentifier,
+      input: sanitized.sanitizedText,
+    };
+    const targetUrl = `${endpoint.baseUrl.replace(/\/$/, '')}/v1/embeddings`;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.LITELLM_API_KEY ?? 'sk-local-onpremise'}`,
+    };
+
+    const shouldTryLive =
+      this.customEmbeddingTransport !== null || process.env.LITELLM_ENABLE_LIVE_HTTP === 'true';
+    if (!shouldTryLive) {
+      throw new Error('EMBEDDING_UNAVAILABLE: 未启用 embedding 在线端点');
+    }
+
+    try {
+      const transport: EmbeddingHttpTransport =
+        this.customEmbeddingTransport ??
+        (async (url, payload, hdrs) => {
+          const timeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 60000);
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: hdrs,
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(timeoutMs),
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          return (await response.json()) as OpenAiCompatibleEmbeddingResponse;
+        });
+
+      const apiRes = await transport(targetUrl, requestPayload, headers);
+      const embedding = apiRes.data[0]?.embedding;
+      if (!embedding || embedding.length === 0) {
+        throw new Error('EMBEDDING_EMPTY_RESPONSE');
+      }
+
+      const promptTokens =
+        apiRes.usage?.prompt_tokens ?? Math.ceil(sanitized.sanitizedText.length / 3);
+      return {
+        embedding,
+        receipt: new ModelInvocationReceipt({
+          endpoint,
+          promptTokens,
+          completionTokens: 0,
+          redactedCount: sanitized.redactedCount,
+          redactedCategories: sanitized.redactedCategories,
+          usageEstimated: !apiRes.usage,
+        }),
+        usedLiveGateway: true,
+      };
+    } catch (err) {
+      throw new Error(
+        `EMBEDDING_UNAVAILABLE: ${err instanceof Error ? err.message.slice(0, 100) : String(err)}`,
+        { cause: err },
+      );
+    }
+  }
+
+  /**
    * 模型能力基线体检（Eval）：校验候选模型的 JSON Schema 遵循度与必选契约字段完整性
    */
   public evaluateEndpointBaseline(params: {
     tier: ModelRoutingTier;
     sampleJsonOutput: string;
     requiredKeys: ReadonlyArray<string>;
+    taskName?: string;
   }): ModelBaselineEvalReport {
     const endpoint = this.resolveEndpoint(params.tier);
     const verifiedKeys: string[] = [];
@@ -401,6 +519,73 @@ export class ModelRouterGateway {
       recommendation: jsonValid
         ? `模型 [${endpoint.modelIdentifier}] 通过 JSON 契约遵循度基线体检，可挂载至生产节点`
         : `警告：模型 [${endpoint.modelIdentifier}] 输出缺失必填契约字段 [${missingKeys.join(', ')}]，建议开启 Schema 自愈重试或降级至本地结构化模板`,
+      ...(params.taskName ? { taskName: params.taskName } : {}),
     };
+  }
+
+  /**
+   * A4：对两级对话端点各发 3 个固定 JSON 体检任务 → evaluateEndpointBaseline 汇总报告。
+   * 离线（未启用 live HTTP 且无注入 transport）→ 返回 offline 标记，不做任何网络调用。
+   */
+  public async runModelBaselineCheck(): Promise<{
+    offline: boolean;
+    reports: ModelBaselineEvalReport[];
+  }> {
+    const live =
+      this.customHttpTransport !== null || process.env.LITELLM_ENABLE_LIVE_HTTP === 'true';
+    if (!live) {
+      return { offline: true, reports: [] };
+    }
+
+    const benchmarkTasks = [
+      {
+        name: 'FLAT_OBJECT',
+        prompt: '仅输出一个 JSON 对象：{"summary":"基线体检样例","count":3}',
+        requiredKeys: ['summary', 'count'],
+      },
+      {
+        name: 'NESTED_ARRAY',
+        prompt: '仅输出一个 JSON 对象：{"total":2,"items":[{"id":"a1"},{"id":"b2"}]}',
+        requiredKeys: ['total', 'items'],
+      },
+      {
+        name: 'ENUM_FIELD',
+        prompt:
+          '仅输出一个 JSON 对象：{"status":"PASS","detail":"基线体检"}，status 只能取 PASS 或 FAIL',
+        requiredKeys: ['status', 'detail'],
+      },
+    ] as const;
+
+    const chatTiers: ReadonlyArray<ModelRoutingTier> = [
+      ModelRoutingTier.PRIVACY_SENSITIVE_LOCAL,
+      ModelRoutingTier.HIGH_REASONING_HYBRID,
+    ];
+    const reports: ModelBaselineEvalReport[] = [];
+    for (const tier of chatTiers) {
+      for (const task of benchmarkTasks) {
+        try {
+          const result = await this.invokeChatCompletion({
+            tier,
+            systemPrompt: '你是模型能力基线体检器。严格遵守任务指令。',
+            userPrompt: task.prompt,
+            fallbackContentGenerator: () => '',
+          });
+          if (!result.usedLiveGateway || !result.content.trim()) {
+            continue;
+          }
+          reports.push(
+            this.evaluateEndpointBaseline({
+              tier,
+              sampleJsonOutput: result.content,
+              requiredKeys: task.requiredKeys,
+              taskName: task.name,
+            }),
+          );
+        } catch {
+          // 单任务失败不阻断其余任务（报告缺失即该任务未通过）
+        }
+      }
+    }
+    return { offline: false, reports };
   }
 }

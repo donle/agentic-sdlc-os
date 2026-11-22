@@ -65,7 +65,7 @@ export class TechLeadAgent extends AbstractWorkerAgent<TechSpecArtifactContract>
     );
   }
 
-  protected override synthesizeArtifact(
+  protected override synthesizeTemplateArtifact(
     context: AgentExecutionInputContext,
     _attemptIndex: number,
   ): TechSpecArtifactContract {
@@ -106,15 +106,5 @@ export class TechLeadAgent extends AbstractWorkerAgent<TechSpecArtifactContract>
         'Mediator & Command Pattern (SupervisorAgent & BoundedNegotiationMediator)',
       ],
     });
-  }
-
-  protected override estimateTokenUsage(
-    context: AgentExecutionInputContext,
-    attemptIndex: number,
-  ): { promptTokens: number; completionTokens: number } {
-    return {
-      promptTokens: 1900 + context.proposal.coreRequirementIds.length * 200 + attemptIndex * 300,
-      completionTokens: 1350,
-    };
   }
 }

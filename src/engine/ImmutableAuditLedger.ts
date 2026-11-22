@@ -15,6 +15,7 @@ import { AgentUserNotification, HumanDecisionRecord } from '../domain/models.ts'
 import { type IWorkflowEventObserver, WorkflowDomainEvent } from '../patterns/EventBus.ts';
 import { NegativeExperienceRagEngine } from './NegativeExperienceRagEngine.ts';
 import type { PersistenceRepository } from './PersistenceRepository.ts';
+import type { EmbeddingProvider } from '../telemetry/EmbeddingProvider.ts';
 
 export class AuditTrailEntry {
   public readonly entryId: string;
@@ -36,6 +37,8 @@ export class AuditTrailEntry {
     actionType: string;
     summary: string;
     metadata?: Record<string, unknown>;
+    /** I3：条目时间（缺省取当前时间）——WAL 按月归档的归属依据 */
+    timestampIso?: string;
   }) {
     this.entryId = params.entryId;
     this.runId = params.runId;
@@ -45,7 +48,7 @@ export class AuditTrailEntry {
     this.actionType = params.actionType;
     this.summary = params.summary;
     this.metadata = params.metadata ? { ...params.metadata } : {};
-    this.timestampIso = new Date().toISOString();
+    this.timestampIso = params.timestampIso ?? new Date().toISOString();
   }
 }
 
@@ -56,11 +59,14 @@ export class ImmutableAuditLedger implements IWorkflowEventObserver {
   public readonly ragEngine: NegativeExperienceRagEngine;
   private readonly persistenceRepo: PersistenceRepository | null;
 
-  public constructor(persistenceRepo?: PersistenceRepository | null) {
+  public constructor(
+    persistenceRepo?: PersistenceRepository | null,
+    embeddingProvider?: EmbeddingProvider | null,
+  ) {
     this.auditEntries = [];
     this.humanDecisions = [];
     this.rejectedLessonsByStage = new Map<WorkflowStageId, string[]>();
-    this.ragEngine = new NegativeExperienceRagEngine();
+    this.ragEngine = new NegativeExperienceRagEngine([], embeddingProvider ?? null);
     this.persistenceRepo = persistenceRepo ?? null;
   }
 
@@ -138,6 +144,11 @@ export class ImmutableAuditLedger implements IWorkflowEventObserver {
     }
   }
 
+  /** D1：恢复决策账本（不触发 RAG 沉淀——负向经验已随快照恢复） */
+  public restoreDecision(decision: HumanDecisionRecord): void {
+    this.humanDecisions.push(decision);
+  }
+
   public registerRejectionLesson(stageId: WorkflowStageId, lesson: string): void {
     const ragRecord = this.ragEngine.ingestRejectionLesson(stageId, lesson);
     const existing = this.rejectedLessonsByStage.get(stageId) ?? [];
@@ -145,13 +156,13 @@ export class ImmutableAuditLedger implements IWorkflowEventObserver {
     this.rejectedLessonsByStage.set(stageId, existing);
   }
 
-  public getRejectionLessonsForStage(
+  public async getRejectionLessonsForStage(
     stageId: WorkflowStageId,
     queryText?: string,
     topK = 5,
-  ): ReadonlyArray<string> {
+  ): Promise<ReadonlyArray<string>> {
     if (queryText && queryText.trim().length > 0) {
-      const retrieved = this.ragEngine.retrieveTopKSimilarLessons({
+      const retrieved = await this.ragEngine.retrieveTopKSimilarLessons({
         stageId,
         queryText,
         topK,

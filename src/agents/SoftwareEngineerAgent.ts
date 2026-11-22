@@ -62,7 +62,7 @@ export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementatio
     );
   }
 
-  protected override synthesizeArtifact(
+  protected override synthesizeTemplateArtifact(
     context: AgentExecutionInputContext,
     _attemptIndex: number,
   ): CodeImplementationArtifactContract {
@@ -83,6 +83,14 @@ export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementatio
       humanDirective: context.humanFeedbackDirective,
     });
 
+    // E2：3b 自测真实化——真实执行 node:test 并解析结果（不再硬编码 selfTestPassed=true）
+    const selfVerification = this.sandboxManager.executeSandboxVerification({
+      runId: context.runId,
+      branchId: context.branchId,
+      requirementIds: reqIds,
+      runSubprocessNodeTest: true,
+    });
+
     const modifiedFiles = provisionResult.generatedFiles.map((f) => ({
       filePath: f.filePath,
       className: f.className,
@@ -91,21 +99,12 @@ export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementatio
     }));
 
     return new CodeImplementationArtifactContract({
-      summary: `已在隔离沙箱分支 [${provisionResult.gitWorktreeBranch}] 真实落盘 ${modifiedFiles.length} 个核心面向对象模块与配套单测文件`,
+      summary: `已在隔离沙箱分支 [${provisionResult.gitWorktreeBranch}] 真实落盘 ${modifiedFiles.length} 个核心面向对象模块与配套单测文件${provisionResult.simulated ? '（模拟 HEAD 模式）' : ''}；自测 ${selfVerification.passedTestCases}/${selfVerification.totalTestCases} 通过`,
       coreRequirementIds: reqIds,
       gitWorktreeBranch: provisionResult.gitWorktreeBranch,
       modifiedFiles,
-      selfTestPassed: true,
+      selfTestPassed:
+        selfVerification.failedTestCases === 0 && selfVerification.securityIssuesFound === 0,
     });
-  }
-
-  protected override estimateTokenUsage(
-    context: AgentExecutionInputContext,
-    attemptIndex: number,
-  ): { promptTokens: number; completionTokens: number } {
-    return {
-      promptTokens: 2400 + context.proposal.coreRequirementIds.length * 320 + attemptIndex * 400,
-      completionTokens: 2100,
-    };
   }
 }

@@ -42,6 +42,8 @@ export class ContractValidationResult {
 
 /**
  * Stage 0: 业务提案输入契约类
+ * 注意：演示用的场景开关（协商熔断/范围缩减/瞬态重试）已迁出至 ScenarioHints（运行元数据），
+ * 本契约保持纯业务字段，可安全持久化与审计。
  */
 export class ProjectProposalContract implements IDomainArtifactContract {
   public readonly contractType = 'PROJECT_PROPOSAL_CONTRACT';
@@ -55,8 +57,6 @@ export class ProjectProposalContract implements IDomainArtifactContract {
   public readonly requirementDescriptions: Readonly<Record<string, string>>;
   public readonly involvesDatabaseMigration: boolean;
   public readonly involvesPermissionOrPayment: boolean;
-  public readonly simulateNegotiationConflict: boolean;
-  public readonly simulateScopeReductionAttempt: boolean;
 
   public constructor(params: {
     proposalId: string;
@@ -65,8 +65,6 @@ export class ProjectProposalContract implements IDomainArtifactContract {
     requirements: Record<string, string>;
     involvesDatabaseMigration?: boolean;
     involvesPermissionOrPayment?: boolean;
-    simulateNegotiationConflict?: boolean;
-    simulateScopeReductionAttempt?: boolean;
   }) {
     this.proposalId = params.proposalId;
     this.title = params.title;
@@ -75,8 +73,6 @@ export class ProjectProposalContract implements IDomainArtifactContract {
     this.coreRequirementIds = Object.keys(params.requirements);
     this.involvesDatabaseMigration = Boolean(params.involvesDatabaseMigration);
     this.involvesPermissionOrPayment = Boolean(params.involvesPermissionOrPayment);
-    this.simulateNegotiationConflict = Boolean(params.simulateNegotiationConflict);
-    this.simulateScopeReductionAttempt = Boolean(params.simulateScopeReductionAttempt);
   }
 
   public validateContractIntegrity(): ContractValidationResult {
@@ -88,6 +84,29 @@ export class ProjectProposalContract implements IDomainArtifactContract {
       errors.push('提案必须包含至少一项核心需求条目');
     }
     return new ContractValidationResult(errors.length === 0, errors);
+  }
+
+  public toSerializableRecord(): Record<string, unknown> {
+    return {
+      proposalId: this.proposalId,
+      title: this.title,
+      summary: this.summary,
+      requirementDescriptions: { ...this.requirementDescriptions },
+      coreRequirementIds: [...this.coreRequirementIds],
+      involvesDatabaseMigration: this.involvesDatabaseMigration,
+      involvesPermissionOrPayment: this.involvesPermissionOrPayment,
+    };
+  }
+
+  public static fromSerializableRecord(raw: Record<string, unknown>): ProjectProposalContract {
+    return new ProjectProposalContract({
+      proposalId: String(raw.proposalId ?? ''),
+      title: String(raw.title ?? ''),
+      summary: String(raw.summary ?? ''),
+      requirements: (raw.requirementDescriptions as Record<string, string> | undefined) ?? {},
+      involvesDatabaseMigration: Boolean(raw.involvesDatabaseMigration),
+      involvesPermissionOrPayment: Boolean(raw.involvesPermissionOrPayment),
+    });
   }
 }
 

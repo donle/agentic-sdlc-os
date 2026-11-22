@@ -14,6 +14,20 @@ import { AgentUserNotification } from '../domain/models.ts';
  * 强类型工作流事件对象
  */
 export class WorkflowDomainEvent {
+  public static fromJSON(raw: Record<string, unknown>): WorkflowDomainEvent {
+    return new WorkflowDomainEvent({
+      eventId: String(raw.eventId ?? ''),
+      runId: String(raw.runId ?? ''),
+      branchId: String(raw.branchId ?? ''),
+      stageId: String(raw.stageId ?? 'STAGE_1_PM') as never,
+      agentRole: String(raw.agentRole ?? 'PM_AGENT') as never,
+      lifecycleState: String(raw.lifecycleState ?? 'IDLE') as never,
+      headline: String(raw.headline ?? ''),
+      detailPayload: (raw.detailPayload as Record<string, unknown> | undefined) ?? {},
+      timestampIso: raw.timestampIso ? String(raw.timestampIso) : undefined,
+    });
+  }
+
   public readonly eventId: string;
   public readonly runId: string;
   public readonly branchId: string;
@@ -33,6 +47,7 @@ export class WorkflowDomainEvent {
     lifecycleState: SnapshotLifecycleState;
     headline: string;
     detailPayload?: Record<string, unknown>;
+    timestampIso?: string;
   }) {
     this.eventId = params.eventId;
     this.runId = params.runId;
@@ -42,7 +57,7 @@ export class WorkflowDomainEvent {
     this.lifecycleState = params.lifecycleState;
     this.headline = params.headline;
     this.detailPayload = params.detailPayload ? { ...params.detailPayload } : {};
-    this.timestampIso = new Date().toISOString();
+    this.timestampIso = params.timestampIso ?? new Date().toISOString();
   }
 }
 
@@ -81,6 +96,11 @@ export class WorkflowEventBus {
     for (const observer of this.observers) {
       observer.onWorkflowEvent(event);
     }
+  }
+
+  /** D1：恢复历史事件（不广播观察者，审计已随快照恢复） */
+  public restoreEvent(event: WorkflowDomainEvent): void {
+    this.eventHistory.push(event);
   }
 
   public publishNotification(notification: AgentUserNotification): void {

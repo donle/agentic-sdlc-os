@@ -43,7 +43,7 @@ describe('Block 5 — Web 管控台 HTTP 服务、SSE 实时流推送与 YAML �
       persistenceDir: tempPersistDir,
       sandboxRootDir: tempSandboxDir,
     });
-    const server = workbench.start();
+    const server = await workbench.start();
 
     try {
       const addr = server.address();

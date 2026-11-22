@@ -26,7 +26,7 @@ export class RetrospectiveBenchmarkSuite {
     });
   }
 
-  public runFullSuite(): RetrospectiveEvaluationReport {
+  public async runFullSuite(): Promise<RetrospectiveEvaluationReport> {
     // 1. 场景 A：带数据库 DDL 变更的企业订单研发提案（含 Stage 1 瞬态重试自愈）
     const proposalA = new ProjectProposalContract({
       proposalId: 'PROP-BENCH-001',
@@ -39,13 +39,12 @@ export class RetrospectiveBenchmarkSuite {
       },
       involvesDatabaseMigration: true,
       involvesPermissionOrPayment: true,
-      simulateNegotiationConflict: true,
     });
 
-    const runA = this.orchestrator.startProposalWorkflow({
+    const runA = await this.orchestrator.startProposalWorkflow({
       proposal: proposalA,
       initiatorActor: '产品总监-陈工',
-      simulateTransientRetryOnStage1: true,
+      scenarioHints: { forceNegotiationDeadlock: true, forceTransientRetry: true },
     });
 
     // Stage 2 PD 与 PM 发生 3 轮协商熔断 -> 人工在裁决台拍板采用方案 A
@@ -116,10 +115,9 @@ export class RetrospectiveBenchmarkSuite {
       },
       involvesDatabaseMigration: false,
       involvesPermissionOrPayment: false,
-      simulateNegotiationConflict: false,
     });
 
-    const runB = this.orchestrator.startProposalWorkflow({
+    const runB = await this.orchestrator.startProposalWorkflow({
       proposal: proposalB,
       initiatorActor: '研发效能组-刘工',
     });
@@ -142,7 +140,7 @@ export class RetrospectiveBenchmarkSuite {
 // 当直接作为脚本执行时输出详细复盘报告
 if (import.meta.url === `file://${process.argv[1]}`) {
   const suite = new RetrospectiveBenchmarkSuite();
-  const report = suite.runFullSuite();
+  const report = await suite.runFullSuite();
 
   console.log('================================================================================');
   console.log('📊 AI 原生多智能体研发协同系统 —— 自动化复盘与成本控制检测报告');

@@ -3,6 +3,12 @@
 > [!NOTE]
 > 本文档为后续正式进入研发阶段的**工程落地参考蓝图**，聚焦“单机私有化优先、B 端可配置、提案到 QA 全闭环、全链路可回退审计”的技术实现方案。
 
+> [!WARNING]
+> **实现偏差说明（2026-11-23 补记）**：本文保留为**立项时蓝图存档**。实际实现有意偏离了本文的技术栈选型——
+> 未采用 Python FastAPI + LangGraph + LiteLLM + Redis/Celery，而是**纯 TypeScript 单进程**（Node 22，后端仅依赖 `yaml`），
+> BYOM 网关自研（`ModelRouterGateway`），异步实时推送用进程内 EventBus + SSE 桥（无 Redis）。
+> 偏差理由与最终架构见 `AGENT_ARCHITECTURE.md` 与 `BACKEND_TODO_IMPL_LOG.md`；本文其余工程原则（Worktree 沙箱 / pgvector / 审计不可变）仍有效。
+
 ---
 
 ## 一、 推荐技术栈选型（轻量、低运维、易私有化）

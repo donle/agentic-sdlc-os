@@ -1,0 +1,195 @@
+# UI 组件库选型评估与 Meridian UI 规格
+
+> 决策日期：2026-11-22
+> 决策对象：Agentic SDLC OS 前端组件体系（用于替换/统一现有 `src/ui/client/**` + `workbench.css`）
+> 关联文档：[`UI_SYSTEM_DESIGN_MAP.md`](./UI_SYSTEM_DESIGN_MAP.md)（系统设计全景图）
+
+---
+
+## 一、需求翻译
+
+原始反馈：
+
+> 「现在的 UI 太散了，而且文字信息在 UI 组件里略显拥挤，文字信息很多时候会占满整个 UI 组件，这样并不利于阅读，我需要一套专业的 UI 组件模板」
+
+拆成三条可验证的技术需求：
+
+| # | 原始诉求 | 技术翻译 | 验收方式 |
+|---|---|---|---|
+| **R1** | UI 太散 | 单一组件体系 + 令牌驱动 + 命名空间隔离；组件之间视觉与交互必须一致 | 一套令牌 + 一套组件，无第二来源的样式变量 |
+| **R2** | 文字占满组件 | **排版有度量**：正文按 `ch` 限宽、每个文本槽位声明层级与截断策略、组件内不得出现未声明的裸字号 | 总览页「排版与度量」并排对照，同一段字在 `无 Prose` 与 `Prose` 两种容器下的差异 |
+| **R3** | 缺少专业模板 | 组件需覆盖**全部状态**（默认/悬停/聚焦/禁用/载入/错误/空态/长文本/极窄容器），且可在双主题 × 三档密度下实时评估 | 组件总览页 `#/gallery`，顶部实时切换主题与密度 |
+
+> R2 是本项目的**差异化需求**，也是决定选型的关键 —— 通用组件库不解决它（见 §三）。
+
+---
+
+## 二、项目的硬约束（从代码事实推出，不是主观偏好）
+
+| # | 约束 | 事实来源 | 对选型的直接影响 |
+|---|---|---|---|
+| **C1** | 构建链只有 esbuild 一条 | `package.json` → `build:ui` | 任何需要 PostCSS / Tailwind / 额外插件的方案要么新增构建链，要么放弃 |
+| **C2** | 内网私有化部署，**禁止 CDN** | `docs/ENGINEERING_BLUEPRINT.md` §三 | 所有依赖必须 vendor 进 `node_modules`；图标与字体必须内联 |
+| **C3** | React 19 + TypeScript strict | `package.json` / `tsconfig.ui.json` | 老版本组件库（antd 4、antd 5 < 5.22）需要 React 19 补丁包 |
+| **C4** | 现有样式是单文件 39KB 全局 CSS | `src/ui/styles/workbench.css` | 新组件若与旧变量同名会互相污染 → 必须独立命名空间 |
+| **C5** | 业务组件高度定制 | 流水线脊柱、门禁决策卡、点阵权限矩阵、分叉泳道、事件链、审计轨 | **通用库只能覆盖原语层（约占工作量 30%）** |
+| **C6** | 信息密度极高（每屏要看到卡点、风险、待办、证据） | `docs/UI_SYSTEM_DESIGN_MAP.md` §1 | 需要密度档位；通用库默认密度是为"通用后台"设计的 |
+| **C7** | 前端产物需保持单文件自包含 | `src/ui/index.html` 只引用一个 CSS + 一个 JS | 多包 CSS 需要服务端配合（本次已改：CSS 路由泛化） |
+
+---
+
+## 三、候选方案对比矩阵
+
+评分：✅ 完全满足 / ⚠️ 需改造后满足 / ❌ 不满足
+
+| 维度 | Ant Design 5 | MUI v6 | Mantine 7 | Radix + shadcn | Arco Design | Semi Design | **自建 Meridian** |
+|---|---|---|---|---|---|---|---|
+| C1 构建链零新增 | ⚠️ 需引 postcss 链或额外 CSS 产物 | ⚠️ emotion 运行时注入 | ⚠️ 需 PostCSS | ❌ 配 Tailwind 必须新增构建步骤 | ⚠️ 同 antd | ⚠️ 同 antd | ✅ |
+| C2 无 CDN / 可私有化 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| C3 React 19 兼容 | ⚠️ 需 5.22+ 或补丁包 | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ✅ |
+| C4 与旧样式隔离 | ⚠️ 需重命名变量 | ⚠️ emotion 隔离尚可 | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ✅ `--m-` 命名空间 |
+| C5 业务组件覆盖度 | ❌ 全部需自建 | ❌ | ❌ | ❌ | ❌ | ❌ | ⚠️ 原语自建，业务组件另算（同所有方案） |
+| **R2 排版度量 / 文字限宽** | ❌ 组件默认满宽排版，需逐组件覆写 | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ 令牌原生支持 |
+| **R3 密度三档** | ⚠️ 只有 `size`/`compact` 两档，且各组件不一致 | ⚠️ | ⚠️ | ❌ | ⚠️ | ⚠️ | ✅ 切换 `data-density` 整体生效 |
+| 产物体积（内网首屏） | ⚠️ antd reset.css 全量 ~700KB | ⚠️ emotion 运行时 | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ ~34KB CSS（gzip 后约 6KB） |
+| 主题机制 | ✅ ConfigProvider token | ⚠️ 需自建 | ✅ | ✅ | ✅ | ✅ | ✅ 双主题作用域化 |
+| 无障碍 | ✅ | ⚠️ | ✅ | ✅ | ✅ | ✅ | ⚠️ 基础已覆盖，浮层需后续补焦点陷阱细节 |
+| 维护自主权 | ❌ 跟随上游版本 | ❠️ | ❠️ | ✅ | ❌ | ❌ | ✅ 全自主 |
+| **结论** | 可用但要为 R2/R3 大量覆写 | 不适配 | 不适配 | 缺 R2/R3 基础 | 不适配 | 不适配 | ✅ **适配** |
+
+### 关键判断
+
+1. **第三方库只解决 R1（一致性），不解决 R2（文字拥挤）**。
+   antd / Mantine / Arco 的组件默认都是「满宽排版 + 单密度」，用户最痛的点原样保留；
+   要修好，仍然要自己写一套排版约束与 CSS 覆写 —— **等于既装了库，又写了自己的样式，还多背一层依赖**。
+
+2. **C5 让「用库」省下的工作量远小于直觉**。
+   本系统真正费工的是业务专属表达（流水线脊柱、门禁决策卡、点阵矩阵、分叉泳道、事件链）。
+   这些在任何库里都要自建，能省下的只有按钮/输入/表格这类原语 —— 而这些恰恰是最容易自己写好、
+   且完全受 R2 约束的部分。
+
+3. **C1 + C2 + C3 三条叠加后，第三方库的边际收益被压得很低**。
+   引入 antd 要付出：PostCSS 或额外 CSS 产物、React 19 兼容补丁、700KB 样式体积、
+   与旧 CSS 的变量冲突处理 —— 换来的是一套**我们仍然要覆写大半**的默认样式。
+
+4. **但自建必须克制**。自建的最大风险是"什么都自己写一遍变成第二个烂摊子"。
+   对策见 §五：API 形状对齐 Radix / shadcn（受控组件 + `variant` / `size` 枚举 + `data-*` 状态属性），
+   将来若要换库，替换面只落在 primitives 层。
+
+---
+
+## 四、决策结论
+
+**采用自建 `Meridian UI` 组件库**，落在 `src/ui/kit/`。
+
+| 决策项 | 结论 |
+|---|---|
+| 组件来源 | 自建（TSX + 纯 CSS，无运行时依赖） |
+| 命名空间 | CSS 类 `m-` 前缀，设计令牌 `--m-` 前缀，与旧版 `--bg-*`/`--text-*` **零冲突** |
+| 主题 | 双主题，作用域化（`data-theme` 可挂在任意祖先，不强制 `:root`） |
+| 密度 | 三档（`compact` / `comfortable` / `spacious`），切换 `data-density` 整体生效 |
+| 图标 | 35 枚内联 SVG（24×24，stroke 继承 currentColor），零 CDN |
+| 依赖增量 | **0**（`package.json` 的 dependencies 不变） |
+| 与旧版并存 | 两者可同时加载，kit 用独立命名空间互不污染，便于逐视图迁移 |
+
+---
+
+## 五、Meridian UI 规格
+
+### 5.1 三条核心主张
+
+1. **排版有度量**
+   - 6 级字阶（display / h1 / h2 / h3 / body / sm / xs / label / mono），组件内禁止临时定义字号；
+   - 三个测量令牌：`--m-measure-prose: 68ch`（段落）、`--m-measure-list: 56ch`（列表摘要）、`--m-measure-inline: 44ch`（行内说明）；
+   - 每个文本槽位必须声明 **角色**（primary / secondary / tertiary / 语义色）与 **截断策略**（`m-truncate` / `m-clamp-2/3/4`）；
+   - `Prose` 组件是长文本的唯一入口，默认限宽 + 默认 3 行截断。
+
+2. **密度是令牌**
+   - 切换 `data-density` 即整体生效，不改任何组件代码；
+   - compact 只压缩 padding / 行高 / 行高密度，**不把字号压到不可读**（正文 12.5px 是下限）。
+
+3. **状态由语义色承载**
+   - 6 组语义色，每组三个档位：`--m-xxx`（文字）/ `--m-xxx-soft`（背景）/ `--m-xxx-line`（边框）；
+   - 组件不允许直接使用色值，只使用语义令牌；
+   - 语义命名刻意与业务对齐：jade=已通过、amber=待裁决/高风险、coral=驳回/红线、violet=总管/管理员、cyan=自动放行/复用。
+
+### 5.2 组件清单（34 个）
+
+| 分区 | 组件 |
+|---|---|
+| 图标 | `Icon`（35 枚内联 SVG） |
+| 排版 | `Text`（variant × tone × clamp）、`Prose`、`SectionLabel`、`Stack`、`Inline`、`Divider` |
+| 容器 | `Panel`（header/body/footer）、`Card`（interactive/inset）、`Callout`（5 态）、`Banner`（4 态） |
+| 数据 | `StatusChip`（7 态）、`KeyValueList`、`DefinitionList`、`Meter`（6 色 × 3 尺寸）、`Gauge`、`DataTable`、`ListRow`、`MetricGrid` |
+| 操作 | `Button`（7 变体 × 3 尺寸 × loading/disabled）、`IconButton`、`SegmentedControl`、`Field`、`Input`、`Textarea`、`Select`、`Switch`、`Checkbox`、`Slider`、`Stat` |
+| 导航 | `Tabs`、`Breadcrumb`、`Avatar`、`AvatarGroup`、`PageHeader` |
+| 反馈 | `EmptyState`、`LoadingState`、`ErrorState`、`Skeleton`、`Tooltip`、`Drawer`（三级宽度）、`Modal` |
+
+### 5.3 目录与命名规范
+
+```
+src/ui/kit/
+  tokens.css        # 设计令牌（颜色/字阶/间距/密度/动效/层级）
+  primitives.css    # 组件样式层（.m-* 类）
+  Icon.tsx          # 图标集
+  Typography.tsx    # 排版基元
+  Surface.tsx       # 容器与提示
+  Controls.tsx      # 操作与表单
+  Data.tsx          # 数据表达
+  Navigation.tsx    # 导航与身份
+  Feedback.tsx      # 反馈与浮层
+  index.ts          # 统一出口
+```
+
+- 组件 **不读业务 DTO**；业务适配层放 `src/ui/client/lib/`（如 `artifactParsers.ts`、`perspective.ts`）。
+- 组件 props 用受控模式（`value` + `onChange`），不内置内部状态，便于与后端状态机对齐。
+- 状态通过 `data-*` 属性暴露（`aria-selected` / `aria-checked` / `aria-invalid`），便于外部与测试断言。
+
+### 5.4 本次为接入组件库所做的**最小**改动
+
+| 文件 | 改动 | 为什么必须 |
+|---|---|---|
+| `src/server/WorkbenchServer.ts` | CSS 路由由硬编码 `/styles/workbench.css` 泛化为 `/styles/*.css` + `/kit/*.css`（含路径穿越防护） | 否则 kit 的 CSS 无法被托管 |
+| `src/ui/index.html` | 增加 2 个 `<link>`：tokens.css / primitives.css | 加载令牌层与组件层 |
+| `src/ui/client/App.tsx` | 新增 `gallery` 路由；该路由走**独立全宽外壳**（早返回），不占用旧版 `.app-shell` 栅格 | 组件库总览需要完整宽度评估 |
+| `src/ui/client/components/Sidebar.tsx` | 新增「Meridian UI 组件库」导航项 | 入口 |
+| `tsconfig.ui.json` | `rootDir` 由 `src/ui/client` 放宽到 `src/ui`，`include` 增加 `src/ui/kit/**` | kit 是 client 的同级库，需要被类型检查覆盖 |
+| `package.json` | `lint` / `lint:frontend` glob 补上 `src/ui/kit/**/*.tsx` | 否则 kit 的 TSX 不会被 ESLint 覆盖 |
+
+**未改动**：任何既有视图、任何后端 API、任何 DTO 定义、`WorkbenchApiClient`。
+
+### 5.5 与旧版并存与迁移路径
+
+1. **并存期**：kit 用 `--m-` / `.m-` 独立命名空间，与 `workbench.css` 的 `--bg-*` / `.panel` 等互不污染，两者可同时加载。
+2. **迁移期**：按 `docs/UI_SYSTEM_DESIGN_MAP.md` §14 的顺序逐视图替换。
+   每个视图替换完成后，删除该视图对旧 class 的引用。
+3. **收尾期**：旧 `workbench.css` 中已无引用的规则清空，删除 `--bg-*` / `--text-*` 令牌，
+   并把 `index.html` 的 CSS 引用收敛为 kit 两层。
+
+---
+
+## 六、什么情况下应该推翻这个决策
+
+如果后续出现以下情况，**建议改选第三方库**：
+
+| 触发条件 | 建议改选 | 理由 |
+|---|---|---|
+| 需要大量复杂表单（动态表单、级联选择、日期区间、树选择、拖拽排序） | Ant Design 5 | 自研这些会消耗大量工时且质量难追平 |
+| 需要成熟的国际化（i18n）与 RTL | Ant Design 5 / Arco | 自研 i18n 成本高 |
+| 需要可访问性合规认证（WCAG 2.2 AA 审计） | Radix + 自研样式 | Radix 的焦点管理与 ARIA 语义更成熟 |
+| 团队后续要维护多套 B 端产品，组件库需要**对外共享** | Ant Design 5 / Arco | 社区生态与文档完备度是自研无法追平的 |
+
+**当前不满足以上任何一条**，且 R2（排版度量）是本产品的第一优先级 —— 自研是唯一能把"排版约束"做成
+**默认行为而不是口头规范**的方案。
+
+---
+
+## 七、已实现内容核对
+
+- [x] `tokens.css` —— 颜色（6 组语义色 × 3 档）、9 级字阶、4 个测量令牌、间距、圆角、阴影、动效、双主题、三档密度
+- [x] `primitives.css` —— 排版基元、截断工具类、布局、容器、提示、按钮、表单、状态、数据表、导航、头像、反馈态、浮层
+- [x] 34 个组件（TSX）
+- [x] 组件总览页 `#/gallery`：7 个分区，每个组件的全部状态并排展示，顶部实时切换主题 × 密度
+- [x] 主题与密度作用域限定在总览页自身，不干扰宿主应用
+- [x] `npm run check` 全绿（双端 typecheck + ESLint + Prettier + 19/19 测试）
+- [x] 产物体积：CSS 34KB（tokens 9KB + primitives 33KB 源文件，未压缩），JS 从 328KB → 379KB

@@ -67,6 +67,6 @@ CREATE TABLE IF NOT EXISTS rejected_history_rag (
     id VARCHAR(96) PRIMARY KEY,
     stage_id VARCHAR(64) NOT NULL,
     desensitized_lesson TEXT NOT NULL,
-    embedding vector(64) NOT NULL,
+    embedding vector(1536) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

@@ -5,17 +5,17 @@
   "description": "AI 原生多智能体研发协同管理系统（单机私有化、面向对象模块化架构、DAG分叉回退、风险动态门禁、成本与复盘指标引擎）",
   "private": true,
   "scripts": {
-    "build:ui": "tsc -p tsconfig.ui.json",
+    "build:ui": "esbuild src/ui/client/main.tsx --bundle --outfile=src/ui/dist/main.js --format=esm --target=es2022 --jsx=automatic --minify --log-level=warning",
     "start": "npm run build:ui && node src/server/WorkbenchServer.ts",
     "retrospective:eval": "node src/retrospective/runRetrospective.ts",
     "typecheck:backend": "tsc -p tsconfig.json --noEmit",
     "typecheck:frontend": "tsc -p tsconfig.ui.json --noEmit",
     "typecheck": "npm run typecheck:backend && npm run typecheck:frontend",
     "lint:backend": "eslint \"src/**/*.ts\" \"tests/**/*.ts\" --ignore-pattern \"src/ui/**\"",
-    "lint:frontend": "eslint \"src/ui/client/**/*.ts\"",
-    "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
-    "format": "prettier --write \"src/**/*.{ts,html,css}\" \"tests/**/*.ts\" \"configs/**/*.yaml\" \"*.{json,mjs,md}\"",
-    "format:check": "prettier --check \"src/**/*.{ts,html,css}\" \"tests/**/*.ts\" \"configs/**/*.yaml\" \"*.{json,mjs,md}\"",
+    "lint:frontend": "eslint \"src/ui/client/**/*.{ts,tsx}\" \"src/ui/kit/**/*.{ts,tsx}\"",
+    "lint": "eslint \"src/**/*.ts\" \"src/ui/client/**/*.tsx\" \"src/ui/kit/**/*.tsx\" \"tests/**/*.ts\"",
+    "format": "prettier --write \"src/**/*.{ts,tsx,html,css}\" \"tests/**/*.ts\" \"configs/**/*.yaml\" \"*.{json,mjs,md}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx,html,css}\" \"tests/**/*.ts\" \"configs/**/*.yaml\" \"*.{json,mjs,md}\"",
     "test": "node --test tests/*.spec.ts",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm test"
   },
@@ -23,11 +23,15 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "esbuild": "^0.28.2",
     "eslint": "^10.15.0",
     "prettier": "^3.10.1",

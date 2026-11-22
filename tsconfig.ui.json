@@ -5,6 +5,7 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": [],
+    "jsx": "react-jsx",
     "strict": true,
     "noImplicitAny": true,
     "strictNullChecks": true,
@@ -12,12 +13,17 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "rewriteRelativeImportExtensions": true,
-    "outDir": "./src/ui/dist",
-    "rootDir": "./src/ui/client",
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "./src/ui/dist",
+    "rootDir": "./src/ui"
   },
-  "include": ["src/ui/client/**/*.ts"],
+  "include": [
+    "src/ui/client/**/*.ts",
+    "src/ui/client/**/*.tsx",
+    "src/ui/kit/**/*.ts",
+    "src/ui/kit/**/*.tsx"
+  ],
   "exclude": ["node_modules", "src/ui/dist"]
 }

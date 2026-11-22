@@ -14,6 +14,7 @@
 import { type IDomainArtifactContract, ProjectProposalContract } from '../domain/contracts.ts';
 import { SnapshotLifecycleState, WorkflowStageId } from '../domain/enums.ts';
 import { StageSnapshotMemento } from '../domain/models.ts';
+import type { ScenarioHints } from '../domain/scenario.ts';
 
 export const STANDARD_STAGE_PIPELINE: ReadonlyArray<WorkflowStageId> = [
   WorkflowStageId.STAGE_1_PM,
@@ -24,7 +25,8 @@ export const STANDARD_STAGE_PIPELINE: ReadonlyArray<WorkflowStageId> = [
   WorkflowStageId.STAGE_5_DA,
 ];
 
-export type WorkflowRunStatus = 'RUNNING' | 'PAUSED_AT_HUMAN_GATE' | 'COMPLETED' | 'ABORTED';
+export type WorkflowRunStatus =
+  'RUNNING' | 'PAUSED_AT_HUMAN_GATE' | 'COMPLETED' | 'ABORTED' | 'ABORTED_TOKEN_BUDGET';
 
 export class WorkflowRunState {
   public readonly runId: string;
@@ -32,12 +34,15 @@ export class WorkflowRunState {
   public readonly initiatorActor: string;
   public readonly workflowTemplateId: string;
   public readonly createdAtIso: string;
+  /** 演示/测试场景开关（运行元数据，见 domain/scenario.ts，不属于提案契约） */
+  public readonly scenarioHints: ScenarioHints;
   private readonly stagePipeline: ReadonlyArray<WorkflowStageId>;
   private activeBranchId: string;
   private branchCounter: number;
   private currentStageIndex: number;
   private runStatus: WorkflowRunStatus;
   private pendingRollbackDirective: string | null;
+  private tokensUsedTotal = 0;
   private readonly allSnapshots: StageSnapshotMemento[];
   private readonly branchHistory: string[];
 
@@ -48,12 +53,14 @@ export class WorkflowRunState {
     stagePipeline?: ReadonlyArray<WorkflowStageId>;
     workflowTemplateId?: string;
     createdAtIso?: string;
+    scenarioHints?: ScenarioHints;
   }) {
     this.runId = params.runId;
     this.proposal = params.proposal;
     this.initiatorActor = params.initiatorActor;
     this.workflowTemplateId = params.workflowTemplateId ?? 'enterprise_standard_sdlc_v1';
     this.createdAtIso = params.createdAtIso ?? new Date().toISOString();
+    this.scenarioHints = params.scenarioHints ?? {};
     this.stagePipeline = params.stagePipeline
       ? [...params.stagePipeline]
       : [...STANDARD_STAGE_PIPELINE];
@@ -72,6 +79,10 @@ export class WorkflowRunState {
 
   public getActiveBranchId(): string {
     return this.activeBranchId;
+  }
+
+  public getBranchCounter(): number {
+    return this.branchCounter;
   }
 
   public getBranches(): ReadonlyArray<string> {
@@ -101,6 +112,50 @@ export class WorkflowRunState {
     const directive = this.pendingRollbackDirective;
     this.pendingRollbackDirective = null;
     return directive;
+  }
+
+  /** B3：累计本 run 的真实 Token 消耗（供预算守卫与持久化） */
+  public recordTokenUsage(delta: number): void {
+    if (delta > 0) {
+      this.tokensUsedTotal += delta;
+    }
+  }
+
+  /** D1：从持久化快照恢复私有字段（仅 StateReconstructor 调用） */
+  public restoreInternals(params: {
+    activeBranchId: string;
+    currentStageIndex: number;
+    branchCounter: number;
+    branchHistory: string[];
+    tokensUsedTotal: number;
+    status: string;
+  }): void {
+    this.activeBranchId = params.activeBranchId;
+    this.currentStageIndex = params.currentStageIndex;
+    this.branchCounter = params.branchCounter;
+    this.branchHistory.length = 0;
+    for (const b of params.branchHistory) {
+      this.branchHistory.push(b);
+    }
+    this.tokensUsedTotal = params.tokensUsedTotal;
+    this.runStatus = params.status as WorkflowRunStatus;
+  }
+
+  public getTokensUsedTotal(): number {
+    return this.tokensUsedTotal;
+  }
+
+  /** B2：每类自动修复闭环的已尝试次数（防死循环；key 如 QA_TO_ENG） */
+  private readonly autoRepairCounts = new Map<string, number>();
+
+  public recordAutoRepair(key: string): number {
+    const next = (this.autoRepairCounts.get(key) ?? 0) + 1;
+    this.autoRepairCounts.set(key, next);
+    return next;
+  }
+
+  public getAutoRepairCount(key: string): number {
+    return this.autoRepairCounts.get(key) ?? 0;
   }
 
   public advanceToNextStage(): void {
@@ -253,6 +308,7 @@ export class DagWorkflowStateEngine {
     initiatorActor: string;
     stagePipeline?: ReadonlyArray<WorkflowStageId>;
     workflowTemplateId?: string;
+    scenarioHints?: ScenarioHints;
   }): WorkflowRunState {
     const runState = new WorkflowRunState(params);
     this.runs.set(runState.runId, runState);

@@ -63,7 +63,7 @@ export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArt
     );
   }
 
-  protected override synthesizeArtifact(
+  protected override synthesizeTemplateArtifact(
     context: AgentExecutionInputContext,
     _attemptIndex: number,
   ): QaVerificationArtifactContract {
@@ -74,43 +74,37 @@ export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArt
       ? upstreamCode.coreRequirementIds
       : context.proposal.coreRequirementIds;
 
+    // E2：真实执行 node:test 并解析计数/覆盖率（不再使用硬编码套件与覆盖率）
     const verification = this.sandboxManager.executeSandboxVerification({
       runId: context.runId,
       branchId: context.branchId,
       requirementIds: reqIds,
-      runSubprocessNodeTest: false,
+      runSubprocessNodeTest: true,
     });
 
     const totalCases = verification.totalTestCases;
+    // J1 演示开关：强制 QA 失败（驱动 B2 Engineer 修复闭环的可测试路径）
+    const forceQaFailure = context.scenarioHints?.forceQaFailure === true;
+    const coverageText =
+      verification.coveragePercent !== null
+        ? `，平均行覆盖率 ${verification.coveragePercent}%`
+        : '';
     return new QaVerificationArtifactContract({
-      summary: `已完成沙箱自动化测试验证（校验落盘文件 ${verification.filesVerifiedCount} 个）：共执行 ${totalCases} 条契约与边界测试用例，通过 ${verification.passedTestCases} 条，行覆盖率 95.6%，高危安全漏洞 ${verification.securityIssuesFound} 个`,
+      summary: `已完成沙箱自动化测试验证（校验落盘文件 ${verification.filesVerifiedCount} 个）：共执行 ${totalCases} 条真实 node:test 用例，通过 ${verification.passedTestCases} 条${coverageText}，高危安全漏洞 ${verification.securityIssuesFound} 个${forceQaFailure ? '（演示场景：注入未通过缺陷以驱动修复闭环）' : ''}`,
       coreRequirementIds: reqIds,
-      testSuitesExecuted: [
-        {
-          suiteName: 'SandboxDomainContractUnitTestSuite',
-          totalCases: reqIds.length * 4,
-          passedCases: reqIds.length * 4,
-          coveragePercent: 95.6,
-        },
-        {
-          suiteName: 'EndToEndWorkflowIntegrationSuite',
-          totalCases: reqIds.length * 2,
-          passedCases: reqIds.length * 2,
-          coveragePercent: 91.4,
-        },
-      ],
-      securityIssuesFound: verification.securityIssuesFound,
-      allAcceptanceCriteriaMet: verification.securityIssuesFound === 0,
+      testSuitesExecuted: verification.suites.map((suite) => ({
+        suiteName: suite.suiteName,
+        totalCases: suite.totalCases,
+        passedCases: suite.passedCases,
+        coveragePercent: suite.coveragePercent ?? 0,
+      })),
+      securityIssuesFound: forceQaFailure
+        ? verification.securityIssuesFound + 1
+        : verification.securityIssuesFound,
+      allAcceptanceCriteriaMet:
+        verification.failedTestCases === 0 &&
+        verification.securityIssuesFound === 0 &&
+        !forceQaFailure,
     });
-  }
-
-  protected override estimateTokenUsage(
-    context: AgentExecutionInputContext,
-    attemptIndex: number,
-  ): { promptTokens: number; completionTokens: number } {
-    return {
-      promptTokens: 1750 + context.proposal.coreRequirementIds.length * 190 + attemptIndex * 220,
-      completionTokens: 1050,
-    };
   }
 }

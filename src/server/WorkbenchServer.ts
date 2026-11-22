@@ -19,10 +19,13 @@
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { ProjectProposalContract } from '../domain/contracts.ts';
 import { DecisionVerdict, WorkflowStageId } from '../domain/enums.ts';
+import type { ScenarioHints } from '../domain/scenario.ts';
+import { SessionService } from './auth/SessionService.ts';
+import { SseBridge } from './SseBridge.ts';
 import { WorkflowDslLoader } from '../engine/WorkflowDslLoader.ts';
 import { WorkflowOrchestratorFacade } from '../engine/WorkflowOrchestratorFacade.ts';
 
@@ -31,6 +34,8 @@ export class WorkbenchHttpServer {
   private readonly port: number;
   private activeRunId: string;
   private readonly sseClients: Map<http.ServerResponse, string>;
+  public readonly sessionService: SessionService;
+  private readonly sseBridge: SseBridge;
 
   public constructor(
     port = 4300,
@@ -41,14 +46,48 @@ export class WorkbenchHttpServer {
   ) {
     this.port = port;
     this.sseClients = new Map<http.ServerResponse, string>();
-    this.orchestrator = new WorkflowOrchestratorFacade({
+    const orchestrator = new WorkflowOrchestratorFacade({
       maxNegotiationTurns: 3,
       highRiskThreshold: 60,
       persistenceDir: options?.persistenceDir,
       sandboxRootDir: options?.sandboxRootDir,
     });
-    this.activeRunId = this.seedInitialInteractiveScenario();
+    this.sessionService = new SessionService();
+    this.orchestrator = orchestrator;
+    this.sseBridge = new SseBridge((frame, eventName, seqId) => {
+      this.sseClients.forEach((_clientData: string, clientRes: http.ServerResponse) => {
+        try {
+          // C1/D3：逐事件帧（run_event / user_notification）
+          clientRes.write(`id: ${seqId}
+event: ${eventName}
+data: ${frame}
+
+`);
+        } catch {
+          this.sseClients.delete(clientRes);
+        }
+      });
+    });
+    this.orchestrator.eventBus.registerObserver(this.sseBridge);
+    this.activeRunId = 'SEEDING';
+    this.seedPromise = (async () => {
+      // D1：优先从持久化恢复；失败/无数据 → 播种演示场景
+      const restoreResult = orchestrator.restoreFromPersistence();
+      if (restoreResult.restored) {
+        this.activeRunId = orchestrator.getRestoredActiveRunId() ?? restoreResult.runIds[0];
+        console.log(`[D1] 已从持久化恢复 ${restoreResult.runIds.length} 个运行实例`);
+        return;
+      }
+      for (const warning of restoreResult.warnings) {
+        console.log(`[D1] ${warning}`);
+      }
+      console.log('[D1] 无可恢复数据，播种演示场景...');
+      const runId = await this.seedInitialInteractiveScenario();
+      this.activeRunId = runId;
+    })();
   }
+
+  private seedPromise: Promise<void> = Promise.resolve();
 
   public getOrchestrator(): WorkflowOrchestratorFacade {
     return this.orchestrator;
@@ -57,7 +96,7 @@ export class WorkbenchHttpServer {
   /**
    * 预置两个不同进展的企业研发项目运行实例，方便多角色用户切换查看
    */
-  public seedInitialInteractiveScenario(): string {
+  public async seedInitialInteractiveScenario(): Promise<string> {
     // 项目 1：已完成前序阶段并停留在 Stage 4 QA 终审门禁（沙箱已生成完整源码）
     const completedCodeProposal = new ProjectProposalContract({
       proposalId: 'PROP-ENT-2026-00',
@@ -69,12 +108,10 @@ export class WorkbenchHttpServer {
       },
       involvesDatabaseMigration: false,
       involvesPermissionOrPayment: false,
-      simulateNegotiationConflict: false,
     });
-    this.orchestrator.startProposalWorkflow({
+    await this.orchestrator.startProposalWorkflow({
       proposal: completedCodeProposal,
       initiatorActor: '陈工 (PM · 资深产品经理)',
-      simulateTransientRetryOnStage1: false,
     });
 
     // 项目 2（默认激活）：Stage 1 自愈达成 + Stage 2 PM/PD 3轮协商熔断等待拍板 + 后续含 DDL 高风险门禁
@@ -89,20 +126,18 @@ export class WorkbenchHttpServer {
       },
       involvesDatabaseMigration: true,
       involvesPermissionOrPayment: true,
-      simulateNegotiationConflict: true,
-      simulateScopeReductionAttempt: false,
     });
 
-    const runState = this.orchestrator.startProposalWorkflow({
+    const runState = await this.orchestrator.startProposalWorkflow({
       proposal: initialProposal,
       initiatorActor: '陈工 (PM · 资深产品经理)',
-      simulateTransientRetryOnStage1: true,
+      scenarioHints: { forceNegotiationDeadlock: true, forceTransientRetry: true },
     });
 
     return runState.runId;
   }
 
-  public start(): http.Server {
+  public async start(): Promise<http.Server> {
     const server = http.createServer(async (req, res) => {
       try {
         await this.routeRequest(req, res);
@@ -112,6 +147,8 @@ export class WorkbenchHttpServer {
         this.sendJson(res, statusCode, { ok: false, error: message });
       }
     });
+
+    await this.seedPromise.catch(() => undefined);
 
     server.listen(this.port, () => {
       console.log(`========================================================================`);
@@ -129,18 +166,38 @@ export class WorkbenchHttpServer {
     urlObj: URL,
     body?: Record<string, unknown>,
   ): string {
-    const headerActor = req.headers['x-actor-id'];
-    if (typeof headerActor === 'string' && headerActor.trim().length > 0) {
-      return headerActor.trim();
+    // AUTH_DISABLED=true（本地开发/测试）→ 保留旧 X-Actor-Id 行为
+    if (process.env.AUTH_DISABLED === 'true') {
+      const headerActor = req.headers['x-actor-id'];
+      if (typeof headerActor === 'string' && headerActor.trim().length > 0) {
+        return headerActor.trim();
+      }
+      const queryActor = urlObj.searchParams.get('actorId');
+      if (queryActor && queryActor.trim().length > 0) {
+        return queryActor.trim();
+      }
+      if (body && typeof body.actorUserId === 'string' && body.actorUserId.trim().length > 0) {
+        return body.actorUserId.trim();
+      }
+      return 'user-admin-01';
     }
-    const queryActor = urlObj.searchParams.get('actorId');
-    if (queryActor && queryActor.trim().length > 0) {
-      return queryActor.trim();
+    // F1：从会话 Cookie / Bearer token 提取 userId
+    const cookieHeader = req.headers.cookie ?? '';
+    const match = cookieHeader.match(/sdlc_session=([^\s;]+)/);
+    if (match) {
+      const user = this.sessionService.validate(match[1]);
+      if (user) {
+        return user.userId;
+      }
     }
-    if (body && typeof body.actorUserId === 'string' && body.actorUserId.trim().length > 0) {
-      return body.actorUserId.trim();
+    const authHeader = req.headers.authorization;
+    if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+      const user = this.sessionService.validate(authHeader.slice(7));
+      if (user) {
+        return user.userId;
+      }
     }
-    return 'user-admin-01';
+    return 'UNAUTHENTICATED';
   }
 
   private broadcastSseStateUpdate(): void {
@@ -171,13 +228,17 @@ export class WorkbenchHttpServer {
       return;
     }
 
-    if (method === 'GET' && pathname === '/styles/workbench.css') {
+    if (method === 'GET' && pathname.endsWith('.css')) {
+      // 允许托管 /styles/*.css（宿主样式）与 /kit/*.css（Meridian UI 组件库样式）
       const currentFileDir = path.dirname(fileURLToPath(import.meta.url));
-      const cssPath = path.resolve(currentFileDir, '../ui/styles/workbench.css');
-      const cssContent = fs.readFileSync(cssPath, 'utf-8');
-      res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8' });
-      res.end(cssContent);
-      return;
+      const uiRoot = path.resolve(currentFileDir, '../ui');
+      const cssPath = path.resolve(uiRoot, `.${pathname}`);
+      if (cssPath.startsWith(uiRoot) && fs.existsSync(cssPath) && fs.statSync(cssPath).isFile()) {
+        const cssContent = fs.readFileSync(cssPath, 'utf-8');
+        res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8' });
+        res.end(cssContent);
+        return;
+      }
     }
 
     if (method === 'GET' && pathname.startsWith('/dist/') && pathname.endsWith('.js')) {
@@ -272,10 +333,9 @@ export class WorkbenchHttpServer {
         },
         involvesDatabaseMigration: false,
         involvesPermissionOrPayment: false,
-        simulateNegotiationConflict: false,
       });
 
-      const runState = this.orchestrator.startProposalWorkflow({
+      const runState = await this.orchestrator.startProposalWorkflow({
         proposal,
         initiatorActor: `${user.displayName} (${user.jobTitle})`,
       });
@@ -287,6 +347,227 @@ export class WorkbenchHttpServer {
       return;
     }
 
+    // ---- F1: 认证端点 ----
+    // ---- A4: 模型基线体检端点（admin-only）——两级端点各发 3 个固定 JSON 任务 ----
+    if (method === 'POST' && pathname === '/api/admin/model-baseline') {
+      const actorUserId = this.resolveActorUserId(req, urlObj, {});
+      if (process.env.AUTH_DISABLED !== 'true') {
+        const user = this.sessionService.getUserById(actorUserId);
+        if (!user || user.tier !== 'PROJECT_ADMIN') {
+          this.sendJson(res, 403, { ok: false, error: '仅项目管理员可执行模型体检' });
+          return;
+        }
+      }
+      const result = await this.orchestrator.modelRouter.runModelBaselineCheck();
+      this.sendJson(res, 200, { ok: true, data: result });
+      return;
+    }
+
+    // ---- I2: 健康检查（运维探针） ----
+    if (method === 'GET' && pathname === '/api/health') {
+      this.sendJson(res, 200, {
+        ok: true,
+        data: {
+          status: 'healthy',
+          activeRunId: this.activeRunId,
+          sseClients: this.sseClients.size,
+          persistenceDir: process.env.LOCAL_PERSISTENCE_DIR ?? '.runtime-data',
+          authDisabled: process.env.AUTH_DISABLED === 'true',
+          databaseUrl: process.env.DATABASE_URL ? 'configured' : 'json-file-mode',
+          llmLiveHttp: process.env.LITELLM_ENABLE_LIVE_HTTP === 'true',
+          uptimeSec: Math.round(process.uptime()),
+        },
+      });
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/auth/login') {
+      const body = await this.readJsonBody(req);
+      const result = this.sessionService.login(
+        String(body.username ?? ''),
+        String(body.password ?? ''),
+      );
+      if (!result.ok) {
+        const statusCode =
+          result.reason === 'LOCKED' ? 423 : result.reason === 'DISABLED' ? 403 : 401;
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json; charset=utf-8',
+        };
+        if (result.reason === 'LOCKED' && result.retryAfterSec) {
+          headers['Retry-After'] = String(result.retryAfterSec);
+        }
+        res.writeHead(statusCode, headers);
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error: `认证失败: ${result.reason}`,
+            retryAfterSec: (result as { retryAfterSec?: number }).retryAfterSec,
+          }),
+        );
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Set-Cookie': `sdlc_session=${result.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800`,
+      });
+      res.end(JSON.stringify({ ok: true, data: { user: result.user } }));
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/auth/logout') {
+      const cookie = req.headers.cookie?.match(/sdlc_session=([^\s;]+)/);
+      if (cookie) {
+        this.sessionService.logout(cookie[1]);
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Set-Cookie': 'sdlc_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
+      });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (method === 'GET' && pathname === '/api/auth/me') {
+      const cookie = req.headers.cookie?.match(/sdlc_session=([^\s;]+)/);
+      const token =
+        cookie?.[1] ??
+        (req.headers.authorization?.startsWith('Bearer ')
+          ? req.headers.authorization.slice(7)
+          : '');
+      const user = token ? this.sessionService.validate(token) : null;
+      const impersonating = token ? this.sessionService.isImpersonating(token) : null;
+      if (!user) {
+        this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
+        return;
+      }
+      this.sendJson(res, 200, {
+        ok: true,
+        data: { user, impersonating },
+      });
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/auth/change-password') {
+      const body = await this.readJsonBody(req);
+      const actorUserId = this.resolveActorUserId(req, urlObj, body);
+      if (actorUserId === 'UNAUTHENTICATED') {
+        this.sendJson(res, 401, { ok: false, error: '未登录' });
+        return;
+      }
+      const result = this.sessionService.changePassword(
+        actorUserId,
+        String(body.oldPassword ?? ''),
+        String(body.newPassword ?? ''),
+      );
+      if (!result.ok) {
+        this.sendJson(res, 400, { ok: false, error: result.reason });
+        return;
+      }
+      this.sendJson(res, 200, { ok: true, data: { message: '口令已更新，其他设备已退出登录' } });
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/auth/act-as') {
+      const body = await this.readJsonBody(req);
+      const cookie = req.headers.cookie?.match(/sdlc_session=([^\s;]+)/);
+      const adminToken =
+        cookie?.[1] ??
+        (req.headers.authorization?.startsWith('Bearer ')
+          ? req.headers.authorization.slice(7)
+          : '');
+      const result = this.sessionService.actAs(adminToken, String(body.targetUserId ?? ''));
+      if (!result) {
+        this.sendJson(res, 403, { ok: false, error: '仅项目管理员可切换视角' });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Set-Cookie': `sdlc_session=${result.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800`,
+      });
+      res.end(JSON.stringify({ ok: true, data: { user: result.user } }));
+      return;
+    }
+
+    if (method === 'GET' && pathname === '/api/admin/users') {
+      const actorUserId = this.resolveActorUserId(req, urlObj);
+      const user = this.sessionService.getUserById(actorUserId);
+      if (!user || user.tier !== 'PROJECT_ADMIN') {
+        this.sendJson(res, 403, { ok: false, error: '仅项目管理员可查看成员列表' });
+        return;
+      }
+      this.sendJson(res, 200, { ok: true, data: { users: this.sessionService.listUsers() } });
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/admin/users') {
+      const body = await this.readJsonBody(req);
+      const actorUserId = this.resolveActorUserId(req, urlObj, body);
+      const result = this.sessionService.createUser(actorUserId, {
+        username: String(body.username ?? ''),
+        displayName: String(body.displayName ?? ''),
+        jobTitle: body.jobTitle ? String(body.jobTitle) : undefined,
+        department: body.department ? String(body.department) : undefined,
+        tier: String(body.tier ?? 'STAGE_SPECIALIST'),
+        specialistDomain: String(body.specialistDomain ?? 'SOFTWARE_ENGINEERING'),
+        counterpartAgentRole: String(body.counterpartAgentRole ?? 'ENGINEER_AGENT'),
+        ownedStageIds: ((body.ownedStageIds as string[] | undefined) ?? []).map(String),
+        avatarBadge: body.avatarBadge ? String(body.avatarBadge) : undefined,
+        tempPassword: body.tempPassword ? String(body.tempPassword) : undefined,
+      });
+      if (!result.ok) {
+        this.sendJson(res, result.reason === '用户名已存在' ? 409 : 403, {
+          ok: false,
+          error: result.reason,
+        });
+        return;
+      }
+      this.sendJson(res, 201, {
+        ok: true,
+        data: { user: result.user, tempPassword: result.tempPassword },
+      });
+      return;
+    }
+
+    if (method === 'PATCH' && pathname.startsWith('/api/admin/users/')) {
+      const body = await this.readJsonBody(req);
+      const actorUserId = this.resolveActorUserId(req, urlObj, body);
+      const targetUserId = pathname.split('/').pop() ?? '';
+      const result = this.sessionService.updateUser(actorUserId, targetUserId, {
+        displayName: body.displayName ? String(body.displayName) : undefined,
+        jobTitle: body.jobTitle ? String(body.jobTitle) : undefined,
+        ownedStageIds: body.ownedStageIds
+          ? ((body.ownedStageIds as string[] | undefined) ?? []).map(String)
+          : undefined,
+        status: body.status ? (String(body.status) as 'ACTIVE' | 'DISABLED') : undefined,
+      });
+      if (!result.ok) {
+        this.sendJson(res, result.reason === '不能停用最后一个 ACTIVE 管理员' ? 409 : 403, {
+          ok: false,
+          error: result.reason,
+        });
+        return;
+      }
+      this.sendJson(res, 200, { ok: true, data: { user: result.user } });
+      return;
+    }
+
+    if (
+      method === 'POST' &&
+      pathname.startsWith('/api/admin/users/') &&
+      pathname.endsWith('/reset-password')
+    ) {
+      const body = await this.readJsonBody(req);
+      const actorUserId = this.resolveActorUserId(req, urlObj, body);
+      const targetUserId = pathname.split('/')[4];
+      const result = this.sessionService.resetPassword(actorUserId, targetUserId);
+      if (!result) {
+        this.sendJson(res, 403, { ok: false, error: '仅项目管理员可重置口令' });
+        return;
+      }
+      this.sendJson(res, 200, { ok: true, data: { tempPassword: result.tempPassword } });
+      return;
+    }
+
     if (method === 'POST' && pathname === '/api/proposals') {
       const body = await this.readJsonBody(req);
       const actorUserId = this.resolveActorUserId(req, urlObj, body);
@@ -294,7 +575,9 @@ export class WorkbenchHttpServer {
       const preset = String(body.preset ?? 'CONFLICT_AND_DDL');
 
       let proposal: ProjectProposalContract;
-      let simulateRetry = false;
+      let scenarioHints: ScenarioHints = {};
+
+      // J1：演示开关已迁出提案契约，由 preset 映射为 ScenarioHints（运行元数据）
 
       if (preset === 'CUSTOM') {
         const customTitle = String(body.title ?? '').trim();
@@ -318,9 +601,11 @@ export class WorkbenchHttpServer {
           requirements: cleanReqs,
           involvesDatabaseMigration: Boolean(body.involvesDatabaseMigration),
           involvesPermissionOrPayment: Boolean(body.involvesPermissionOrPayment),
-          simulateNegotiationConflict: Boolean(body.simulateNegotiationConflict),
-          simulateScopeReductionAttempt: Boolean(body.simulateScopeReductionAttempt),
         });
+        scenarioHints = {
+          forceNegotiationDeadlock: Boolean(body.simulateNegotiationConflict),
+          forceScopeReduction: Boolean(body.simulateScopeReductionAttempt),
+        };
       } else if (preset === 'LOW_RISK_FAST_TRACK') {
         proposal = new ProjectProposalContract({
           proposalId: `PROP-LOW-${Date.now()}`,
@@ -332,7 +617,6 @@ export class WorkbenchHttpServer {
           },
           involvesDatabaseMigration: false,
           involvesPermissionOrPayment: false,
-          simulateNegotiationConflict: false,
         });
       } else if (preset === 'SCOPE_DIFF_ALERT') {
         proposal = new ProjectProposalContract({
@@ -346,9 +630,8 @@ export class WorkbenchHttpServer {
           },
           involvesDatabaseMigration: false,
           involvesPermissionOrPayment: true,
-          simulateNegotiationConflict: false,
-          simulateScopeReductionAttempt: true,
         });
+        scenarioHints = { forceScopeReduction: true };
       } else if (preset === 'CACHE_HIT_REUSE') {
         proposal = new ProjectProposalContract({
           proposalId: `PROP-CACHE-${Date.now()}`,
@@ -361,10 +644,9 @@ export class WorkbenchHttpServer {
           },
           involvesDatabaseMigration: false,
           involvesPermissionOrPayment: false,
-          simulateNegotiationConflict: false,
         });
       } else {
-        simulateRetry = true;
+        scenarioHints = { forceNegotiationDeadlock: true, forceTransientRetry: true };
         proposal = new ProjectProposalContract({
           proposalId: `PROP-FULL-${Date.now()}`,
           title: String(body.title ?? '企业级研发权限与智能工单协同模块'),
@@ -379,14 +661,13 @@ export class WorkbenchHttpServer {
           },
           involvesDatabaseMigration: true,
           involvesPermissionOrPayment: true,
-          simulateNegotiationConflict: true,
         });
       }
 
-      const runState = this.orchestrator.startProposalWorkflow({
+      const runState = await this.orchestrator.startProposalWorkflow({
         proposal,
         initiatorActor: String(body.initiatorActor ?? `${user.displayName} (${user.jobTitle})`),
-        simulateTransientRetryOnStage1: simulateRetry,
+        scenarioHints,
       });
       this.activeRunId = runState.runId;
 
@@ -406,7 +687,7 @@ export class WorkbenchHttpServer {
         body.comment ?? '经人工交叉核验，当前阶段 Agent 契约产出符合质量标准，准予放行',
       );
 
-      this.orchestrator.submitHumanGateDecision({
+      await this.orchestrator.submitHumanGateDecision({
         runId: this.activeRunId,
         snapshotId,
         reviewerActor,
@@ -432,7 +713,7 @@ export class WorkbenchHttpServer {
         : undefined;
       const humanActor = String(body.humanActor ?? '项目总负责人');
 
-      this.orchestrator.invokeSupervisorConversationalRollback({
+      await this.orchestrator.invokeSupervisorConversationalRollback({
         runId: this.activeRunId,
         humanActor,
         actorUserId,
@@ -515,7 +796,7 @@ export class WorkbenchHttpServer {
       const body = await this.readJsonBody(req);
       const stageId = String(body.stageId ?? WorkflowStageId.STAGE_3A_TECH_SPEC) as WorkflowStageId;
       const queryText = String(body.queryText ?? '').trim();
-      const matches = this.orchestrator.auditLedger.ragEngine.retrieveTopKSimilarLessons({
+      const matches = await this.orchestrator.auditLedger.ragEngine.retrieveTopKSimilarLessons({
         stageId,
         queryText,
         topK: 5,
@@ -594,7 +875,12 @@ export class WorkbenchHttpServer {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// 仅当被 node 直接执行时启动服务器；在 Windows 上 process.argv[1] 为反斜杠路径，
+// 必须经 pathToFileURL 归一化后才能与 import.meta.url 严格比较
+const invokedDirectly =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
   const port = Number(process.env.PORT ?? 4300);
   const server = new WorkbenchHttpServer(port);
   server.start();
