@@ -10,12 +10,12 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { execFileSync } from 'node:child_process';
 
 import { HumanDecisionRecord, NegotiationTurnRecord } from '../domain/models.ts';
 import type { WorkflowRunState } from './DagWorkflowStateEngine.ts';
 import type { AuditTrailEntry } from './ImmutableAuditLedger.ts';
 import type { NegativeExperienceVectorRecord } from './NegativeExperienceRagEngine.ts';
+import { buildPgUpsertSql, selectPersistenceDriver } from './pg/PgPersistenceDriver.ts';
 
 export interface PersistedRunRecord {
   readonly runId: string;
@@ -32,7 +32,11 @@ export interface PersistedRunRecord {
   readonly branchCounter: number;
   readonly branchHistory: ReadonlyArray<string>;
   readonly tokensUsedTotal: number;
+  /** AUDIT-8：运行实例对应的 Token 预算上限（取代 PG 硬编码 120000） */
+  readonly tokenBudget?: number;
   readonly scenarioHints: Record<string, boolean>;
+  /** AUDIT-9：各修复闭环的已尝试次数（防重启后清零绕过上限） */
+  readonly autoRepairCounts?: Readonly<Record<string, number>>;
 }
 
 export interface PersistenceDriver {
@@ -51,22 +55,40 @@ export interface PersistedLedgerSnapshot {
   readonly negativeExperienceRecords: ReadonlyArray<NegativeExperienceVectorRecord>;
   /** D1：EventBus 事件历史快照（供 liveInteractionStream 恢复） */
   readonly liveEvents?: ReadonlyArray<Record<string, unknown>>;
+  /** AUDIT-9：EventBus 通知收件箱（保留待审批门禁卡片与已处理状态） */
+  readonly notifications?: ReadonlyArray<Record<string, unknown>>;
+  /** AUDIT-9：团队评论与签核备注（StageTeamCommentRecord） */
+  readonly teamComments?: ReadonlyArray<Record<string, unknown>>;
+  /** AUDIT-9：审计时间线条目兜底快照（WAL 缺失时亦可恢复） */
+  readonly auditEntries?: ReadonlyArray<Record<string, unknown>>;
 }
 
 export class PersistenceRepository {
   private readonly storageDir: string;
   private readonly snapshotFilePath: string;
   private readonly sqlDumpFilePath: string;
+  private readonly pgDriver: PersistenceDriver | null;
   private lastSyncedAtIso: string;
 
-  public constructor(storageDir?: string) {
+  public constructor(
+    storageDir?: string,
+    options?: { databaseUrl?: string; driver?: PersistenceDriver | null },
+  ) {
     this.storageDir =
       storageDir ??
       path.resolve(process.cwd(), process.env.LOCAL_PERSISTENCE_DIR ?? '.runtime-data');
     this.snapshotFilePath = path.join(this.storageDir, 'ledger-store.json');
     this.sqlDumpFilePath = path.join(this.storageDir, 'pgvector-sync.sql');
+    this.pgDriver =
+      options?.driver !== undefined
+        ? options.driver
+        : selectPersistenceDriver(options?.databaseUrl);
     this.lastSyncedAtIso = new Date().toISOString();
     this.ensureStorageDirectory();
+  }
+
+  public getActiveDriver(): PersistenceDriver | null {
+    return this.pgDriver;
   }
 
   private ensureStorageDirectory(): void {
@@ -92,6 +114,7 @@ export class PersistenceRepository {
     this.ensureStorageDirectory();
     const line = `${JSON.stringify(entry)}\n`;
     fs.appendFileSync(this.resolveMonthlyWalFilePath(entry.timestampIso), line, 'utf-8');
+    this.pgDriver?.appendAudit(entry as unknown as Record<string, unknown>);
     this.lastSyncedAtIso = new Date().toISOString();
   }
 
@@ -120,6 +143,9 @@ export class PersistenceRepository {
     humanDecisions: ReadonlyArray<HumanDecisionRecord>;
     negativeExperienceRecords: ReadonlyArray<NegativeExperienceVectorRecord>;
     liveEvents?: ReadonlyArray<Record<string, unknown>>;
+    notifications?: ReadonlyArray<Record<string, unknown>>;
+    teamComments?: ReadonlyArray<Record<string, unknown>>;
+    auditEntries?: ReadonlyArray<Record<string, unknown>>;
   }): PersistedLedgerSnapshot {
     this.ensureStorageDirectory();
     this.lastSyncedAtIso = new Date().toISOString();
@@ -143,7 +169,9 @@ export class PersistenceRepository {
         branchCounter: r.getBranchCounter(),
         branchHistory: [...r.getBranches()],
         tokensUsedTotal: r.getTokensUsedTotal(),
+        tokenBudget: r.getTokenBudget(),
         scenarioHints: { ...r.scenarioHints },
+        autoRepairCounts: r.getAutoRepairCountsRecord(),
       };
     });
 
@@ -156,6 +184,9 @@ export class PersistenceRepository {
       humanDecisions: [...params.humanDecisions],
       negativeExperienceRecords: [...params.negativeExperienceRecords],
       liveEvents: [...(params.liveEvents ?? [])],
+      notifications: [...(params.notifications ?? [])],
+      teamComments: [...(params.teamComments ?? [])],
+      ...(params.auditEntries ? { auditEntries: [...params.auditEntries] } : {}),
     };
 
     fs.writeFileSync(this.snapshotFilePath, JSON.stringify(payload, null, 2), 'utf-8');
@@ -163,36 +194,44 @@ export class PersistenceRepository {
     const sqlStatements = this.generatePostgreSqlStatements(payload);
     fs.writeFileSync(this.sqlDumpFilePath, sqlStatements, 'utf-8');
 
-    // D2：DATABASE_URL 存在时同步到 PG（psql CLI 方式，失败不阻塞主流程）
-    const dbUrl = process.env.DATABASE_URL ?? '';
-    if (dbUrl) {
-      const pgTmp = path.join(this.storageDir, '.d2-pg-sync.sql');
-      try {
-        fs.writeFileSync(pgTmp, sqlStatements, 'utf-8');
-        execFileSync('psql', [dbUrl, '-f', pgTmp], { timeout: 30000, encoding: 'utf-8' });
-      } catch (err) {
-        console.warn(
-          `[D2] PG 同步失败（数据保留在 JSON 兜底）: ${err instanceof Error ? err.message.slice(0, 200) : err}`,
-        );
-      } finally {
-        if (fs.existsSync(pgTmp)) {
-          fs.rmSync(pgTmp, { force: true });
-        }
-      }
+    // D2 / AUDIT-8：PG 驱动在位时统一委托 PgPersistenceDriver 同步（失败不阻塞 JSON 兜底）
+    if (this.pgDriver) {
+      this.pgDriver.saveFullState(payload);
     }
 
     return payload;
   }
 
   /**
-   * 从磁盘读取已持久化的状态账本快照
+   * 从磁盘或 PostgreSQL 读取已持久化的状态账本快照（PG 优先，失败或空库回落 JSON 兜底）
    */
   public loadPersistedSnapshot(): PersistedLedgerSnapshot | null {
-    if (!fs.existsSync(this.snapshotFilePath)) {
-      return null;
+    const jsonFallback = fs.existsSync(this.snapshotFilePath)
+      ? (JSON.parse(fs.readFileSync(this.snapshotFilePath, 'utf-8')) as PersistedLedgerSnapshot)
+      : null;
+
+    if (this.pgDriver) {
+      const pgSnapshot = this.pgDriver.loadFullState();
+      if (pgSnapshot && pgSnapshot.runs.length > 0) {
+        return {
+          ...pgSnapshot,
+          ...((pgSnapshot.liveEvents ?? jsonFallback?.liveEvents)
+            ? { liveEvents: pgSnapshot.liveEvents ?? jsonFallback?.liveEvents }
+            : {}),
+          ...((pgSnapshot.notifications ?? jsonFallback?.notifications)
+            ? { notifications: pgSnapshot.notifications ?? jsonFallback?.notifications }
+            : {}),
+          ...((pgSnapshot.teamComments ?? jsonFallback?.teamComments)
+            ? { teamComments: pgSnapshot.teamComments ?? jsonFallback?.teamComments }
+            : {}),
+          ...((pgSnapshot.auditEntries ?? jsonFallback?.auditEntries)
+            ? { auditEntries: pgSnapshot.auditEntries ?? jsonFallback?.auditEntries }
+            : {}),
+        };
+      }
     }
-    const raw = fs.readFileSync(this.snapshotFilePath, 'utf-8');
-    return JSON.parse(raw) as PersistedLedgerSnapshot;
+
+    return jsonFallback;
   }
 
   /**
@@ -209,7 +248,13 @@ export class PersistenceRepository {
         .map((l) => l.trim())
         .filter((l) => l.length > 0);
       for (const line of lines) {
-        entries.push(JSON.parse(line) as Record<string, unknown>);
+        try {
+          entries.push(JSON.parse(line) as Record<string, unknown>);
+        } catch (err) {
+          console.warn(
+            `[D1 WAL] 跳过损坏或截断的审计日志行 (${fileName}): ${err instanceof Error ? err.message : err}`,
+          );
+        }
       }
     }
     return entries;
@@ -217,53 +262,9 @@ export class PersistenceRepository {
 
   /**
    * 生成符合 `deploy/init-pgvector-schema.sql` 的 PostgreSQL + pgvector UPSERT 同步语句
+   * AUDIT-8：委托 PgPersistenceDriver.buildPgUpsertSql 作为单一事实源（含 negotiation_logs / team_comments / 真实 token_budget）
    */
   public generatePostgreSqlStatements(snapshot: PersistedLedgerSnapshot): string {
-    const escapeSql = (val: string): string => val.replace(/'/g, "''");
-    const lines: string[] = [
-      '-- Auto-generated PostgreSQL 16 + pgvector state synchronization script',
-      'BEGIN;',
-    ];
-
-    for (const run of snapshot.runs) {
-      lines.push(
-        `INSERT INTO workflow_runs (id, title, workflow_template_name, workflow_snapshot_yaml, active_branch_id, status, created_by, created_at) VALUES ('${escapeSql(run.runId)}', '${escapeSql(run.title)}', '${escapeSql(run.workflowTemplateId)}', '{}'::jsonb, '${escapeSql(run.activeBranchId)}', '${escapeSql(run.status)}', '${escapeSql(run.initiatorActor)}', '${escapeSql(run.createdAtIso)}') ON CONFLICT (id) DO UPDATE SET active_branch_id = EXCLUDED.active_branch_id, status = EXCLUDED.status;`,
-      );
-    }
-
-    for (const snap of snapshot.snapshots) {
-      const snapId = escapeSql(String(snap.snapshotId ?? ''));
-      const runId = escapeSql(String(snap.runId ?? ''));
-      const parentId = snap.parentSnapshotId
-        ? `'${escapeSql(String(snap.parentSnapshotId))}'`
-        : 'NULL';
-      const branchId = escapeSql(String(snap.branchId ?? ''));
-      const stageId = escapeSql(String(snap.stageId ?? ''));
-      const role = escapeSql(String(snap.agentRole ?? ''));
-      const model = escapeSql(String(snap.modelUsed ?? ''));
-      const artifactJson = escapeSql(JSON.stringify(snap.artifactDetails ?? {}));
-      const riskScore = Number(snap.riskScore ?? 0);
-      const state = escapeSql(String(snap.state ?? 'IDLE'));
-
-      lines.push(
-        `INSERT INTO stage_snapshots (id, run_id, parent_snap_id, branch_id, stage_id, role_agent, model_used, artifact_json, risk_score, state) VALUES ('${snapId}', '${runId}', ${parentId}, '${branchId}', '${stageId}', '${role}', '${model}', '${artifactJson}'::jsonb, ${riskScore}, '${state}') ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state;`,
-      );
-    }
-
-    for (const dec of snapshot.humanDecisions) {
-      lines.push(
-        `INSERT INTO human_decisions (id, run_id, snap_id, reviewer_id, decision_type, comment, created_at) VALUES ('${escapeSql(dec.decisionId)}', '${escapeSql(dec.runId)}', '${escapeSql(dec.snapshotId)}', '${escapeSql(dec.reviewerActor)}', '${escapeSql(dec.verdict)}', '${escapeSql(dec.comment)}', '${escapeSql(dec.createdAtIso)}') ON CONFLICT (id) DO NOTHING;`,
-      );
-    }
-
-    for (const rag of snapshot.negativeExperienceRecords) {
-      const vectorLiteral = `[${rag.embedding.join(',')}]`;
-      lines.push(
-        `INSERT INTO rejected_history_rag (id, stage_id, desensitized_lesson, embedding, created_at) VALUES ('${escapeSql(rag.recordId)}', '${escapeSql(rag.stageId)}', '${escapeSql(rag.desensitizedLesson)}', '${vectorLiteral}'::vector, '${escapeSql(rag.createdAtIso)}') ON CONFLICT (id) DO NOTHING;`,
-      );
-    }
-
-    lines.push('COMMIT;');
-    return lines.join('\n');
+    return buildPgUpsertSql(snapshot);
   }
 }

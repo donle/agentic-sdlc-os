@@ -27,7 +27,7 @@
  * ============================================================================
  */
 
-import { PrdArtifactContract } from '../domain/contracts.ts';
+import { containsPlaceholderText, PrdArtifactContract } from '../domain/contracts.ts';
 import { AgentRole, ModelRoutingTier, WorkflowStageId } from '../domain/enums.ts';
 import { WorkflowEventBus } from '../patterns/EventBus.ts';
 import { FalseConsensusGuard } from '../patterns/FalseConsensusGuard.ts';
@@ -70,6 +70,43 @@ export class ProductManagerAgent extends AbstractWorkerAgent<PrdArtifactContract
       `拆解 ${reqCount} 项核心业务需求为结构化 User Stories，并同步生成前置埋点规划`,
       0.97,
     );
+  }
+
+  protected override validateStageSpecificConstraints(
+    candidate: PrdArtifactContract,
+    _context: AgentExecutionInputContext,
+  ): ReadonlyArray<string> {
+    const violations: string[] = [];
+    if (containsPlaceholderText(candidate.summary, true)) {
+      violations.push('PRD summary 不得为空或包含 TBD/待定 等未完成占位词');
+    }
+    const coveredReqIds = new Set<string>();
+    for (const story of candidate.userStories) {
+      coveredReqIds.add(story.reqId);
+      if (containsPlaceholderText(story.story)) {
+        violations.push(`需求 [${story.reqId}] 的 User Story 包含空值或占位符`);
+      }
+      if (story.acceptanceCriteria.length === 0) {
+        violations.push(`需求 [${story.reqId}] 缺少可量化验收标准 (acceptanceCriteria)`);
+      } else {
+        for (const ac of story.acceptanceCriteria) {
+          if (containsPlaceholderText(ac)) {
+            violations.push(`需求 [${story.reqId}] 的验收标准包含空值或占位符 [${ac}]`);
+          }
+        }
+      }
+    }
+    for (const reqId of candidate.coreRequirementIds) {
+      if (!coveredReqIds.has(reqId)) {
+        violations.push(`核心需求 [${reqId}] 未被任何 User Story 覆盖`);
+      }
+    }
+    for (const evt of candidate.trackingPlanEvents) {
+      if (containsPlaceholderText(evt.eventName) || containsPlaceholderText(evt.triggerCondition)) {
+        violations.push(`埋点事件 [${evt.eventName || '(空)'}] 包含空值或占位符`);
+      }
+    }
+    return violations;
   }
 
   protected override synthesizeTemplateArtifact(

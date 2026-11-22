@@ -23,6 +23,7 @@ import {
 
 export class RbacGovernanceService {
   private readonly users: Map<string, EnterpriseUserAccount>;
+  private readonly disabledUserIds: Set<string>;
   private allowSpecialistCrossStageRollback: boolean;
   /** J2：可插拔节点注册表（自定义节点的 RBAC 角色映射来源） */
   private readonly agentRegistry: AgentRegistry;
@@ -30,8 +31,58 @@ export class RbacGovernanceService {
   public constructor(agentRegistry?: AgentRegistry) {
     this.agentRegistry = agentRegistry ?? AgentRegistry.default();
     this.users = new Map<string, EnterpriseUserAccount>();
+    this.disabledUserIds = new Set<string>();
     this.allowSpecialistCrossStageRollback = true;
     this.seedEnterpriseRoster();
+  }
+
+  /**
+   * 按用户层级与专长领域派生标准细粒度权限码集合（供 SessionService 新增/同步用户共用）
+   */
+  public static derivePermissionsForRole(
+    tier: UserHierarchyTier | string,
+    specialistDomain: SpecialistDomain | string,
+  ): ReadonlyArray<SystemPermissionCode> {
+    if (tier === UserHierarchyTier.PROJECT_ADMIN) {
+      return Object.values(SystemPermissionCode);
+    }
+    switch (specialistDomain) {
+      case SpecialistDomain.PRODUCT_MANAGEMENT:
+        return [
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+          SystemPermissionCode.CREATE_PROPOSAL,
+          SystemPermissionCode.APPROVE_ASSIGNED_STAGE_GATE,
+          SystemPermissionCode.INVOKE_SUPERVISOR_ROLLBACK,
+        ];
+      case SpecialistDomain.PRODUCT_DESIGN_UX:
+        return [
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+          SystemPermissionCode.APPROVE_ASSIGNED_STAGE_GATE,
+          SystemPermissionCode.INVOKE_SUPERVISOR_ROLLBACK,
+        ];
+      case SpecialistDomain.SYSTEM_ARCHITECTURE:
+        return [
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+          SystemPermissionCode.CREATE_PROPOSAL,
+          SystemPermissionCode.APPROVE_ASSIGNED_STAGE_GATE,
+          SystemPermissionCode.INVOKE_SUPERVISOR_ROLLBACK,
+          SystemPermissionCode.EXECUTE_SANDBOX_VERIFICATION,
+        ];
+      case SpecialistDomain.SOFTWARE_ENGINEERING:
+      case SpecialistDomain.QUALITY_ASSURANCE:
+        return [
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+          SystemPermissionCode.APPROVE_ASSIGNED_STAGE_GATE,
+          SystemPermissionCode.EXECUTE_SANDBOX_VERIFICATION,
+          SystemPermissionCode.INVOKE_SUPERVISOR_ROLLBACK,
+        ];
+      case SpecialistDomain.DATA_ANALYTICS:
+      default:
+        return [
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+          SystemPermissionCode.APPROVE_ASSIGNED_STAGE_GATE,
+        ];
+    }
   }
 
   private seedEnterpriseRoster(): void {
@@ -179,9 +230,40 @@ export class RbacGovernanceService {
   }
 
   public getAllUsers(): ReadonlyArray<EnterpriseUserAccount> {
-    return Array.from(this.users.values());
+    return Array.from(this.users.values()).filter((u) => !this.disabledUserIds.has(u.userId));
   }
 
+  /**
+   * F1/F2：与 SessionService 同步用户账号与启停状态（打破两套用户源割裂）
+   */
+  public upsertUserAccount(
+    account: EnterpriseUserAccount,
+    status: 'ACTIVE' | 'DISABLED' = 'ACTIVE',
+  ): void {
+    this.users.set(account.userId, account);
+    if (status === 'DISABLED') {
+      this.disabledUserIds.add(account.userId);
+    } else {
+      this.disabledUserIds.delete(account.userId);
+    }
+  }
+
+  public setUserStatus(userId: string, status: 'ACTIVE' | 'DISABLED'): void {
+    if (status === 'DISABLED') {
+      this.disabledUserIds.add(userId);
+    } else {
+      this.disabledUserIds.delete(userId);
+    }
+  }
+
+  public isUserActive(userId: string): boolean {
+    return this.users.has(userId) && !this.disabledUserIds.has(userId);
+  }
+
+  /**
+   * 仅用于只读视图或未传 userId 时的默认投影展示；
+   * 严禁在写操作/权限断言中使用本方法将未知/未认证用户静默提权为 user-admin-01！
+   */
   public getUserOrDefault(userId?: string): EnterpriseUserAccount {
     if (userId && this.users.has(userId)) {
       return this.users.get(userId)!;
@@ -193,6 +275,39 @@ export class RbacGovernanceService {
     const user = this.users.get(userId);
     if (!user) {
       throw new Error(`未找到企业用户账号: ${userId}`);
+    }
+    return user;
+  }
+
+  /**
+   * F1：严格获取当前已认证且处于 ACTIVE 状态的账号（未知、未认证或已停用均抛出 403 RBAC 拦截异常）
+   */
+  public getUserStrict(userId: string): EnterpriseUserAccount {
+    if (!userId || userId === 'UNAUTHENTICATED') {
+      throw new Error('[RBAC 权限拦截] 未登录或会话无效，拒绝访问受控业务操作');
+    }
+    const user = this.users.get(userId);
+    if (!user) {
+      throw new Error(`[RBAC 权限拦截] 未知的企业用户账号: ${userId}`);
+    }
+    if (this.disabledUserIds.has(userId)) {
+      throw new Error(`[RBAC 权限拦截] 企业用户账号 [${user.displayName}] 已停用，权限已即时吊销`);
+    }
+    return user;
+  }
+
+  /**
+   * F1：校验用户是否具备指定的细粒度系统权限码 (`SystemPermissionCode`)
+   */
+  public assertHasPermission(
+    userId: string,
+    permission: SystemPermissionCode,
+  ): EnterpriseUserAccount {
+    const user = this.getUserStrict(userId);
+    if (!user.isProjectAdmin() && !user.hasPermission(permission)) {
+      throw new Error(
+        `[RBAC 权限拦截] 当前用户 [${user.displayName} · ${user.jobTitle}] 缺少所需系统权限码 [${permission}]`,
+      );
     }
     return user;
   }
@@ -240,12 +355,36 @@ export class RbacGovernanceService {
    * 评估指定用户对某个阶段门禁的共享查看权与审批裁决权
    */
   public evaluateStageAccess(userId: string, stageId: WorkflowStageId): StageAccessEvaluation {
-    const user = this.getUserOrDefault(userId);
     const requiredRoles = this.getRequiredRolesForStage(stageId);
+    if (!userId || userId === 'UNAUTHENTICATED' || !this.users.has(userId)) {
+      return {
+        stageId,
+        canViewSharedArtifact: false,
+        canApproveOrArbitrate: false,
+        isDirectDomainOwner: false,
+        isAdminOverride: false,
+        requiredSpecialistRoles: requiredRoles,
+        denialReason: `未知或未认证用户 [${userId || 'ANONYMOUS'}] 无权签核阶段 [${stageId}]`,
+      };
+    }
+    const user = this.users.get(userId)!;
+    if (this.disabledUserIds.has(userId)) {
+      return {
+        stageId,
+        canViewSharedArtifact: false,
+        canApproveOrArbitrate: false,
+        isDirectDomainOwner: false,
+        isAdminOverride: false,
+        requiredSpecialistRoles: requiredRoles,
+        denialReason: `当前用户 [${user.displayName}] 账号已停用，无权签核阶段 [${stageId}]`,
+      };
+    }
     const isDirectOwner =
       user.tier === UserHierarchyTier.STAGE_SPECIALIST && user.ownedStageIds.includes(stageId);
     const isAdmin = user.isProjectAdmin();
-    const canApprove = isDirectOwner || isAdmin;
+    const canApprove =
+      (isDirectOwner && user.hasPermission(SystemPermissionCode.APPROVE_ASSIGNED_STAGE_GATE)) ||
+      isAdmin;
 
     return {
       stageId,
@@ -290,7 +429,7 @@ export class RbacGovernanceService {
     readonly evaluation: StageAccessEvaluation;
     readonly formattedActorLabel: string;
   } {
-    const user = this.getUserOrDefault(userId);
+    const user = this.getUserStrict(userId);
     const evaluation = this.evaluateStageAccess(user.userId, stageId);
     if (!evaluation.canApproveOrArbitrate) {
       throw new Error(`[RBAC 权限拦截] ${evaluation.denialReason ?? '当前角色无权签核该阶段门禁'}`);
@@ -309,7 +448,7 @@ export class RbacGovernanceService {
    * 强制校验用户是否为最上层项目管理员 (`PROJECT_ADMIN`)
    */
   public assertIsProjectAdmin(userId: string): EnterpriseUserAccount {
-    const user = this.getUserOrDefault(userId);
+    const user = this.getUserStrict(userId);
     if (!user.isProjectAdmin()) {
       throw new Error(
         `[RBAC 最高权限拦截] 仅顶层管理员 (PROJECT_ADMIN) 可修改项目全局工作流治理配置，当前用户为 [${user.displayName} · ${user.jobTitle}]`,
@@ -325,7 +464,7 @@ export class RbacGovernanceService {
     userId: string,
     targetStageId: WorkflowStageId,
   ): EnterpriseUserAccount {
-    const user = this.getUserOrDefault(userId);
+    const user = this.getUserStrict(userId);
     if (user.isProjectAdmin()) {
       return user;
     }

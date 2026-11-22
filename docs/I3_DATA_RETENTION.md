@@ -23,13 +23,13 @@
 
 - 保留最近 N 个 run 的沙箱目录（默认 10，env `SANDBOX_WORKTREE_RETENTION` 可调，下限 1）；
   更旧的先按分支执行 `cleanupWorktree`（真实模式 → `git worktree remove`），再删除 run 目录。
-- `protectRunIds`：无论多旧都保留——调用方传入活跃 run（RUNNING / PAUSED_AT_HUMAN_GATE）。
+- `protectRunIds`：无论多旧都保留——调用方传入活跃 run（RUNNING / PAUSED_AT_HUMAN_GATE）；注：`retainedRunIds` 先计入受保护 run 再补齐到 `keepLastN` 名额，因此受保护的活跃 run 会占用 `keepLastN` 配额。
 - 返回 `{removedRunIds, retainedRunIds}` 供日志。
 
 ### 3. Facade 终态钩子
 
-- `onRunReachedTerminalState(runState)`：在 COMPLETED / ABORTED / ABORTED_TOKEN_BUDGET 三个终态转换点调用；
-  保护集 = 全部 RUNNING/PAUSED run + 刚终态的 run 自身。
+- `onRunReachedTerminalState(runState)`：设计用于在 `COMPLETED` / `ABORTED` / `ABORTED_TOKEN_BUDGET` 三个终态转换点调用（保护集 = 全部 RUNNING/PAUSED run + 刚终态的 run 自身）。
+- **现行触发范围说明**：`DagWorkflowStateEngine.advanceToNextStage()` 在推过最后阶段时会提前将 `runStatus` 设为 `'COMPLETED'`，导致 `WorkflowOrchestratorFacade` 内 `while (runState.getStatus() === 'RUNNING')` 循环提前退出、其中 `currentStageId === null` 分支的 `onRunReachedTerminalState` 暂不可达——因此当前仅 `ABORTED` 与 `ABORTED_TOKEN_BUDGET` 实际触发终态清理，`COMPLETED` 触发路径待后续修正循环判断条件。
 - **旁路设计**：钩子内 try/catch，保留策略失败只 WARN 不影响主流程终态语义。
 
 ## 边界处理
@@ -38,6 +38,7 @@
 2. 旧单文件存在时与新分片共存，读取合并（历史条目排后）。
 3. 目录名与 runId 的 sanitize 规则同源（`resolveWorkspacePath`），保护名单按 sanitize 后匹配。
 4. 真实 git worktree 移除失败（分支已被删等）→ 不阻断目录清理。
+5. 若直接对尚未创建的 `sandboxRootDir` 调用 `enforceWorktreeRetention()` 会抛出 `ENOENT`（Facade 钩子外层已 try/catch 捕获）；此外扫描 `sandboxRootDir` 时暂未排除 E3 的 `docker-results/` 日志目录，超限后会一并参与清理。
 
 ## 验证（tests/data-retention.spec.ts，5 项）
 
@@ -47,9 +48,9 @@
 4. 保留策略：5 目录 N=2 → 清理 3 个最旧的；`protectRunIds` 无视新旧存活
 5. Facade 终态钩子：散文输出 → ABORTED → 钩子自动清理最旧 run（N=1，端到端）
 
-**测试基线**：122 项（118 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。
+**完成时测试基线**：122 项（118 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
 
 ## 遗留
 
 - WAL 分片无删除策略（设计只要求切分）；如需按月过期删除，挂到同一终态钩子即可。
-- `enforceWorktreeRetention` 当前仅由终态钩子触发；服务长期运行但 run 不终态（暂停）时目录不清理——保护语义本就如此。
+- `enforceWorktreeRetention` 当前仅在 `ABORTED`/`ABORTED_TOKEN_BUDGET` 触发；`COMPLETED` 终态未触发与排除 `docker-results/` 待后续清理时补齐。

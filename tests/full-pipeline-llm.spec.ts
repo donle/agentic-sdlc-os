@@ -286,6 +286,204 @@ describe('高优 — 全阶段 LLM 管道测试', () => {
     assert.equal(runState.getStatus(), 'PAUSED_AT_HUMAN_GATE');
     assert.equal(runState.getCurrentStageId(), WorkflowStageId.STAGE_3A_TECH_SPEC);
   });
+
+  it('4. 在线 LLM 模式下 Stage 3b/4 必须执行真实沙箱落盘与单测，且拦截 QA 谎报（A1↔E1/E2 闭环）', async () => {
+    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
+
+    let capturedEngineerUserPrompt = '';
+    let capturedQaUserPrompt = '';
+    let qaAttempt = 0;
+
+    orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
+      const systemPrompt = payload.messages?.[0]?.content ?? '';
+      const userPrompt = payload.messages?.[1]?.content ?? '';
+
+      if (systemPrompt.includes('Engineer Agent')) {
+        capturedEngineerUserPrompt = userPrompt;
+        return makeResponse(STAGE_JSON.STAGE_3B_ENGINEER);
+      }
+      if (systemPrompt.includes('QA Agent')) {
+        qaAttempt += 1;
+        capturedQaUserPrompt = userPrompt;
+        if (qaAttempt === 1) {
+          // 第一次故意谎报：passedCases (1) < totalCases (2)，但声称 allAcceptanceCriteriaMet=true
+          return makeResponse(
+            JSON.stringify({
+              summary: 'QA 谎报测试全部通过',
+              coreRequirementIds: ['R1', 'R2'],
+              testSuitesExecuted: [
+                {
+                  suiteName: 'r1.sandbox.spec.ts',
+                  totalCases: 2,
+                  passedCases: 1,
+                  coveragePercent: 50,
+                },
+              ],
+              securityIssuesFound: 0,
+              allAcceptanceCriteriaMet: true,
+            }),
+          );
+        }
+        return makeResponse(STAGE_JSON.STAGE_4_QA);
+      }
+      for (const [stageId, json] of Object.entries(STAGE_JSON)) {
+        if (systemPrompt.includes(stageId) || systemPrompt.includes(stageMetaRole(stageId))) {
+          return makeResponse(json);
+        }
+      }
+      return makeResponse(STAGE_JSON.STAGE_1_PM);
+    });
+
+    const proposal = new ProjectProposalContract({
+      proposalId: 'TEST-FULL-PIPE-SANDBOX-004',
+      title: '在线 LLM 真实沙箱落盘与防谎报校验',
+      summary: '验证 3b 真实写文件、4 注入真实测试结果并拦截谎报',
+      requirements: { R1: '需求 1', R2: '需求 2' },
+    });
+
+    const runState = await orchestrator.startProposalWorkflow({
+      proposal,
+      initiatorActor: '沙箱闭环测试',
+    });
+
+    // 3a 门禁签核放行以推进到 3b 与 Stage 4
+    await orchestrator.submitHumanGateDecision({
+      runId: runState.runId,
+      snapshotId: runState.getLatestSnapshotOnActiveBranch()!.snapshotId,
+      reviewerActor: '架构师',
+      verdict: 'APPROVE' as never,
+      comment: '放行进入 3b 与 4',
+    });
+
+    // 1) 验证 Stage 3b 在线模式下物理沙箱已真实创建并落盘代码文件
+    const workspaceSummary = orchestrator.sandboxManager.getWorkspaceSummary(
+      runState.runId,
+      runState.getActiveBranchId(),
+    );
+    assert.ok(
+      workspaceSummary.generatedFiles.length >= 4,
+      `在线 LLM 模式下 Stage 3b 必须真实落盘业务类与单测文件（实际 ${workspaceSummary.generatedFiles.length} 个）`,
+    );
+    assert.ok(
+      capturedEngineerUserPrompt.includes('"sandboxVerification"'),
+      'Stage 3b Prompt 必须注入真实沙箱分支与自测结果 sandboxVerification',
+    );
+
+    // 2) 验证 Stage 4 Prompt 注入了真实 node:test 沙箱结果，且首次谎报被拦截触发了自愈重试
+    assert.ok(
+      capturedQaUserPrompt.includes('"sandboxVerification"'),
+      'Stage 4 QA Prompt 必须注入真实沙箱测试结果 sandboxVerification',
+    );
+    assert.equal(qaAttempt, 2, 'QA 首次谎报 passedCases < totalCases 应触发契约校验违规并自愈重试');
+  });
+
+  it('5. C3 总管自然语言回退在 Facade 中已接线 modelRouter（同义词 LLM 解析 + 流水线阶段白名单）', async () => {
+    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
+
+    let supervisorLlmCalled = false;
+    orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
+      const systemPrompt = payload.messages?.[0]?.content ?? '';
+      if (systemPrompt.includes('研发流水线总管 Agent')) {
+        supervisorLlmCalled = true;
+        return makeResponse(
+          JSON.stringify({
+            targetStageId: 'STAGE_1_PM',
+            cleanInstruction: '重新梳理产品经理阶段的业务验收指标',
+          }),
+        );
+      }
+      for (const [stageId, json] of Object.entries(STAGE_JSON)) {
+        if (systemPrompt.includes(stageId) || systemPrompt.includes(stageMetaRole(stageId))) {
+          return makeResponse(json);
+        }
+      }
+      return makeResponse(STAGE_JSON.STAGE_1_PM);
+    });
+
+    const proposal = new ProjectProposalContract({
+      proposalId: 'TEST-C3-SUPERVISOR-005',
+      title: 'C3 总管 LLM 解析接线验证',
+      summary: '不含 PM/需求/PRD 关键词的同义指令由 LLM 解析回退至 STAGE_1_PM',
+      requirements: { R1: '需求 1', R2: '需求 2' },
+    });
+
+    const runState = await orchestrator.startProposalWorkflow({
+      proposal,
+      initiatorActor: '总管测试',
+    });
+
+    // 指令不含 "PM" / "需求" / "PRD"（若走 keywordParse 会默认落到 STAGE_3B_ENGINEER）
+    await orchestrator.invokeSupervisorConversationalRollback({
+      runId: runState.runId,
+      humanActor: '项目总监',
+      dialogueInstruction: '请退回到最初的产品经理规划环节，补充多币种清分指标',
+    });
+
+    assert.equal(supervisorLlmCalled, true, 'Facade 中的 SupervisorAgent 必须调用 LLM 解析指令');
+    assert.ok(
+      runState.getActiveBranchId().includes('STAGE_1_PM'),
+      `应由 LLM 解析回退至 STAGE_1_PM（实际分支 ${runState.getActiveBranchId()}）`,
+    );
+  });
+
+  it('6. B1 受限协商在线 LLM 多轮演进：首轮分歧、次轮达成共识，且 Token 计入运行实例', async () => {
+    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
+
+    let negTurnCalls = 0;
+    orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
+      const systemPrompt = payload.messages?.[0]?.content ?? '';
+      if (systemPrompt.includes('受限协商')) {
+        negTurnCalls += 1;
+        return makeResponse(
+          JSON.stringify({
+            responseResolution:
+              negTurnCalls === 1
+                ? '第 1 轮：PM 暂不同意直接砍掉三维拓扑视图'
+                : '第 2 轮：双方同意采用渐进式双栏抽屉降级方案',
+            consensusReached: negTurnCalls >= 2,
+            optionAProposal: 'LLM 方案 A：渐进式双栏抽屉',
+            optionBProposal: 'LLM 方案 B：定制 WebGL 视图',
+          }),
+        );
+      }
+      if (systemPrompt.includes('PD Agent')) {
+        return makeResponse(
+          JSON.stringify({
+            ...JSON.parse(STAGE_JSON.STAGE_2_PD),
+            designChallengeNote: 'PD 质询：三维画布超出首屏渲染预算',
+          }),
+        );
+      }
+      for (const [stageId, json] of Object.entries(STAGE_JSON)) {
+        if (systemPrompt.includes(stageId) || systemPrompt.includes(stageMetaRole(stageId))) {
+          return makeResponse(json);
+        }
+      }
+      return makeResponse(STAGE_JSON.STAGE_1_PM);
+    });
+
+    const proposal = new ProjectProposalContract({
+      proposalId: 'TEST-B1-MULTITURN-006',
+      title: 'B1 多轮协商演进测试',
+      summary: '非强制死锁下 LLM 第 1 轮分歧、第 2 轮达成共识',
+      requirements: { R1: '需求 1', R2: '需求 2' },
+    });
+
+    const runState = await orchestrator.startProposalWorkflow({
+      proposal,
+      initiatorActor: '协商测试',
+    });
+
+    assert.equal(negTurnCalls, 2, '首轮未达成共识时应继续推进至第 2 轮协商');
+    const history = orchestrator.negotiationMediator.getNegotiationHistory(runState.runId);
+    assert.equal(history.length, 2);
+    assert.equal(history[0].consensusReached, false);
+    assert.equal(history[1].consensusReached, true);
+    assert.equal(history[1].escalatedToSupervisor, false);
+  });
 });
 
 /** 阶段 ID → 角色名映射（用于 prompt 路由） */

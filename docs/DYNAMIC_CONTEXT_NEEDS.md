@@ -16,7 +16,7 @@
 - 三道防线：
   1. **离线零调用**：`LITELLM_ENABLE_LIVE_HTTP !== 'true'` 时直接返回空数组（不发起任何请求）；
   2. **目录白名单**：type 必须命中 `ALL_CONTEXT_NEED_TYPES`（由 STAGE_CONTEXT_NEEDS 全表派生），枚举外一律丢弃——注入拦截，与 C3 NL 解析同哲学；
-  3. **轻量上限**：最多 3 条、一律 `required: false` + `maxTokens: 800`——动态增强永不阻塞流水线。
+  3. **轻量上限**：先截取前 3 条（`slice(0, 3)`）再按白名单过滤（因此最终有效动态需求 `≤ 3` 条）、一律 `required: false` + `maxTokens: 800`——动态增强永不阻塞流水线。
 
 ### 2. 需求合并与预取
 
@@ -48,8 +48,8 @@ Facade
    注入类型被白名单丢弃。
 2. **离线回归**：`LITELLM_ENABLE_LIVE_HTTP` 未开启 → 规划器零调用（transport 捕获 0 次规划请求），静态流水线照常执行。
 
-**测试基线**：107 项（103 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。
+**完成时测试基线**：107 项（103 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
 
 ## 遗留
 
-- 规划器与 A4（总管意图识别 LLM 化）各自独立调用 LLM——若成本敏感可合并为单次调用，暂保持简单。
+- 规划器目前每次在线执行会额外发起 1 次 `PRIVACY_SENSITIVE_LOCAL` LLM 调用；与之不同，A4（6 个 Worker Agent 的阶段意图识别 `__intent`）已通过随主阶段 `invokeChatCompletion` 返回实现零额外往返（而总管自然语言回退解析为 C3，仅在人类主动发起对话回退时独立调用 LLM）。若成本敏感，后续也可考虑进一步复用或缓存动态需求。

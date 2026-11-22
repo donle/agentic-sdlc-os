@@ -38,6 +38,15 @@ export class CacheLookupOutcome<T extends IDomainArtifactContract = IDomainArtif
   }
 }
 
+export interface CacheLookupOptions {
+  /** 请求方模型最低能力等级：拒绝命中低排名模型产出的缓存（防质量倒挂） */
+  readonly minQualityRank?: number;
+  /** 当前阶段 Prompt 规格摘要：模板升级后自动隔离旧缓存 */
+  readonly promptSpecHash?: string;
+  /** 所属阶段 ID：防止跨阶段语义误命中 */
+  readonly stageId?: WorkflowStageId;
+}
+
 export class CacheTelemetrySnapshot {
   public readonly totalLookups: number;
   public readonly l1ExactHits: number;
@@ -49,6 +58,10 @@ export class CacheTelemetrySnapshot {
   public readonly savedCostUsdTotal: number;
   /** G1：embedding 端点不可用导致的 L2 降级检索次数（诚实口径） */
   public readonly embeddingUnavailableLookups: number;
+  /** Pillar 2：因当前请求模型质量等级高于缓存条目而绕过的次数（防弱模型污染强模型） */
+  public readonly qualityUpgradeBypasses: number;
+  /** Pillar 2：因 Embedding 向量空间 / Prompt 版本 / 阶段不一致而跳过的条目数 */
+  public readonly crossSpaceSkips: number;
 
   public constructor(params: {
     totalLookups: number;
@@ -58,6 +71,8 @@ export class CacheTelemetrySnapshot {
     savedTokensTotal: number;
     savedCostUsdTotal: number;
     embeddingUnavailableLookups?: number;
+    qualityUpgradeBypasses?: number;
+    crossSpaceSkips?: number;
   }) {
     this.totalLookups = params.totalLookups;
     this.l1ExactHits = params.l1ExactHits;
@@ -71,6 +86,8 @@ export class CacheTelemetrySnapshot {
     this.savedTokensTotal = params.savedTokensTotal;
     this.savedCostUsdTotal = Number(params.savedCostUsdTotal.toFixed(6));
     this.embeddingUnavailableLookups = params.embeddingUnavailableLookups ?? 0;
+    this.qualityUpgradeBypasses = params.qualityUpgradeBypasses ?? 0;
+    this.crossSpaceSkips = params.crossSpaceSkips ?? 0;
   }
 }
 
@@ -78,12 +95,17 @@ interface CacheEntryRecord {
   readonly artifact: IDomainArtifactContract;
   readonly estimatedTokens: number;
   readonly estimatedCostUsd: number;
+  readonly modelQualityRank: number;
+  readonly modelIdentifier?: string;
+  readonly promptSpecHash?: string;
 }
 
-/** L2 语义条目：意图文本 + 向量（embedding 失败时不产生条目） */
+/** L2 语义条目：意图文本 + 所属向量空间 + 向量（embedding 失败时不产生条目） */
 interface L2SemanticEntry {
   readonly intentText: string;
   readonly embedding: ReadonlyArray<number>;
+  readonly embeddingSpaceId: string;
+  readonly stageId?: WorkflowStageId;
   readonly entry: CacheEntryRecord;
 }
 
@@ -95,6 +117,8 @@ export class PromptCacheManager {
   private l2SemanticHits = 0;
   private cacheMisses = 0;
   private embeddingUnavailableLookups = 0;
+  private qualityUpgradeBypasses = 0;
+  private crossSpaceSkips = 0;
   private savedTokensTotal = 0;
   private savedCostUsdTotal = 0;
   private readonly cacheEnabled: boolean;
@@ -149,11 +173,12 @@ export class PromptCacheManager {
   }
 
   /**
-   * 检索双层缓存并自动记账（G1：L2 走向量余弦，需异步）
+   * 检索双层缓存并自动记账（G1/Pillar 2：跨模型防质量倒挂 + Embedding 空间与 Prompt 版本隔离）
    */
   public async lookup<T extends IDomainArtifactContract>(
     exactKey: string,
     semanticIntentText: string,
+    options?: CacheLookupOptions,
   ): Promise<CacheLookupOutcome<T>> {
     this.totalLookups += 1;
 
@@ -169,15 +194,24 @@ export class PromptCacheManager {
 
     const l1Match = this.l1ExactStore.get(exactKey);
     if (l1Match) {
-      this.l1ExactHits += 1;
-      this.savedTokensTotal += l1Match.estimatedTokens;
-      this.savedCostUsdTotal += l1Match.estimatedCostUsd;
-      return new CacheLookupOutcome<T>({
-        isHit: true,
-        cacheLayer: 'L1_EXACT',
-        cachedArtifact: l1Match.artifact as T,
-        savedTokensEstimate: l1Match.estimatedTokens,
-      });
+      if (options?.promptSpecHash && l1Match.promptSpecHash !== options.promptSpecHash) {
+        this.crossSpaceSkips += 1;
+      } else if (
+        options?.minQualityRank !== undefined &&
+        l1Match.modelQualityRank < options.minQualityRank
+      ) {
+        this.qualityUpgradeBypasses += 1;
+      } else {
+        this.l1ExactHits += 1;
+        this.savedTokensTotal += l1Match.estimatedTokens;
+        this.savedCostUsdTotal += l1Match.estimatedCostUsd;
+        return new CacheLookupOutcome<T>({
+          isHit: true,
+          cacheLayer: 'L1_EXACT',
+          cachedArtifact: l1Match.artifact as T,
+          savedTokensEstimate: l1Match.estimatedTokens,
+        });
+      }
     }
 
     // L2 语义向量检索：embedding 不可用 → 仅 L1（D-2 降级，如实记账）
@@ -193,9 +227,25 @@ export class PromptCacheManager {
       });
     }
 
+    const activeSpaceId = this.getActiveEmbeddingSpaceId();
     let bestEntry: L2SemanticEntry | null = null;
     let bestScore = 0;
     for (const candidate of this.l2SemanticEntries) {
+      if (
+        candidate.embeddingSpaceId !== activeSpaceId ||
+        (options?.promptSpecHash && candidate.entry.promptSpecHash !== options.promptSpecHash) ||
+        (options?.stageId && candidate.stageId && candidate.stageId !== options.stageId)
+      ) {
+        this.crossSpaceSkips += 1;
+        continue;
+      }
+      if (
+        options?.minQualityRank !== undefined &&
+        candidate.entry.modelQualityRank < options.minQualityRank
+      ) {
+        this.qualityUpgradeBypasses += 1;
+        continue;
+      }
       const score = cosineSimilarity(queryEmbedding, candidate.embedding);
       if (score >= SEMANTIC_CACHE_THRESHOLD && score > bestScore) {
         bestScore = score;
@@ -226,7 +276,7 @@ export class PromptCacheManager {
 
   /**
    * 将经过契约校验的优质 Agent 交付物写入 L1 与 L2 缓存
-   * （G1：L2 需先 embedding 意图文本；失败则仅写 L1，不产生降级伪向量）
+   * （G1：L2 需先 embedding 意图文本；失败则仅写 L1；Pillar 2：高能力产物不被同版本低能力条目覆写）
    */
   public async storeVerifiedArtifact(params: {
     exactKey: string;
@@ -234,22 +284,36 @@ export class PromptCacheManager {
     artifact: IDomainArtifactContract;
     estimatedTokens: number;
     estimatedCostUsd: number;
+    modelQualityRank?: number;
+    modelIdentifier?: string;
+    promptSpecHash?: string;
+    stageId?: WorkflowStageId;
   }): Promise<void> {
     if (!this.cacheEnabled) {
       return;
     }
+    const modelQualityRank = params.modelQualityRank ?? 70;
     const entry: CacheEntryRecord = {
       artifact: params.artifact,
       estimatedTokens: params.estimatedTokens,
       estimatedCostUsd: params.estimatedCostUsd,
+      modelQualityRank,
+      modelIdentifier: params.modelIdentifier,
+      promptSpecHash: params.promptSpecHash,
     };
-    this.l1ExactStore.set(params.exactKey, entry);
+    const existing = this.l1ExactStore.get(params.exactKey);
+    const sameSpec = existing?.promptSpecHash === params.promptSpecHash;
+    if (!existing || !sameSpec || modelQualityRank >= existing.modelQualityRank) {
+      this.l1ExactStore.set(params.exactKey, entry);
+    }
 
     const embedding = await this.embedOrNull(params.semanticIntentText);
     if (embedding !== null) {
       this.l2SemanticEntries.push({
         intentText: params.semanticIntentText,
         embedding,
+        embeddingSpaceId: this.getActiveEmbeddingSpaceId(),
+        stageId: params.stageId,
         entry,
       });
     }
@@ -269,7 +333,16 @@ export class PromptCacheManager {
       savedTokensTotal: this.savedTokensTotal,
       savedCostUsdTotal: this.savedCostUsdTotal,
       embeddingUnavailableLookups: this.embeddingUnavailableLookups,
+      qualityUpgradeBypasses: this.qualityUpgradeBypasses,
+      crossSpaceSkips: this.crossSpaceSkips,
     });
+  }
+
+  private getActiveEmbeddingSpaceId(): string {
+    if (!this.embeddingProvider) {
+      return 'NONE';
+    }
+    return `${this.embeddingProvider.providerName}::${this.embeddingProvider.modelIdentifier ?? 'default'}`;
   }
 
   private async embedOrNull(text: string): Promise<number[] | null> {

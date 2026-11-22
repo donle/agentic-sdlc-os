@@ -18,6 +18,24 @@ import type { PersistenceRepository } from './PersistenceRepository.ts';
 import type { EmbeddingProvider } from '../telemetry/EmbeddingProvider.ts';
 
 export class AuditTrailEntry {
+  public static fromJSON(raw: Record<string, unknown>): AuditTrailEntry {
+    const rawMetadata =
+      raw.metadata && typeof raw.metadata === 'object' && !Array.isArray(raw.metadata)
+        ? (raw.metadata as Record<string, unknown>)
+        : {};
+    return new AuditTrailEntry({
+      entryId: String(raw.entryId ?? ''),
+      runId: String(raw.runId ?? ''),
+      branchId: String(raw.branchId ?? ''),
+      stageId: String(raw.stageId ?? 'STAGE_1_PM') as WorkflowStageId,
+      actor: String(raw.actor ?? ''),
+      actionType: String(raw.actionType ?? ''),
+      summary: String(raw.summary ?? ''),
+      metadata: rawMetadata,
+      timestampIso: raw.timestampIso ? String(raw.timestampIso) : undefined,
+    });
+  }
+
   public readonly entryId: string;
   public readonly runId: string;
   public readonly branchId: string;
@@ -147,6 +165,19 @@ export class ImmutableAuditLedger implements IWorkflowEventObserver {
   /** D1：恢复决策账本（不触发 RAG 沉淀——负向经验已随快照恢复） */
   public restoreDecision(decision: HumanDecisionRecord): void {
     this.humanDecisions.push(decision);
+  }
+
+  /** D1 / AUDIT-9：从 WAL 或快照恢复审计时间线条目（不重写入 WAL，防重复/二次 RAG） */
+  public restoreAuditEntry(entry: AuditTrailEntry): void {
+    const duplicated = this.auditEntries.some(
+      (existing) =>
+        existing.entryId === entry.entryId &&
+        existing.runId === entry.runId &&
+        existing.timestampIso === entry.timestampIso,
+    );
+    if (!duplicated) {
+      this.auditEntries.push(entry);
+    }
   }
 
   public registerRejectionLesson(stageId: WorkflowStageId, lesson: string): void {

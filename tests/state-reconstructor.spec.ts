@@ -5,10 +5,16 @@
  */
 
 import * as assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { ProjectProposalContract } from '../src/domain/contracts.ts';
-import { DecisionVerdict } from '../src/domain/enums.ts';
+import { DecisionVerdict, WorkflowStageId } from '../src/domain/enums.ts';
+import { ScopeDiffReport } from '../src/domain/models.ts';
+import { AuditTrailEntry } from '../src/engine/ImmutableAuditLedger.ts';
+import { PersistenceRepository } from '../src/engine/PersistenceRepository.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
 import { StateReconstructor } from '../src/engine/pg/StateReconstructor.ts';
 
@@ -143,5 +149,140 @@ describe('D1 — StateReconstructor 启动恢复测试', () => {
     // 应正常推进到下一阶段或完成
     assert.notEqual(runState2.getStatus(), 'ABORTED');
     assert.notEqual(runState2.getStatus(), 'PAUSED_AT_HUMAN_GATE');
+  });
+
+  it('4. AUDIT-9：persist → restoreFromPersistence 完整还原 ScopeDiff / notificationInbox / teamComments / autoRepairCounts / auditEntries（且 WAL 不重复追加）', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdlc-d1-audit9-'));
+    const persistenceDir = path.join(tmpDir, 'persist');
+    const sandboxRootDir = path.join(tmpDir, 'sandbox');
+    try {
+      const orchestrator1 = new WorkflowOrchestratorFacade({
+        maxNegotiationTurns: 3,
+        persistenceDir,
+        sandboxRootDir,
+      });
+      const proposal = new ProjectProposalContract({
+        proposalId: 'TEST-D1-AUDIT9-004',
+        title: 'AUDIT-9 5项状态持久化恢复测试',
+        summary: '验证范围缩水/通知卡/评论/返修计数/审计WAL全量跨重启还原',
+        requirements: {
+          REQ_SCOPE_KEEP: '保留核心业务流程',
+          REQ_SCOPE_DROP: '应被保留不可缩水条款',
+        },
+      });
+      const runState1 = await orchestrator1.startProposalWorkflow({
+        proposal,
+        initiatorActor: '审计恢复验证',
+        scenarioHints: { forceScopeReduction: true },
+      });
+
+      assert.equal(runState1.getStatus(), 'PAUSED_AT_HUMAN_GATE');
+      runState1.recordAutoRepair('QA_TO_ENG');
+      runState1.recordAutoRepair('QA_TO_ENG');
+
+      const addedComment = orchestrator1.addTeamComment({
+        runId: runState1.runId,
+        stageId: WorkflowStageId.STAGE_1_PM,
+        actorUserId: 'user-pm-01',
+        content: '独立追加的跨重启团队评审评论',
+      });
+
+      const walCountBefore = orchestrator1.persistenceRepo.readAuditWalEntries().length;
+      const timeline1 = orchestrator1.auditLedger.getAuditTimeline(runState1.runId);
+      const inbox1 = orchestrator1.eventBus.getNotificationInbox(runState1.runId);
+      const comments1 = orchestrator1.getTeamComments(runState1.runId);
+      const snap1 = runState1.getAllSnapshots()[0];
+      assert.ok(snap1);
+      assert.equal(snap1.scopeDiffReport.hasUnauthorizedScopeReduction, true);
+      assert.ok(inbox1.length > 0);
+      assert.ok(timeline1.length > 0);
+
+      // 重建全新实例模拟服务重启
+      const orchestrator2 = new WorkflowOrchestratorFacade({
+        maxNegotiationTurns: 3,
+        persistenceDir,
+        sandboxRootDir,
+      });
+      const restored = orchestrator2.restoreFromPersistence();
+      assert.equal(restored.restored, true);
+      assert.equal(restored.warnings.length, 0);
+      assert.ok(restored.runIds.includes(runState1.runId));
+
+      const runState2 = orchestrator2.stateEngine.getRunOrThrow(runState1.runId);
+
+      // 1) ScopeDiffReport 完整保留 baseline/current/dropped
+      const snap2 = runState2.getAllSnapshots()[0];
+      assert.ok(snap2);
+      assert.equal(snap2.scopeDiffReport.hasUnauthorizedScopeReduction, true);
+      assert.deepEqual(snap2.scopeDiffReport.baselineRequirementIds, [
+        'REQ_SCOPE_KEEP',
+        'REQ_SCOPE_DROP',
+      ]);
+      assert.deepEqual(snap2.scopeDiffReport.currentRequirementIds, ['REQ_SCOPE_KEEP']);
+      assert.deepEqual(snap2.scopeDiffReport.droppedRequirementIds, ['REQ_SCOPE_DROP']);
+
+      // 2) notificationInbox 保留待办门禁卡片及顺序
+      const inbox2 = orchestrator2.eventBus.getNotificationInbox(runState1.runId);
+      assert.equal(inbox2.length, inbox1.length);
+      assert.deepEqual(
+        inbox2.map((n) => n.notificationId),
+        inbox1.map((n) => n.notificationId),
+      );
+      const pendingNotif2 = inbox2.find((n) => n.requiresHumanAction);
+      assert.ok(pendingNotif2);
+      assert.equal(pendingNotif2.isResolved(), false);
+      assert.ok(pendingNotif2.actionOptions.length > 0);
+
+      // 3) teamComments 包含单独追加的评论
+      const comments2 = orchestrator2.getTeamComments(runState1.runId);
+      assert.equal(comments2.length, comments1.length);
+      const restoredAdded = comments2.find((c) => c.commentId === addedComment.commentId);
+      assert.ok(restoredAdded);
+      assert.equal(restoredAdded.content, '独立追加的跨重启团队评审评论');
+      assert.equal(restoredAdded.authorUserId, addedComment.authorUserId);
+
+      // 4) autoRepairCounts 准确恢复
+      assert.equal(runState2.getAutoRepairCount('QA_TO_ENG'), 2);
+
+      // 5) auditEntries 从 WAL 重建且磁盘 WAL 不重复写入
+      const timeline2 = orchestrator2.auditLedger.getAuditTimeline(runState1.runId);
+      assert.equal(timeline2.length, timeline1.length);
+      assert.equal(orchestrator2.persistenceRepo.readAuditWalEntries().length, walCountBefore);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('5. AUDIT-9：兼容缺 baselineRequirementIds 的历史 ScopeDiff 快照与损坏 WAL 行容错', () => {
+    const legacyDiff = ScopeDiffReport.fromJSON({
+      hasUnauthorizedScopeReduction: true,
+      droppedRequirementIds: ['REQ_LEGACY'],
+    });
+    assert.equal(legacyDiff.hasUnauthorizedScopeReduction, true);
+    assert.deepEqual(legacyDiff.droppedRequirementIds, ['REQ_LEGACY']);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdlc-d1-wal-corrupt-'));
+    try {
+      const repo = new PersistenceRepository(tmpDir);
+      const validEntry = new AuditTrailEntry({
+        entryId: 'AUD-VALID-1',
+        runId: 'RUN-WAL-1',
+        branchId: 'branch-v1',
+        stageId: WorkflowStageId.STAGE_1_PM,
+        actor: 'PM_AGENT',
+        actionType: 'AGENT_EXECUTING',
+        summary: '正常审计条目',
+        timestampIso: '2026-11-23T06:00:00.000Z',
+      });
+      repo.appendAuditEntryToWal(validEntry);
+      const walPath = path.join(tmpDir, 'audit-trail-2026-11.jsonl');
+      fs.appendFileSync(walPath, '{"corrupted_truncated_json\n', 'utf-8');
+
+      const readBack = repo.readAuditWalEntries();
+      assert.equal(readBack.length, 1);
+      assert.equal(readBack[0].entryId, 'AUD-VALID-1');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

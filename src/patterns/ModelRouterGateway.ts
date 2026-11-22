@@ -71,6 +71,43 @@ export class PayloadDesensitizer {
   }
 }
 
+export interface ModelCapabilityProfile {
+  /** 模型综合能力等级（1-100），用于跨模型 L1/L2 缓存防质量倒挂 */
+  readonly qualityRank: number;
+  /** 端点是否支持 response_format: { type: 'json_schema', json_schema: { strict: true } } */
+  readonly supportsJsonSchema: boolean;
+  /** 推荐确定性采样温度 */
+  readonly recommendedTemperature: number;
+  /** 是否在首轮 Prompt 自动附带 1-shot 精简示例（中小本地模型强烈推荐） */
+  readonly preferFewShotExample: boolean;
+  /** 端点是否支持提供商侧 Prompt 前缀 KV 缓存（L0） */
+  readonly supportsPromptPrefixCache: boolean;
+}
+
+const DEFAULT_TIER_CAPABILITIES: Record<ModelRoutingTier, ModelCapabilityProfile> = {
+  [ModelRoutingTier.PRIVACY_SENSITIVE_LOCAL]: {
+    qualityRank: 65,
+    supportsJsonSchema: true,
+    recommendedTemperature: 0,
+    preferFewShotExample: true,
+    supportsPromptPrefixCache: false,
+  },
+  [ModelRoutingTier.HIGH_REASONING_HYBRID]: {
+    qualityRank: 90,
+    supportsJsonSchema: true,
+    recommendedTemperature: 0,
+    preferFewShotExample: false,
+    supportsPromptPrefixCache: true,
+  },
+  [ModelRoutingTier.EMBEDDING]: {
+    qualityRank: 70,
+    supportsJsonSchema: false,
+    recommendedTemperature: 0,
+    preferFewShotExample: false,
+    supportsPromptPrefixCache: false,
+  },
+};
+
 export class ModelEndpointDescriptor {
   public readonly tier: ModelRoutingTier;
   public readonly providerName: string;
@@ -78,6 +115,7 @@ export class ModelEndpointDescriptor {
   public readonly costPer1kTokensUsd: number;
   public readonly isLocalPrivateModel: boolean;
   public readonly baseUrl: string;
+  public readonly capabilities: ModelCapabilityProfile;
 
   public constructor(params: {
     tier: ModelRoutingTier;
@@ -86,6 +124,7 @@ export class ModelEndpointDescriptor {
     costPer1kTokensUsd: number;
     isLocalPrivateModel: boolean;
     baseUrl?: string;
+    capabilities?: Partial<ModelCapabilityProfile>;
   }) {
     this.tier = params.tier;
     this.providerName = params.providerName;
@@ -97,6 +136,11 @@ export class ModelEndpointDescriptor {
       (params.isLocalPrivateModel
         ? (process.env.OLLAMA_API_BASE ?? 'http://localhost:11434')
         : (process.env.LITELLM_GATEWAY_URL ?? 'http://localhost:4000'));
+    const defaults = DEFAULT_TIER_CAPABILITIES[params.tier];
+    this.capabilities = {
+      ...defaults,
+      ...(params.capabilities ?? {}),
+    };
   }
 }
 
@@ -112,6 +156,8 @@ export class ModelInvocationReceipt {
   public readonly redactedCategories: ReadonlyArray<string>;
   /** A3：true = 网关未返回 usage，按长度估算；false = 真实账单口径 */
   public readonly usageEstimated: boolean;
+  /** L0：推理引擎提供商侧前缀 KV 缓存命中的 Prompt Token 数 */
+  public readonly cachedPromptTokens: number;
 
   public constructor(params: {
     endpoint: ModelEndpointDescriptor;
@@ -120,6 +166,7 @@ export class ModelInvocationReceipt {
     redactedCount?: number;
     redactedCategories?: ReadonlyArray<string>;
     usageEstimated?: boolean;
+    cachedPromptTokens?: number;
   }) {
     this.modelIdentifier = params.endpoint.modelIdentifier;
     this.providerName = params.endpoint.providerName;
@@ -133,8 +180,20 @@ export class ModelInvocationReceipt {
     this.redactedCount = params.redactedCount ?? 0;
     this.redactedCategories = params.redactedCategories ? [...params.redactedCategories] : [];
     this.usageEstimated = params.usageEstimated ?? true;
+    this.cachedPromptTokens = params.cachedPromptTokens ?? 0;
   }
 }
+
+export type OpenAiCompatibleResponseFormat =
+  | { readonly type: 'json_object' | 'text' }
+  | {
+      readonly type: 'json_schema';
+      readonly json_schema: {
+        readonly name: string;
+        readonly strict: boolean;
+        readonly schema: Record<string, unknown>;
+      };
+    };
 
 export interface OpenAiCompatibleChatRequest {
   readonly model: string;
@@ -143,7 +202,7 @@ export interface OpenAiCompatibleChatRequest {
     readonly content: string;
   }>;
   readonly temperature?: number;
-  readonly response_format?: { readonly type: 'json_object' | 'text' };
+  readonly response_format?: OpenAiCompatibleResponseFormat;
 }
 
 export interface OpenAiCompatibleChatResponse {
@@ -159,6 +218,9 @@ export interface OpenAiCompatibleChatResponse {
     readonly prompt_tokens: number;
     readonly completion_tokens: number;
     readonly total_tokens: number;
+    readonly prompt_tokens_details?: {
+      readonly cached_tokens?: number;
+    };
   };
 }
 
@@ -311,6 +373,11 @@ export class ModelRouterGateway {
     systemPrompt: string;
     userPrompt: string;
     fallbackContentGenerator: () => string;
+    jsonSchema?: {
+      readonly name: string;
+      readonly schema: Record<string, unknown>;
+    };
+    temperature?: number;
   }): Promise<{
     readonly content: string;
     readonly receipt: ModelInvocationReceipt;
@@ -324,14 +391,26 @@ export class ModelRouterGateway {
       new Set([...sanitizedSystem.redactedCategories, ...sanitizedUser.redactedCategories]),
     );
 
+    const responseFormat: OpenAiCompatibleResponseFormat =
+      params.jsonSchema && endpoint.capabilities.supportsJsonSchema
+        ? {
+            type: 'json_schema',
+            json_schema: {
+              name: params.jsonSchema.name,
+              strict: true,
+              schema: params.jsonSchema.schema,
+            },
+          }
+        : { type: 'json_object' };
+
     const requestPayload: OpenAiCompatibleChatRequest = {
       model: endpoint.modelIdentifier,
       messages: [
         { role: 'system', content: sanitizedSystem.sanitizedText },
         { role: 'user', content: sanitizedUser.sanitizedText },
       ],
-      temperature: 0,
-      response_format: { type: 'json_object' },
+      temperature: params.temperature ?? endpoint.capabilities.recommendedTemperature,
+      response_format: responseFormat,
     };
 
     const targetUrl = `${endpoint.baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
@@ -367,6 +446,7 @@ export class ModelRouterGateway {
         const promptTokens =
           apiRes.usage?.prompt_tokens ?? Math.ceil(sanitizedUser.sanitizedText.length / 3);
         const completionTokens = apiRes.usage?.completion_tokens ?? Math.ceil(content.length / 3);
+        const cachedPromptTokens = apiRes.usage?.prompt_tokens_details?.cached_tokens ?? 0;
 
         return {
           content,
@@ -377,6 +457,7 @@ export class ModelRouterGateway {
             redactedCount: totalRedacted,
             redactedCategories: mergedCategories,
             usageEstimated,
+            cachedPromptTokens,
           }),
           usedLiveGateway: true,
         };

@@ -5,11 +5,14 @@
 
 import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import type * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { describe, it, beforeEach } from 'node:test';
+import { Readable } from 'node:stream';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 
 import { SessionService } from '../src/server/auth/SessionService.ts';
+import { WorkbenchHttpServer } from '../src/server/WorkbenchServer.ts';
 
 describe('F1 — SessionService 边界测试', () => {
   let svc: SessionService;
@@ -186,5 +189,346 @@ describe('F1 — SessionService 边界测试', () => {
       const user = svc2.validate((login as { token: string }).token);
       assert.equal(user?.userId, 'user-admin-01');
     });
+  });
+
+  describe('安全加固回归（SHA-256 摘要 / 改密保留当前会话 / 降级保护 / 登录审计）', () => {
+    it('18. 服务端仅存 SHA-256(token) 摘要，不存明文 token', () => {
+      const login = svc.login('admin', 'admin') as { ok: true; token: string };
+      const hashes = svc.getStoredSessionTokenHashes();
+      assert.equal(hashes.length, 1);
+      assert.equal(hashes[0].length, 64);
+      assert.match(hashes[0], /^[0-9a-f]{64}$/);
+      assert.notEqual(hashes[0], login.token, '会话表中绝对不能出现明文 token');
+    });
+
+    it('19. changePassword(currentToken) 仅吊销其他设备会话，当前会话保持有效', () => {
+      const sessionA = svc.login('pm', 'pm') as { ok: true; token: string };
+      const sessionB = svc.login('pm', 'pm') as { ok: true; token: string };
+      assert.ok(svc.validate(sessionA.token));
+      assert.ok(svc.validate(sessionB.token));
+
+      const changed = svc.changePassword('user-pm-01', 'pm', 'newSecure123', sessionA.token);
+      assert.equal(changed.ok, true);
+      assert.ok(svc.validate(sessionA.token), '发起改密的当前会话必须保持有效');
+      assert.equal(svc.validate(sessionB.token), null, '同一用户的其他设备会话必须被吊销');
+    });
+
+    it('20. 禁止降级最后一个 ACTIVE 管理员为 STAGE_SPECIALIST', () => {
+      const result = svc.updateUser('user-admin-01', 'user-admin-01', {
+        tier: 'STAGE_SPECIALIST',
+      });
+      assert.equal(result.ok, false);
+      assert.ok(result.reason?.includes('最后一个'));
+    });
+
+    it('21. 登录审计正确记录 UNKNOWN_USER / BAD_PASSWORD / OK / ACT_AS', () => {
+      svc.login('nobody', 'bad');
+      svc.login('pm', 'wrong');
+      const adminLogin = svc.login('admin', 'admin') as { ok: true; token: string };
+      svc.actAs(adminLogin.token, 'user-pd-01');
+
+      const entries = svc.getLoginAudit({ limit: 10 });
+      const reasons = entries.map((e) => e.reason);
+      assert.ok(reasons.includes('UNKNOWN_USER'));
+      assert.ok(reasons.includes('BAD_PASSWORD'));
+      assert.ok(reasons.includes('OK'));
+      assert.ok(reasons.includes('ACT_AS'));
+    });
+  });
+});
+
+interface MockHttpResponse {
+  readonly statusCode: number;
+  readonly headers: Record<string, string | string[]>;
+  readonly bodyText: string;
+  readonly json: Record<string, unknown>;
+}
+
+async function dispatchInProcess(
+  server: WorkbenchHttpServer,
+  params: {
+    method: string;
+    url: string;
+    headers?: Record<string, string>;
+    body?: Record<string, unknown>;
+  },
+): Promise<MockHttpResponse> {
+  const chunks = params.body ? [Buffer.from(JSON.stringify(params.body))] : [];
+  const req = Readable.from(chunks) as unknown as http.IncomingMessage;
+  req.method = params.method;
+  req.url = params.url;
+  req.headers = { ...(params.headers ?? {}) };
+
+  let statusCode = 200;
+  const headers: Record<string, string | string[]> = {};
+  const outChunks: Buffer[] = [];
+
+  const res = {
+    writeHead(code: number, hdrs?: Record<string, string | string[]>): http.ServerResponse {
+      statusCode = code;
+      if (hdrs) {
+        for (const [k, v] of Object.entries(hdrs)) {
+          headers[k.toLowerCase()] = v;
+        }
+      }
+      return res as unknown as http.ServerResponse;
+    },
+    write(chunk: string | Buffer): boolean {
+      outChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      return true;
+    },
+    end(chunk?: string | Buffer): http.ServerResponse {
+      if (chunk) {
+        outChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return res as unknown as http.ServerResponse;
+    },
+  } as unknown as http.ServerResponse;
+
+  await server.handleHttpRequest(req, res);
+  const bodyText = Buffer.concat(outChunks).toString('utf-8');
+  let json: Record<string, unknown>;
+  try {
+    json = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : {};
+  } catch {
+    json = {};
+  }
+  return { statusCode, headers, bodyText, json };
+}
+
+describe('F1/F2 — WorkbenchHttpServer 认证与路由权限守卫（进程内 HTTP 验证）', () => {
+  const savedEnv: Record<string, string | undefined> = {};
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) {
+        delete process.env[k];
+      } else {
+        process.env[k] = v;
+      }
+    }
+  });
+
+  function setEnv(key: string, val: string | undefined): void {
+    if (!(key in savedEnv)) {
+      savedEnv[key] = process.env[key];
+    }
+    if (val === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = val;
+    }
+  }
+
+  it('1. AUTH_REQUIRED=true：未登录 401、首登改密拦截 403、改密保留当前会话、权限码越权拦截 403、act-as 与审计查询', async () => {
+    setEnv('AUTH_REQUIRED', 'true');
+    setEnv('AUTH_DISABLED', undefined);
+    const persistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'f1-srv-persist-'));
+    const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'f1-srv-sb-'));
+
+    try {
+      const server = new WorkbenchHttpServer(0, {
+        persistenceDir: persistDir,
+        sandboxRootDir: sandboxDir,
+      });
+      await server.waitUntilReady();
+
+      // 1) 未登录访问 /api/state → 401
+      const unauthState = await dispatchInProcess(server, { method: 'GET', url: '/api/state' });
+      assert.equal(unauthState.statusCode, 401);
+
+      // 2) PM 登录成功，Set-Cookie 带 sdlc_session
+      const pmLogin = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/login',
+        body: { username: 'pm', password: 'pm' },
+      });
+      assert.equal(pmLogin.statusCode, 200);
+      const setCookie = String(pmLogin.headers['set-cookie'] ?? '');
+      const pmCookieMatch = setCookie.match(/sdlc_session=([^\s;]+)/);
+      assert.ok(pmCookieMatch);
+      const pmCookie = `sdlc_session=${pmCookieMatch[1]}`;
+
+      // 3) 首登 mustChangePassword=true → 访问业务端点 403；改密后当前会话保持有效
+      const blockedBeforePwd = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/state',
+        headers: { cookie: pmCookie },
+      });
+      assert.equal(blockedBeforePwd.statusCode, 403);
+      assert.equal(blockedBeforePwd.json.mustChangePassword, true);
+
+      const changePwd = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/change-password',
+        headers: { cookie: pmCookie },
+        body: { oldPassword: 'pm', newPassword: 'PmNewPassword1' },
+      });
+      assert.equal(changePwd.statusCode, 200);
+
+      const pmMe = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/auth/me',
+        headers: { cookie: pmCookie },
+      });
+      assert.equal(pmMe.statusCode, 200, '改密后原会话 Cookie 必须仍然有效');
+
+      // 4) PM 越权调用 /api/admin/governance → 403
+      const pmGovernance = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/admin/governance',
+        headers: { cookie: pmCookie },
+        body: { maxNegotiationTurns: 5 },
+      });
+      assert.equal(pmGovernance.statusCode, 403);
+
+      // 5) PD 登录改密后越权调用 POST /api/proposals（缺 CREATE_PROPOSAL 权限码）→ 403
+      const pdLogin = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/login',
+        body: { username: 'pd', password: 'pd' },
+      });
+      const pdCookieMatch = String(pdLogin.headers['set-cookie'] ?? '').match(
+        /sdlc_session=([^\s;]+)/,
+      );
+      assert.ok(pdCookieMatch);
+      const pdCookie = `sdlc_session=${pdCookieMatch[1]}`;
+      await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/change-password',
+        headers: { cookie: pdCookie },
+        body: { oldPassword: 'pd', newPassword: 'PdNewPassword1' },
+      });
+      const pdProposal = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/proposals',
+        headers: { cookie: pdCookie },
+        body: { preset: 'LOW_RISK_FAST_TRACK' },
+      });
+      assert.equal(pdProposal.statusCode, 403);
+
+      // 6) Admin 登录改密 → act-as PM → /api/auth/me 返回 impersonating；登录审计可见
+      const adminLogin = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/login',
+        body: { username: 'admin', password: 'admin' },
+      });
+      const adminCookieMatch = String(adminLogin.headers['set-cookie'] ?? '').match(
+        /sdlc_session=([^\s;]+)/,
+      );
+      assert.ok(adminCookieMatch);
+      const adminCookie = `sdlc_session=${adminCookieMatch[1]}`;
+      await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/change-password',
+        headers: { cookie: adminCookie },
+        body: { oldPassword: 'admin', newPassword: 'AdminNewPassword1' },
+      });
+
+      const auditRes = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/admin/login-audit?limit=10',
+        headers: { cookie: adminCookie },
+      });
+      assert.equal(auditRes.statusCode, 200);
+      const auditData = auditRes.json.data as { entries: unknown[] };
+      assert.ok(auditData.entries.length >= 3);
+
+      const actAsRes = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/act-as',
+        headers: { cookie: adminCookie },
+        body: { targetUserId: 'user-pm-01' },
+      });
+      assert.equal(actAsRes.statusCode, 200);
+      const actAsCookieMatch = String(actAsRes.headers['set-cookie'] ?? '').match(
+        /sdlc_session=([^\s;]+)/,
+      );
+      assert.ok(actAsCookieMatch);
+      const actAsMe = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/auth/me',
+        headers: { cookie: `sdlc_session=${actAsCookieMatch[1]}` },
+      });
+      assert.equal(actAsMe.statusCode, 200);
+      const actAsData = actAsMe.json.data as {
+        user: { userId: string };
+        impersonating: { userId: string } | null;
+      };
+      assert.equal(actAsData.user.userId, 'user-pm-01');
+      assert.equal(actAsData.impersonating?.userId, 'user-admin-01');
+    } finally {
+      fs.rmSync(persistDir, { recursive: true, force: true });
+      fs.rmSync(sandboxDir, { recursive: true, force: true });
+    }
+  });
+
+  it('2. 默认模式下，未认证写请求或未知 X-Actor-Id 绝不静默提权为最高管理员', async () => {
+    setEnv('AUTH_REQUIRED', undefined);
+    setEnv('AUTH_DISABLED', undefined);
+    const persistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'f1-srv-strict-'));
+    const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'f1-srv-strict-sb-'));
+
+    try {
+      const server = new WorkbenchHttpServer(0, {
+        persistenceDir: persistDir,
+        sandboxRootDir: sandboxDir,
+      });
+      await server.waitUntilReady();
+
+      // 无会话、无 X-Actor-Id 直接调用写操作 → 403（绝不回落 user-admin-01）
+      const unauthProposal = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/proposals',
+        body: { preset: 'LOW_RISK_FAST_TRACK' },
+      });
+      assert.equal(unauthProposal.statusCode, 403);
+
+      const unauthGovernance = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/admin/governance',
+        body: { maxNegotiationTurns: 2 },
+      });
+      assert.equal(unauthGovernance.statusCode, 403);
+
+      // 伪造未知 X-Actor-Id → GET /api/state 返回 401，POST /api/decisions 返回 403
+      const unknownState = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/state',
+        headers: { 'x-actor-id': 'usr_unknown_hacker' },
+      });
+      assert.equal(unknownState.statusCode, 401);
+
+      const unknownDecision = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/decisions',
+        headers: { 'x-actor-id': 'usr_unknown_hacker' },
+        body: { snapshotId: 'SNAP-1', verdict: 'APPROVE' },
+      });
+      assert.equal(unknownDecision.statusCode, 403);
+
+      // Admin 创建的新专长员工（无 CREATE_PROPOSAL 权限码）不会因不在旧硬编码表而被提权为管理员
+      const created = server.sessionService.createUser('user-admin-01', {
+        username: 'qa_new',
+        displayName: '新测试员',
+        tier: 'STAGE_SPECIALIST',
+        specialistDomain: 'QUALITY_ASSURANCE',
+        counterpartAgentRole: 'QA_AGENT',
+        ownedStageIds: ['STAGE_4_QA'],
+      });
+      assert.equal(created.ok, true);
+      assert.ok(created.user);
+
+      const newUserProposal = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/proposals',
+        headers: { 'x-actor-id': created.user.userId },
+        body: { preset: 'LOW_RISK_FAST_TRACK' },
+      });
+      assert.equal(newUserProposal.statusCode, 403, '新创建员工不可被静默提权为管理员');
+    } finally {
+      fs.rmSync(persistDir, { recursive: true, force: true });
+      fs.rmSync(sandboxDir, { recursive: true, force: true });
+    }
   });
 });

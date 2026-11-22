@@ -129,7 +129,27 @@ describe('A4 — LLM 意图识别（__intent 随主调用返回）', () => {
     assert.equal(
       run2PmTraces[0].recognizedIntentCode,
       'PRD_LLM_INTENT_E2E',
-      '第二个 run 应复用上次同阶段 LLM 顺带输出的意图',
+      '第二个同需求集合 run 应复用上次同阶段 LLM 顺带输出的意图',
+    );
+
+    // run 3：完全不同需求的提案 → 不得被 run 1 的意图串味污染，应回落规则意图
+    const run3 = await orchestrator.startProposalWorkflow({
+      proposal: new ProjectProposalContract({
+        proposalId: 'A4-RUN-3-UNRELATED',
+        title: 'A4 无关提案防串味验证',
+        summary: '不同需求集合不应复用旧提案的 __intent',
+        requirements: { REQ_OTHER: '全新的考勤打卡业务需求' },
+      }),
+      initiatorActor: '测试员',
+    });
+    const run3PmTrace = orchestrator.fulfillmentTracker
+      .getTraces(run3.runId)
+      .find((t) => t.stageId === WorkflowStageId.STAGE_1_PM);
+    assert.ok(run3PmTrace);
+    assert.equal(
+      run3PmTrace.recognizedIntentCode,
+      'PRD_SYNTHESIS_AND_TRACKING_PLAN_1_REQS',
+      '不同需求集合的提案不得被旧提案的 __intent 串味污染',
     );
     void stageCalls;
   });

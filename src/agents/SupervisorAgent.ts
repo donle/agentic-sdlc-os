@@ -40,6 +40,7 @@ import {
 } from '../domain/models.ts';
 import { WorkflowEventBus } from '../patterns/EventBus.ts';
 import { ModelRouterGateway } from '../patterns/ModelRouterGateway.ts';
+import { AgentRegistry } from './AgentRegistry.ts';
 import { JsonExtractor } from './prompt/JsonExtractor.ts';
 
 /**
@@ -152,6 +153,7 @@ export class SupervisorAgent {
   public async parseNaturalLanguageRollback(
     userDialogue: string,
     explicitTargetStageId?: WorkflowStageId,
+    allowedStages?: ReadonlyArray<WorkflowStageId>,
   ): Promise<ParsedRollbackDirective> {
     const text = userDialogue.trim();
     if (explicitTargetStageId) {
@@ -163,22 +165,33 @@ export class SupervisorAgent {
     }
 
     // C3：先尝试 LLM 解析（离线/失败 → 回退到关键词匹配）
-    const llmResult = await this.tryLlmParse(text);
+    const llmResult = await this.tryLlmParse(text, allowedStages);
     if (llmResult) {
       return llmResult;
     }
-    return this.keywordParse(text);
+    return this.keywordParse(text, allowedStages);
   }
 
-  /** C3：LLM 结构化输出 {targetStageId, cleanInstruction}；失败返回 null */
-  private async tryLlmParse(text: string): Promise<ParsedRollbackDirective | null> {
+  /** C3：LLM 结构化输出 {targetStageId, cleanInstruction}；支持当前流水线启用阶段与 J2 自定义节点白名单校验 */
+  private async tryLlmParse(
+    text: string,
+    allowedStages?: ReadonlyArray<WorkflowStageId>,
+  ): Promise<ParsedRollbackDirective | null> {
     if (!this.modelRouter) {
       return null;
     }
     try {
-      const stageList = Object.values(WorkflowStageId)
-        .filter((id) => id !== 'STAGE_0_INITIATION')
-        .join(', ');
+      const candidateStages: string[] =
+        allowedStages && allowedStages.length > 0
+          ? allowedStages.filter((id) => id !== 'STAGE_0_INITIATION')
+          : [
+              ...Object.values(WorkflowStageId).filter((id) => id !== 'STAGE_0_INITIATION'),
+              ...AgentRegistry.default()
+                .listCustomStages()
+                .map((s) => s.stageId),
+            ];
+      const validStageSet = new Set<string>(candidateStages);
+      const stageList = candidateStages.join(', ');
       const llm = await this.modelRouter.invokeChatCompletion({
         tier: 'HIGH_REASONING_HYBRID' as never,
         systemPrompt: `你是研发流水线总管 Agent。用户会给你一段中文回退指令。请从中解析出目标阶段 ID。
@@ -196,7 +209,7 @@ export class SupervisorAgent {
       }
       const parsed = extracted.value as { targetStageId?: string; cleanInstruction?: string };
       const stageId = parsed.targetStageId;
-      if (!stageId || !Object.values(WorkflowStageId).includes(stageId as never)) {
+      if (!stageId || !validStageSet.has(stageId)) {
         return null;
       }
       return new ParsedRollbackDirective({
@@ -209,9 +222,18 @@ export class SupervisorAgent {
     }
   }
 
-  private keywordParse(text: string): ParsedRollbackDirective {
+  private keywordParse(
+    text: string,
+    allowedStages?: ReadonlyArray<WorkflowStageId>,
+  ): ParsedRollbackDirective {
     const upper = text.toUpperCase();
-    if (upper.includes('PM') || text.includes('需求') || text.includes('PRD')) {
+    const isAllowed = (st: WorkflowStageId): boolean =>
+      !allowedStages || allowedStages.length === 0 || allowedStages.includes(st);
+
+    if (
+      (upper.includes('PM') || text.includes('需求') || text.includes('PRD')) &&
+      isAllowed(WorkflowStageId.STAGE_1_PM)
+    ) {
       return new ParsedRollbackDirective({
         targetStageId: WorkflowStageId.STAGE_1_PM,
         targetAgentRole: AgentRole.PRODUCT_MANAGER,
@@ -219,12 +241,13 @@ export class SupervisorAgent {
       });
     }
     if (
-      upper.includes('PD') ||
-      upper.includes('UI') ||
-      text.includes('设计') ||
-      text.includes('交互') ||
-      text.includes('抽屉') ||
-      text.includes('弹窗')
+      (upper.includes('PD') ||
+        upper.includes('UI') ||
+        text.includes('设计') ||
+        text.includes('交互') ||
+        text.includes('抽屉') ||
+        text.includes('弹窗')) &&
+      isAllowed(WorkflowStageId.STAGE_2_PD)
     ) {
       return new ParsedRollbackDirective({
         targetStageId: WorkflowStageId.STAGE_2_PD,
@@ -233,10 +256,11 @@ export class SupervisorAgent {
       });
     }
     if (
-      upper.includes('TECH') ||
-      text.includes('架构') ||
-      text.includes('表结构') ||
-      upper.includes('DDL')
+      (upper.includes('TECH') ||
+        text.includes('架构') ||
+        text.includes('表结构') ||
+        upper.includes('DDL')) &&
+      isAllowed(WorkflowStageId.STAGE_3A_TECH_SPEC)
     ) {
       return new ParsedRollbackDirective({
         targetStageId: WorkflowStageId.STAGE_3A_TECH_SPEC,
@@ -244,7 +268,7 @@ export class SupervisorAgent {
         cleanInstruction: text,
       });
     }
-    if (upper.includes('QA') || text.includes('测试')) {
+    if ((upper.includes('QA') || text.includes('测试')) && isAllowed(WorkflowStageId.STAGE_4_QA)) {
       return new ParsedRollbackDirective({
         targetStageId: WorkflowStageId.STAGE_4_QA,
         targetAgentRole: AgentRole.QUALITY_ASSURANCE,
@@ -252,9 +276,12 @@ export class SupervisorAgent {
       });
     }
 
+    const fallbackStage = isAllowed(WorkflowStageId.STAGE_3B_ENGINEER)
+      ? WorkflowStageId.STAGE_3B_ENGINEER
+      : (allowedStages?.[0] ?? WorkflowStageId.STAGE_3B_ENGINEER);
     return new ParsedRollbackDirective({
-      targetStageId: WorkflowStageId.STAGE_3B_ENGINEER,
-      targetAgentRole: AgentRole.SOFTWARE_ENGINEER,
+      targetStageId: fallbackStage,
+      targetAgentRole: this.mapStageToRole(fallbackStage),
       cleanInstruction: text,
     });
   }
@@ -325,6 +352,10 @@ export class SupervisorAgent {
   }
 
   private mapStageToRole(stageId: WorkflowStageId): AgentRole {
+    const custom = AgentRegistry.default().getCustomStage(String(stageId));
+    if (custom) {
+      return custom.agentRole as AgentRole;
+    }
     switch (stageId) {
       case WorkflowStageId.STAGE_1_PM:
         return AgentRole.PRODUCT_MANAGER;

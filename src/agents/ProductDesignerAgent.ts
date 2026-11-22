@@ -21,7 +21,11 @@
  * ============================================================================
  */
 
-import { PrdArtifactContract, UiDesignArtifactContract } from '../domain/contracts.ts';
+import {
+  containsPlaceholderText,
+  PrdArtifactContract,
+  UiDesignArtifactContract,
+} from '../domain/contracts.ts';
 import { AgentRole, ModelRoutingTier, WorkflowStageId } from '../domain/enums.ts';
 import { WorkflowEventBus } from '../patterns/EventBus.ts';
 import { FalseConsensusGuard } from '../patterns/FalseConsensusGuard.ts';
@@ -63,6 +67,34 @@ export class ProductDesignerAgent extends AbstractWorkerAgent<UiDesignArtifactCo
         : '将 PRD 用户故事映射为企业 Design System 组件树并校验交互可行性',
       0.95,
     );
+  }
+
+  protected override validateStageSpecificConstraints(
+    candidate: UiDesignArtifactContract,
+    _context: AgentExecutionInputContext,
+  ): ReadonlyArray<string> {
+    const violations: string[] = [];
+    if (containsPlaceholderText(candidate.summary, true)) {
+      violations.push('UI 设计 summary 不得为空或包含 TBD/待定 等未完成占位词');
+    }
+    const coveredReqIds = new Set<string>();
+    for (const mapping of candidate.componentMappings) {
+      coveredReqIds.add(mapping.reqId);
+      if (containsPlaceholderText(mapping.designSystemComponent)) {
+        violations.push(`需求 [${mapping.reqId}] 映射的 Design System 组件名无效或包含占位符`);
+      }
+      if (mapping.interactionStates.length === 0) {
+        violations.push(`需求 [${mapping.reqId}] 缺少交互状态机声明`);
+      } else if (mapping.interactionStates.some((s) => containsPlaceholderText(s))) {
+        violations.push(`需求 [${mapping.reqId}] 的交互状态包含空值或占位符`);
+      }
+    }
+    for (const reqId of candidate.coreRequirementIds) {
+      if (!coveredReqIds.has(reqId)) {
+        violations.push(`核心需求 [${reqId}] 缺少 UI 组件映射`);
+      }
+    }
+    return violations;
   }
 
   protected override synthesizeTemplateArtifact(

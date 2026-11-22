@@ -43,6 +43,8 @@ export interface ContextResult {
   readonly source: string;
   /** true = 真实数据；false = 降级 stub */
   readonly isReal: boolean;
+  /** 是否因超长被 ToolCallLoopGuard 截断 */
+  readonly truncated?: boolean;
 }
 
 export interface ContextProvider {

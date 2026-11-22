@@ -7,9 +7,13 @@
 > 审计基线日期：2026-11-22（React 前端 + TypeScript 仿真内核版本）。
 
 > [!NOTE]
-> **执行状态（2026-11-23 更新）**：§一~§三（M1-A/B/C + M2）全部条目已实现并测试通过——实际实现与本设计的偏差记录在各条目的实现文档中
-> （如 G1/G2 的 `EmbeddingProvider`、E3 的 docker CLI 替代 dockerode、A4 的 `__intent` 随主调用返回）；逐条见 `BACKEND_TODO_IMPL_LOG.md`。
-> §四（M3）剩余条目的实施决策见 `P2_REMAINING_PLAN.md`。
+> **执行状态（2026-11-23 更新）**：§一~§三（M1-A/B/C + M2）与 §四（M3 中的 E3/I3/J2/G11 及部分 D3）均已实现并测试通过；2026-11-23 第八/九轮继续完成审计修复 `#1–#7`。主要实现与本设计的偏差如下（逐条详见 `BACKEND_TODO_IMPL_LOG.md` 与对应模块文档）：
+>
+> - **D2**：未引入 `pg` npm 原生驱动，改用零依赖 `psql` CLI 同步；`PgPersistenceDriver` 尚未在生产链路接线且 `loadFullState()` 仍返回 `null`（见 `BACKEND_TODO.md` §五 `#8`）。
+> - **E2**：采用 `node --test --test-reporter=spec --experimental-test-coverage` 与 `TestResultParser`，而非 `--test-reporter=tap`。
+> - **F1**：`SessionService` 使用 `SHA-256(token)` 会话键；`WorkbenchServer` 采用三模式鉴权开关（`AUTH_REQUIRED=true` / 默认写严格拦截 / `AUTH_DISABLED=true`）；前端 `LoginView.tsx` 尚未迁移。
+> - **G1/G2**：新增抽象 `EmbeddingProvider` 与后台串行向量升级。
+> - **M3 & 待办**：`H1–H3` 外部集成挂起于 `P2_REMAINING_PLAN.md`；深度复核新定位的 **7 项未修复缺陷（`#8–#14`，涉及 D1/D2/D3/E3/A2/B3/I1）** 跟踪于 `BACKEND_TODO.md` §五。
 
 ---
 
@@ -540,4 +544,6 @@ export interface NegotiationRoundRunner {
 
 ## 六、执行核对单（与 BACKEND_TODO.md 联动）
 
-执行每个条目前：①确认依赖条目已勾选；②若实现与本文设计冲突，先更新本文"决策记录"再动代码；③完成后在本文件对应小节打勾并在 BACKEND_TODO.md 同步勾选。
+> 注：本文保留为 2026-11-22 代码设计定稿，正文各节不再逐条回勾；实际执行进度、测试基线与遗留修复请统一以 `BACKEND_TODO_IMPL_LOG.md` 及 `BACKEND_TODO.md` §五为准。
+
+执行每个条目前：①确认依赖条目已勾选；②若实现与本文设计冲突，先更新本文"决策记录"再动代码；③完成后在 `BACKEND_TODO_IMPL_LOG.md` 与 `BACKEND_TODO.md` §五同步更新状态。

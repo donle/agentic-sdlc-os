@@ -20,8 +20,17 @@ import {
  */
 export class ScopeDiffReport {
   public static fromJSON(raw: Record<string, unknown> | undefined | null): ScopeDiffReport {
-    const baseline = (raw?.baselineRequirementIds as string[] | undefined) ?? [];
-    const current = (raw?.currentRequirementIds as string[] | undefined) ?? baseline;
+    const hasBaseline = Array.isArray(raw?.baselineRequirementIds);
+    if (!hasBaseline && raw?.hasUnauthorizedScopeReduction === true) {
+      const dropped = Array.isArray(raw.droppedRequirementIds)
+        ? (raw.droppedRequirementIds as unknown[]).map((x) => String(x))
+        : ['__LEGACY_DROPPED__'];
+      return new ScopeDiffReport(dropped, []);
+    }
+    const baseline = hasBaseline ? (raw!.baselineRequirementIds as string[]) : [];
+    const current = Array.isArray(raw?.currentRequirementIds)
+      ? (raw!.currentRequirementIds as string[])
+      : baseline;
     return new ScopeDiffReport(baseline, current);
   }
 
@@ -129,8 +138,10 @@ export class StageSnapshotMemento {
       riskReasons: this.riskReasons,
       gateAction: this.gateAction,
       scopeDiff: {
+        baselineRequirementIds: [...this.scopeDiffReport.baselineRequirementIds],
+        currentRequirementIds: [...this.scopeDiffReport.currentRequirementIds],
         hasUnauthorizedScopeReduction: this.scopeDiffReport.hasUnauthorizedScopeReduction,
-        droppedRequirementIds: this.scopeDiffReport.droppedRequirementIds,
+        droppedRequirementIds: [...this.scopeDiffReport.droppedRequirementIds],
       },
       cacheHit: this.cacheHit,
       retryCount: this.retryCount,
@@ -163,6 +174,7 @@ export class NegotiationTurnRecord {
       escalatedToSupervisor: Boolean(raw.escalatedToSupervisor),
       optionAProposal: raw.optionAProposal ? String(raw.optionAProposal) : undefined,
       optionBProposal: raw.optionBProposal ? String(raw.optionBProposal) : undefined,
+      createdAtIso: raw.createdAtIso ? String(raw.createdAtIso) : undefined,
     });
   }
 
@@ -198,6 +210,7 @@ export class NegotiationTurnRecord {
     escalatedToSupervisor: boolean;
     optionAProposal?: string;
     optionBProposal?: string;
+    createdAtIso?: string;
   }) {
     this.negotiationId = params.negotiationId;
     this.runId = params.runId;
@@ -215,7 +228,7 @@ export class NegotiationTurnRecord {
       params.optionAProposal ?? '方案 A：遵循当前组件库/架构约束进行标准降级实现（工期零延误）';
     this.optionBProposal =
       params.optionBProposal ?? '方案 B：扩展定制组件/底层数据结构以完整保留原方案（工期 +2 人日）';
-    this.createdAtIso = new Date().toISOString();
+    this.createdAtIso = params.createdAtIso ?? new Date().toISOString();
   }
 }
 
@@ -233,6 +246,7 @@ export class HumanDecisionRecord {
       reviewerActor: String(raw.reviewerActor ?? ''),
       verdict: String(raw.verdict ?? 'APPROVE') as never,
       comment: String(raw.comment ?? ''),
+      createdAtIso: raw.createdAtIso ? String(raw.createdAtIso) : undefined,
     });
   }
 
@@ -255,6 +269,7 @@ export class HumanDecisionRecord {
     reviewerActor: string;
     verdict: DecisionVerdict;
     comment: string;
+    createdAtIso?: string;
   }) {
     this.decisionId = params.decisionId;
     this.runId = params.runId;
@@ -264,7 +279,7 @@ export class HumanDecisionRecord {
     this.reviewerActor = params.reviewerActor;
     this.verdict = params.verdict;
     this.comment = params.comment;
-    this.createdAtIso = new Date().toISOString();
+    this.createdAtIso = params.createdAtIso ?? new Date().toISOString();
   }
 }
 
@@ -272,6 +287,32 @@ export class HumanDecisionRecord {
  * Agent 发送给前端用户的实时提醒实体（包括待核验门禁、待拍板冲突裁决、Scope 变更预警、自动放行留痕）
  */
 export class AgentUserNotification {
+  public static fromJSON(raw: Record<string, unknown>): AgentUserNotification {
+    const rawOptions = Array.isArray(raw.actionOptions) ? raw.actionOptions : [];
+    return new AgentUserNotification({
+      notificationId: String(raw.notificationId ?? ''),
+      runId: String(raw.runId ?? ''),
+      branchId: String(raw.branchId ?? ''),
+      stageId: String(raw.stageId ?? 'STAGE_1_PM') as WorkflowStageId,
+      senderRole: String(raw.senderRole ?? 'SUPERVISOR_AGENT') as AgentRole,
+      category: String(raw.category ?? 'STAGE_PROGRESS') as NotificationCategory,
+      title: String(raw.title ?? ''),
+      message: String(raw.message ?? ''),
+      relatedSnapshotId: String(raw.relatedSnapshotId ?? ''),
+      requiresHumanAction: Boolean(raw.requiresHumanAction),
+      resolved: raw.resolved === undefined ? undefined : Boolean(raw.resolved),
+      createdAtIso: raw.createdAtIso ? String(raw.createdAtIso) : undefined,
+      actionOptions: rawOptions.map((item) => {
+        const opt = item as Record<string, unknown>;
+        return {
+          actionKey: String(opt.actionKey ?? ''),
+          label: String(opt.label ?? ''),
+          verdict: String(opt.verdict ?? 'APPROVE') as DecisionVerdict,
+        };
+      }),
+    });
+  }
+
   public readonly notificationId: string;
   public readonly runId: string;
   public readonly branchId: string;
@@ -301,6 +342,8 @@ export class AgentUserNotification {
     message: string;
     relatedSnapshotId: string;
     requiresHumanAction: boolean;
+    resolved?: boolean;
+    createdAtIso?: string;
     actionOptions?: ReadonlyArray<{
       actionKey: string;
       label: string;
@@ -318,8 +361,8 @@ export class AgentUserNotification {
     this.relatedSnapshotId = params.relatedSnapshotId;
     this.requiresHumanAction = params.requiresHumanAction;
     this.actionOptions = params.actionOptions ? [...params.actionOptions] : [];
-    this.resolvedFlag = !params.requiresHumanAction;
-    this.createdAtIso = new Date().toISOString();
+    this.resolvedFlag = params.resolved ?? !params.requiresHumanAction;
+    this.createdAtIso = params.createdAtIso ?? new Date().toISOString();
   }
 
   public isResolved(): boolean {
@@ -329,6 +372,24 @@ export class AgentUserNotification {
   public markResolved(): void {
     this.resolvedFlag = true;
   }
+
+  public toSerializableRecord(): Record<string, unknown> {
+    return {
+      notificationId: this.notificationId,
+      runId: this.runId,
+      branchId: this.branchId,
+      stageId: this.stageId,
+      senderRole: this.senderRole,
+      category: this.category,
+      title: this.title,
+      message: this.message,
+      relatedSnapshotId: this.relatedSnapshotId,
+      requiresHumanAction: this.requiresHumanAction,
+      resolved: this.resolvedFlag,
+      actionOptions: this.actionOptions.map((opt) => ({ ...opt })),
+      createdAtIso: this.createdAtIso,
+    };
+  }
 }
 
 export type TeamCommentCategory = 'COMMENT' | 'APPROVAL_NOTE' | 'REVISION_REQUEST';
@@ -337,6 +398,21 @@ export type TeamCommentCategory = 'COMMENT' | 'APPROVAL_NOTE' | 'REVISION_REQUES
  * 团队成员在项目各步骤留下的协同评论与评审意见实体
  */
 export class StageTeamCommentRecord {
+  public static fromJSON(raw: Record<string, unknown>): StageTeamCommentRecord {
+    return new StageTeamCommentRecord({
+      commentId: String(raw.commentId ?? ''),
+      runId: String(raw.runId ?? ''),
+      stageId: String(raw.stageId ?? 'STAGE_0_INITIATION') as WorkflowStageId,
+      authorUserId: String(raw.authorUserId ?? ''),
+      authorName: String(raw.authorName ?? ''),
+      authorJobTitle: String(raw.authorJobTitle ?? ''),
+      authorBadge: String(raw.authorBadge ?? ''),
+      content: String(raw.content ?? ''),
+      category: (raw.category as TeamCommentCategory | undefined) ?? 'COMMENT',
+      createdAtIso: raw.createdAtIso ? String(raw.createdAtIso) : undefined,
+    });
+  }
+
   public readonly commentId: string;
   public readonly runId: string;
   public readonly stageId: WorkflowStageId;
@@ -370,5 +446,20 @@ export class StageTeamCommentRecord {
     this.content = params.content;
     this.category = params.category ?? 'COMMENT';
     this.createdAtIso = params.createdAtIso ?? new Date().toISOString();
+  }
+
+  public toSerializableRecord(): Record<string, unknown> {
+    return {
+      commentId: this.commentId,
+      runId: this.runId,
+      stageId: this.stageId,
+      authorUserId: this.authorUserId,
+      authorName: this.authorName,
+      authorJobTitle: this.authorJobTitle,
+      authorBadge: this.authorBadge,
+      content: this.content,
+      category: this.category,
+      createdAtIso: this.createdAtIso,
+    };
   }
 }

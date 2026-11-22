@@ -23,7 +23,11 @@ import { AgentRole, ModelRoutingTier, WorkflowStageId } from '../domain/enums.ts
 import { WorkflowEventBus } from '../patterns/EventBus.ts';
 import { FalseConsensusGuard } from '../patterns/FalseConsensusGuard.ts';
 import { ModelRouterGateway } from '../patterns/ModelRouterGateway.ts';
-import { GitWorktreeSandboxManager } from '../sandbox/GitWorktreeSandboxManager.ts';
+import {
+  GitWorktreeSandboxManager,
+  type SandboxProvisionResult,
+  type SandboxVerificationResult,
+} from '../sandbox/GitWorktreeSandboxManager.ts';
 import { IntentFulfillmentTracker } from '../telemetry/IntentFulfillmentTracker.ts';
 import { PromptCacheManager } from '../telemetry/PromptCacheManager.ts';
 import {
@@ -34,6 +38,12 @@ import {
 
 export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementationArtifactContract> {
   private readonly sandboxManager: GitWorktreeSandboxManager;
+  private lastPreparedSandbox: {
+    readonly key: string;
+    readonly reqIds: ReadonlyArray<string>;
+    readonly provisionResult: SandboxProvisionResult;
+    readonly selfVerification: SandboxVerificationResult;
+  } | null = null;
 
   public constructor(deps: {
     eventBus: WorkflowEventBus;
@@ -62,10 +72,17 @@ export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementatio
     );
   }
 
-  protected override synthesizeTemplateArtifact(
-    context: AgentExecutionInputContext,
-    _attemptIndex: number,
-  ): CodeImplementationArtifactContract {
+  private ensureSandboxProvisioned(context: AgentExecutionInputContext): {
+    readonly key: string;
+    readonly reqIds: ReadonlyArray<string>;
+    readonly provisionResult: SandboxProvisionResult;
+    readonly selfVerification: SandboxVerificationResult;
+  } {
+    const key = `${context.runId}::${context.branchId}::${context.humanFeedbackDirective ?? ''}`;
+    if (this.lastPreparedSandbox && this.lastPreparedSandbox.key === key) {
+      return this.lastPreparedSandbox;
+    }
+
     const upstreamTech = context.upstreamArtifacts.get(WorkflowStageId.STAGE_3A_TECH_SPEC) as
       TechSpecArtifactContract | undefined;
 
@@ -83,13 +100,70 @@ export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementatio
       humanDirective: context.humanFeedbackDirective,
     });
 
-    // E2：3b 自测真实化——真实执行 node:test 并解析结果（不再硬编码 selfTestPassed=true）
+    // E2：3b 自测真实化——真实执行 node:test / Docker 并解析结果
     const selfVerification = this.sandboxManager.executeSandboxVerification({
       runId: context.runId,
       branchId: context.branchId,
       requirementIds: reqIds,
       runSubprocessNodeTest: true,
     });
+
+    this.lastPreparedSandbox = { key, reqIds, provisionResult, selfVerification };
+    return this.lastPreparedSandbox;
+  }
+
+  /**
+   * A1 + E1/E2 闭环：无论 LLM 在线还是离线，在步骤 4 推理前先执行真实 Git Worktree 沙箱落盘与自测，
+   * 并将分支名、落盘文件列表与真实自测结果注入 Prompt 的 sandboxVerification 字段。
+   */
+  protected override prepareStageEnvironment(
+    context: AgentExecutionInputContext,
+  ): Record<string, unknown> {
+    const { provisionResult, selfVerification } = this.ensureSandboxProvisioned(context);
+    return {
+      gitWorktreeBranch: provisionResult.gitWorktreeBranch,
+      workspacePath: provisionResult.workspacePath,
+      simulated: provisionResult.simulated,
+      modifiedFiles: provisionResult.generatedFiles.map((f) => ({
+        filePath: f.filePath,
+        className: f.className,
+        designPattern: f.designPattern,
+        linesChanged: f.linesChanged,
+      })),
+      selfTestPassed:
+        selfVerification.failedTestCases === 0 && selfVerification.securityIssuesFound === 0,
+      totalTestCases: selfVerification.totalTestCases,
+      passedTestCases: selfVerification.passedTestCases,
+      failedTestCases: selfVerification.failedTestCases,
+      securityIssuesFound: selfVerification.securityIssuesFound,
+      runtime: selfVerification.runtime,
+    };
+  }
+
+  protected override validateStageSpecificConstraints(
+    candidate: CodeImplementationArtifactContract,
+    context: AgentExecutionInputContext,
+  ): ReadonlyArray<string> {
+    const key = `${context.runId}::${context.branchId}::${context.humanFeedbackDirective ?? ''}`;
+    if (!this.lastPreparedSandbox || this.lastPreparedSandbox.key !== key) {
+      return [];
+    }
+    const { selfVerification } = this.lastPreparedSandbox;
+    const realPassed =
+      selfVerification.failedTestCases === 0 && selfVerification.securityIssuesFound === 0;
+    if (!realPassed && candidate.selfTestPassed) {
+      return [
+        `Engineer 沙箱真实自测未通过（失败用例 ${selfVerification.failedTestCases} 条，安全漏洞 ${selfVerification.securityIssuesFound} 个），selfTestPassed 严禁谎报为 true`,
+      ];
+    }
+    return [];
+  }
+
+  protected override synthesizeTemplateArtifact(
+    context: AgentExecutionInputContext,
+    _attemptIndex: number,
+  ): CodeImplementationArtifactContract {
+    const { reqIds, provisionResult, selfVerification } = this.ensureSandboxProvisioned(context);
 
     const modifiedFiles = provisionResult.generatedFiles.map((f) => ({
       filePath: f.filePath,

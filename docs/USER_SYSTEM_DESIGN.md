@@ -6,9 +6,11 @@
 > 代码基线：React 前端 + `RbacGovernanceService`（权限码体系已存在但服务端未消费）+ 无认证的 `WorkbenchServer`。
 
 > [!NOTE]
-> **实现状态（2026-11-23 更新）**：F1/F2 已全部实现并通过 `session-service.spec`（17 项）——见 `SessionService.ts`、
-> 7 个认证端点与用户管理 API；本文保留为设计定稿与 §六边界检测清单的验收依据。
-> 待补：带 `AUTH_ENABLED` 的服务端联合测试（见 `P2_REMAINING_PLAN.md` §五挂起项）。
+> **实现状态（2026-11-23 更新）**：
+>
+> - **后端 JSON 与 PG 双驱动路径（F1/F2 + 第九轮鉴权加固 + 第十二轮 AUDIT-8/D2）已落地**：`SessionService.ts`、`RbacGovernanceService.ts`、`UserStore.ts`（`JsonUserStore` + `PgUserStore` + `selectUserStore`）与 `WorkbenchServer.ts` 已实现 **10 个认证与用户管理/审计端点**（`POST /api/auth/login|logout|change-password|act-as`、`GET /api/auth/me`、`GET/POST /api/admin/users`、`PATCH /api/admin/users/:id`、`POST /api/admin/users/:id/reset-password`、`GET /api/admin/login-audit`），并配齐 §2.2 `deploy/init-pgvector-schema.sql` 用户体系 4 张表、双轨关联外键及 `team_comments`；通过 `session-service.spec.ts`（23 项）、`rbac-governance.spec.ts`（4 项）与 `pg-persistence-driver.spec.ts` Test 4–5。
+> - **尚未落地部分**：前端 `LoginView.tsx` 与 Cookie/401 权限驱动界面（`src/ui/client/**` 目前仍用 `X-Actor-Id` 与硬编码角色切换条）。
+> - **相对下述设计正文的实现差异**：① `WorkbenchServer` 采用三模式鉴权开关（`AUTH_REQUIRED=true` 全量会话校验 / 默认模式下写操作与未知 `X-Actor-Id` 严格拦截仅只读投影回落 `user-admin-01` / `AUTH_DISABLED=true` 跳过权限码校验）；② `GET /api/auth/me` 返回嵌套结构 `{ ok: true, data: { user, impersonating } }`；③ `change-password` 旧口令错与口令策略不满足均返回 `400`，管理员建人随机临时口令为 8 位 `base64url`；④ `SessionService.login()` 暂未采集 `ip`/`user_agent`，`act-as` 已写入 `loginAudit` 与 `/api/auth/me` 但暂未自动追加 `"via <admin>"` 到业务裁决记录展示名；⑤ `EnterpriseUserAccount` 暂由 `SessionService.syncSingleUserToRbac()` 直接构造（未定义 `fromAuthUserView`）。
 
 ---
 
@@ -22,7 +24,7 @@
 | 多租户   | 单工作空间                                                                       | tenant_id 预留列设计（见 §八）              |
 | MFA      | 无                                                                               | users 表预留 `mfa_secret` 列                |
 
-**现状差距**（代码证据）：
+**现状差距**（2026-11-22 设计前基线，其中 1/2/3 的后端部分已在 F1/F2 与第九轮解决）：
 
 1. 无登录：`WorkbenchServer.resolveActor()` 从 `X-Actor-Id` 头/`?actorId` 读取，**未知用户静默回落 admin**（`WorkbenchServer.ts:127-144`）；
 2. 花名册硬编码 7 人（`RbacGovernanceService.seedEnterpriseRoster()`），不可增删改；

@@ -28,17 +28,28 @@ export class BoundedNegotiationOutcome {
   public readonly consensusReached: boolean;
   public readonly escalatedToSupervisor: boolean;
   public readonly latestTurn: NegotiationTurnRecord;
+  public readonly totalTokensConsumed: number;
 
-  public constructor(turns: ReadonlyArray<NegotiationTurnRecord>) {
+  public constructor(turns: ReadonlyArray<NegotiationTurnRecord>, totalTokensConsumed = 0) {
     this.turns = [...turns];
     const last = turns[turns.length - 1];
     this.latestTurn = last;
     this.consensusReached = last.consensusReached;
     this.escalatedToSupervisor = last.escalatedToSupervisor;
+    this.totalTokensConsumed = totalTokensConsumed;
   }
 }
 
-/** B1：LLM 轮次执行器接口（Facade 提供实现，离线降级到剧本路径） */
+export type NegotiationAction = 'ACCEPT_AND_PATCH' | 'REBUT_WITH_EVIDENCE' | 'ESCALATE_TRADEOFF';
+
+export interface NegotiationTurnHistorySummary {
+  readonly turnIndex: number;
+  readonly responderAction?: NegotiationAction;
+  readonly responseResolution: string;
+  readonly challengerCritique?: string;
+}
+
+/** B1 / Pillar 4：对抗式双上下文 LLM 轮次执行器接口（Facade 提供实现，离线降级到剧本路径） */
 export interface NegotiationRoundRunner {
   runTurn(input: {
     turnIndex: number;
@@ -47,11 +58,19 @@ export interface NegotiationRoundRunner {
     responder: string;
     challengeContext: string;
     topic: string;
+    previousTurns: ReadonlyArray<NegotiationTurnHistorySummary>;
   }): Promise<{
     responseResolution: string;
     consensusReached: boolean;
     optionAProposal: string;
     optionBProposal: string;
+    tokensConsumed?: number;
+    responderAction?: NegotiationAction;
+    concretePatch?: string;
+    challengerVerified?: boolean;
+    challengerCritique?: string;
+    independentJudgePassed?: boolean;
+    independentJudgeReason?: string;
   } | null>;
 }
 
@@ -101,42 +120,93 @@ export class BoundedNegotiationMediator {
     forceDeadlockToMaxTurns: boolean;
   }): Promise<BoundedNegotiationOutcome> {
     const turns: NegotiationTurnRecord[] = [];
-    const totalTurnsToRun = params.forceDeadlockToMaxTurns ? this.maxNegotiationTurns : 1;
+    const previousTurns: NegotiationTurnHistorySummary[] = [];
+    const topic = params.topic ?? 'DESIGN_REVIEW';
+    let totalTokensConsumed = 0;
 
-    for (let turnIndex = 1; turnIndex <= totalTurnsToRun; turnIndex += 1) {
+    for (let turnIndex = 1; turnIndex <= this.maxNegotiationTurns; turnIndex += 1) {
       const reachedMax = turnIndex === this.maxNegotiationTurns;
-      const consensusReached = !params.forceDeadlockToMaxTurns;
-      const escalated = params.forceDeadlockToMaxTurns && reachedMax;
 
-      // B1：有 LLM runner 且在线 → 用 LLM 生成真实协商内容；否则走剧本
-      let responseText: string;
+      // B1 / Pillar 4：对抗式双上下文 LLM 轮次执行（携带历史交锋并支持即时 ESCALATE_TRADEOFF 与盲审否决）
+      let responseText = '';
       let llmConsensus: boolean | null = null;
       let llmOptionA = '';
       let llmOptionB = '';
-      if (this.roundRunner && !params.forceDeadlockToMaxTurns) {
+      let responderAction: NegotiationAction | undefined;
+      let challengerVerified: boolean | undefined;
+      let challengerCritique: string | undefined;
+      let independentJudgePassed: boolean | undefined;
+      let independentJudgeReason: string | undefined;
+
+      if (this.roundRunner) {
         const llmTurn = await this.roundRunner.runTurn({
           turnIndex,
           maxTurns: this.maxNegotiationTurns,
           challenger: params.challengerRole,
           responder: params.responderRole,
           challengeContext: params.initialChallengePoint,
-          topic: params.topic ?? 'DESIGN_REVIEW',
+          topic,
+          previousTurns: [...previousTurns],
         });
         if (llmTurn) {
           responseText = llmTurn.responseResolution;
           llmConsensus = llmTurn.consensusReached;
           llmOptionA = llmTurn.optionAProposal;
           llmOptionB = llmTurn.optionBProposal;
-        } else {
-          responseText = consensusReached
-            ? `[${params.responderRole}] 已采纳 [${params.challengerRole}] 的工程约束反馈，补充了异常边界说明且未删减核心业务范围。`
-            : `[第 ${turnIndex}/${this.maxNegotiationTurns} 轮分歧] [${params.responderRole}] 坚持保留原高复杂度实时交互指标，而 [${params.challengerRole}] 评估现有组件库与工期无法同时满足。`;
+          totalTokensConsumed += llmTurn.tokensConsumed ?? 0;
+          responderAction = llmTurn.responderAction;
+          challengerVerified = llmTurn.challengerVerified;
+          challengerCritique = llmTurn.challengerCritique;
+          independentJudgePassed = llmTurn.independentJudgePassed;
+          independentJudgeReason = llmTurn.independentJudgeReason;
         }
-      } else {
-        responseText = consensusReached
-          ? `[${params.responderRole}] 已采纳 [${params.challengerRole}] 的工程约束反馈，补充了异常边界说明且未删减核心业务范围。`
-          : `[第 ${turnIndex}/${this.maxNegotiationTurns} 轮分歧] [${params.responderRole}] 坚持保留原高复杂度实时交互指标，而 [${params.challengerRole}] 评估现有组件库与工期无法同时满足。`;
       }
+
+      const explicitTradeoffEscalation = responderAction === 'ESCALATE_TRADEOFF';
+      let finalConsensusReached: boolean;
+      let escalated: boolean;
+
+      if (params.forceDeadlockToMaxTurns) {
+        finalConsensusReached = false;
+        escalated = reachedMax;
+      } else if (explicitTradeoffEscalation) {
+        finalConsensusReached = false;
+        escalated = true;
+      } else if (challengerVerified === false || independentJudgePassed === false) {
+        finalConsensusReached = false;
+        escalated = reachedMax;
+      } else {
+        finalConsensusReached = llmConsensus !== null ? llmConsensus : true;
+        escalated = !finalConsensusReached && reachedMax;
+      }
+
+      if (!responseText) {
+        responseText = finalConsensusReached
+          ? `[${params.responderRole}] 已采纳 [${params.challengerRole}] 的工程约束反馈，补充了异常边界说明且未删减核心业务范围。`
+          : `[第 ${turnIndex}/${this.maxNegotiationTurns} 轮分歧] [${params.responderRole}] 坚持保留原高复杂度方案指标，而 [${params.challengerRole}] 评估当前工程边界与质量门禁无法同时满足。`;
+      }
+
+      if (challengerVerified === false && challengerCritique) {
+        responseText = `${responseText} [挑战方独立复核否决: ${challengerCritique}]`;
+      } else if (independentJudgePassed === false && independentJudgeReason) {
+        responseText = `${responseText} [防伪共识盲审否决: ${independentJudgeReason}]`;
+      }
+
+      previousTurns.push({
+        turnIndex,
+        responderAction,
+        responseResolution: responseText,
+        challengerCritique,
+      });
+
+      const defaultOptionA =
+        topic === 'QA_REPAIR'
+          ? '方案 A（QA 推荐）：回退至 Engineer 阶段补充边界防护与修复单测后重新验证（保障零缺陷上线）'
+          : '方案 A（PD 推荐）：采用企业标准双栏折叠抽屉组件替代三维实时画布（零额外工期，符合 Design System 规范）';
+      const defaultOptionB =
+        topic === 'QA_REPAIR'
+          ? '方案 B（特批带病放行）：将未闭合的非阻断项转为下期技术债工单，由质量负责人签字特批放行'
+          : '方案 B（PM 推荐）：立项扩展自定义 WebGL 画布组件以保留完整视觉交互（工期增加 2 人日，需前端架构师协审）';
 
       this.eventBus.publishEvent(
         new WorkflowDomainEvent({
@@ -146,7 +216,7 @@ export class BoundedNegotiationMediator {
           stageId: params.stageId,
           agentRole: params.challengerRole,
           lifecycleState: SnapshotLifecycleState.NEGOTIATING,
-          headline: `[协商第 ${turnIndex}/${this.maxNegotiationTurns} 轮] ${params.challengerRole} ↔ ${params.responderRole}：${escalated ? '达到最大讨论限制未达成一致，触发总管熔断！' : consensusReached ? '已达成结构化共识' : '双方存在方案分歧，继续下一轮对齐'}`,
+          headline: `[协商第 ${turnIndex}/${this.maxNegotiationTurns} 轮] ${params.challengerRole} ↔ ${params.responderRole}：${escalated ? '达到最大讨论限制未达成一致，触发总管熔断！' : finalConsensusReached ? '已达成结构化共识' : '双方存在方案分歧，继续下一轮对齐'}`,
           detailPayload: {
             turnIndex,
             maxTurns: this.maxNegotiationTurns,
@@ -157,12 +227,11 @@ export class BoundedNegotiationMediator {
         }),
       );
 
-      const finalConsensusReached = llmConsensus !== null ? llmConsensus : consensusReached;
       const record = new NegotiationTurnRecord({
         negotiationId: `NEG-${Date.now()}-${turnIndex}`,
         runId: params.runId,
         branchId: params.branchId,
-        topic: params.topic,
+        topic,
         turnIndex,
         maxTurnsAllowed: this.maxNegotiationTurns,
         challengerRole: params.challengerRole,
@@ -171,19 +240,20 @@ export class BoundedNegotiationMediator {
         responseResolution: responseText,
         consensusReached: finalConsensusReached,
         escalatedToSupervisor: escalated,
-        optionAProposal:
-          llmOptionA ||
-          '方案 A（PD 推荐）：采用企业标准双栏折叠抽屉组件替代三维实时画布（零额外工期，符合 Design System 规范）',
-        optionBProposal:
-          llmOptionB ||
-          '方案 B（PM 推荐）：立项扩展自定义 WebGL 画布组件以保留完整视觉交互（工期增加 2 人日，需前端架构师协审）',
+        optionAProposal: llmOptionA || defaultOptionA,
+        optionBProposal: llmOptionB || defaultOptionB,
       });
 
       turns.push(record);
       this.negotiationHistory.push(record);
+
+      // 一旦达成共识或明确上交权衡熔断（ESCALATE_TRADEOFF），立即结束协商，避免白烧后续轮次 Token
+      if (finalConsensusReached || escalated) {
+        break;
+      }
     }
 
-    return new BoundedNegotiationOutcome(turns);
+    return new BoundedNegotiationOutcome(turns, totalTokensConsumed);
   }
 
   /** D1：恢复历史协商记录（不广播观察者） */

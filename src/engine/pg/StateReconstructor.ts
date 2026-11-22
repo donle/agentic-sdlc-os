@@ -9,16 +9,18 @@ import { ArtifactContractFactory } from '../../agents/deserialize/ArtifactContra
 import { ProjectProposalContract } from '../../domain/contracts.ts';
 import { AgentRole, SnapshotLifecycleState, WorkflowStageId } from '../../domain/enums.ts';
 import {
+  AgentUserNotification,
   HumanDecisionRecord,
   NegotiationTurnRecord,
   ScopeDiffReport,
   StageSnapshotMemento,
+  StageTeamCommentRecord,
 } from '../../domain/models.ts';
 import type { ScenarioHints } from '../../domain/scenario.ts';
 import { WorkflowDomainEvent } from '../../patterns/EventBus.ts';
 import type { BoundedNegotiationMediator } from '../../agents/BoundedNegotiationMediator.ts';
 import type { DagWorkflowStateEngine } from '../DagWorkflowStateEngine.ts';
-import type { ImmutableAuditLedger } from '../ImmutableAuditLedger.ts';
+import { AuditTrailEntry, type ImmutableAuditLedger } from '../ImmutableAuditLedger.ts';
 import type { PersistedLedgerSnapshot, PersistedRunRecord } from '../PersistenceRepository.ts';
 import type { WorkflowEventBus } from '../../patterns/EventBus.ts';
 
@@ -27,6 +29,7 @@ export interface RestoreTargets {
   auditLedger: ImmutableAuditLedger;
   mediator: BoundedNegotiationMediator;
   eventBus: WorkflowEventBus;
+  restoreTeamComment?: (comment: StageTeamCommentRecord) => void;
 }
 
 export class StateReconstructor {
@@ -41,6 +44,7 @@ export class StateReconstructor {
     snapshot: PersistedLedgerSnapshot & {
       readonly liveEvents?: ReadonlyArray<Record<string, unknown>>;
     },
+    walAuditEntries?: ReadonlyArray<Record<string, unknown>>,
   ): { runIds: string[]; warnings: string[] } {
     const runIds: string[] = [];
     const warnings: string[] = [];
@@ -63,6 +67,35 @@ export class StateReconstructor {
         WorkflowDomainEvent.fromJSON(event as Record<string, unknown>),
       );
     }
+    for (const rawNotif of snapshot.notifications ?? []) {
+      try {
+        this.targets.eventBus.restoreNotification(AgentUserNotification.fromJSON(rawNotif));
+      } catch (err) {
+        warnings.push(`通知恢复跳过: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    if (this.targets.restoreTeamComment) {
+      for (const rawComment of snapshot.teamComments ?? []) {
+        try {
+          this.targets.restoreTeamComment(StageTeamCommentRecord.fromJSON(rawComment));
+        } catch (err) {
+          warnings.push(`团队评论恢复跳过: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+    }
+
+    const auditSource =
+      walAuditEntries && walAuditEntries.length > 0
+        ? walAuditEntries
+        : (snapshot.auditEntries ?? []);
+    for (const rawEntry of auditSource) {
+      try {
+        this.targets.auditLedger.restoreAuditEntry(AuditTrailEntry.fromJSON(rawEntry));
+      } catch (err) {
+        warnings.push(`审计条目恢复跳过: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
     for (const runRec of snapshot.runs ?? []) {
       try {
         runIds.push(this.restoreRun(runRec, snapshot, warnings));
@@ -86,6 +119,7 @@ export class StateReconstructor {
       stagePipeline: runRec.stagePipeline as WorkflowStageId[],
       workflowTemplateId: runRec.workflowTemplateId,
       scenarioHints: (runRec.scenarioHints ?? {}) as ScenarioHints,
+      tokenBudget: runRec.tokenBudget,
     });
 
     runState.restoreInternals({
@@ -95,6 +129,7 @@ export class StateReconstructor {
       branchHistory: [...runRec.branchHistory],
       tokensUsedTotal: runRec.tokensUsedTotal,
       status: runRec.status,
+      autoRepairCounts: runRec.autoRepairCounts ? { ...runRec.autoRepairCounts } : undefined,
     });
 
     for (const raw of snapshot.snapshots ?? []) {

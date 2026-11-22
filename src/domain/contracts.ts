@@ -6,6 +6,23 @@
 
 import { AgentRole, BusinessRiskLevel, WorkflowStageId } from './enums.ts';
 
+const PLACEHOLDER_WORD_PATTERN = /(?:\bTBD\b|\bTODO\b|待定|后续补充|暂不实现)/i;
+const ELLIPSIS_PATTERN = /(?:\.{3,}|…)/;
+
+/**
+ * 确定性占位符检测（Pillar 1 / DS-2）：禁止未完成占位的交付物绕过门禁
+ */
+export function containsPlaceholderText(text: string, allowEllipsis = false): boolean {
+  const normalized = text.trim();
+  if (!normalized) {
+    return true;
+  }
+  if (PLACEHOLDER_WORD_PATTERN.test(normalized)) {
+    return true;
+  }
+  return !allowEllipsis && ELLIPSIS_PATTERN.test(normalized);
+}
+
 /**
  * 所有阶段结构化交付物的顶层契约接口
  */
@@ -353,6 +370,20 @@ export class QaVerificationArtifactContract implements IDomainArtifactContract {
     const errors: string[] = [];
     if (this.testSuitesExecuted.length === 0) {
       errors.push('QA 验证报告必须包含自动化测试套件执行结果');
+    }
+    const totalCases = this.testSuitesExecuted.reduce((acc, s) => acc + s.totalCases, 0);
+    const passedCases = this.testSuitesExecuted.reduce((acc, s) => acc + s.passedCases, 0);
+    if (this.allAcceptanceCriteriaMet) {
+      if (totalCases === 0 || passedCases < totalCases) {
+        errors.push(
+          `QA 契约完整性违规：测试套件存在未通过或零执行用例 (${passedCases}/${totalCases})，allAcceptanceCriteriaMet 不得谎报为 true`,
+        );
+      }
+      if (this.securityIssuesFound > 0) {
+        errors.push(
+          `QA 契约完整性违规：存在 ${this.securityIssuesFound} 个未清零的高危安全漏洞，allAcceptanceCriteriaMet 不得谎报为 true`,
+        );
+      }
     }
     return new ContractValidationResult(errors.length === 0, errors);
   }

@@ -6,13 +6,30 @@
  * Prompt 中不内嵌上游产物全文，仅注入摘要与关键字段（体积与注入面控制）。
  */
 
+import { createHash } from 'node:crypto';
 import { WorkflowStageId } from '../../domain/enums.ts';
+
+export const STAGE_PROMPT_VERSION = '2026-11-23.v2';
 
 export interface StagePromptSpec {
   readonly systemPrompt: string;
   readonly taskInstruction: string;
   readonly jsonSchemaHint: string;
+  /** OpenAI / vLLM / LiteLLM strict JSON Schema 约束 */
+  readonly jsonSchema?: Record<string, unknown>;
+  /** 中小模型首轮 1-shot 精简 JSON 示例 */
+  readonly compactExampleJson?: string;
 }
+
+const INTENT_SCHEMA_PROP = {
+  type: 'object',
+  properties: {
+    intentCode: { type: 'string' },
+    intentDescription: { type: 'string' },
+    confidenceScore: { type: 'number' },
+  },
+  required: ['intentCode', 'intentDescription', 'confidenceScore'],
+} as const;
 
 const COMMON_DISCIPLINE = `你是企业私有化研发流水线中的职能 Agent。
 输出纪律（必须严格遵守）：
@@ -40,6 +57,49 @@ export const STAGE_PROMPT_SPECS: Partial<Record<WorkflowStageId, StagePromptSpec
   ],
   "nonFunctionalConstraints": string[]     // 非功能性约束（≥2 条）
 }`,
+    jsonSchema: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        summary: { type: 'string' },
+        coreRequirementIds: { type: 'array', items: { type: 'string' } },
+        userStories: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              reqId: { type: 'string' },
+              story: { type: 'string' },
+              acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+            },
+            required: ['reqId', 'story', 'acceptanceCriteria'],
+          },
+        },
+        trackingPlanEvents: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              eventName: { type: 'string' },
+              triggerCondition: { type: 'string' },
+              properties: { type: 'array', items: { type: 'string' } },
+            },
+            required: ['eventName', 'triggerCondition', 'properties'],
+          },
+        },
+        nonFunctionalConstraints: { type: 'array', items: { type: 'string' } },
+        __intent: INTENT_SCHEMA_PROP,
+      },
+      required: [
+        'summary',
+        'coreRequirementIds',
+        'userStories',
+        'trackingPlanEvents',
+        'nonFunctionalConstraints',
+      ],
+    },
+    compactExampleJson:
+      '{"summary":"已完成PRD","coreRequirementIds":["R1"],"userStories":[{"reqId":"R1","story":"作为用户需要审批流","acceptanceCriteria":["延迟<200ms"]}],"trackingPlanEvents":[{"eventName":"evt_r1_submit","triggerCondition":"提交审批","properties":["run_id"]}],"nonFunctionalConstraints":["审计留痕","零云依赖"],"__intent":{"intentCode":"PRD_SYNTHESIS","intentDescription":"拆解PRD与埋点","confidenceScore":0.95}}',
   },
   [WorkflowStageId.STAGE_2_PD]: {
     systemPrompt: `${COMMON_DISCIPLINE}
@@ -57,6 +117,38 @@ export const STAGE_PROMPT_SPECS: Partial<Record<WorkflowStageId, StagePromptSpec
   "accessibilityChecklist": string[],      // ≥3 条
   "designChallengeNote": string | null     // 可行性质询（无冲突为 null）
 }`,
+    jsonSchema: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        summary: { type: 'string' },
+        coreRequirementIds: { type: 'array', items: { type: 'string' } },
+        componentMappings: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              reqId: { type: 'string' },
+              designSystemComponent: { type: 'string' },
+              interactionStates: { type: 'array', items: { type: 'string' } },
+            },
+            required: ['reqId', 'designSystemComponent', 'interactionStates'],
+          },
+        },
+        accessibilityChecklist: { type: 'array', items: { type: 'string' } },
+        designChallengeNote: { type: ['string', 'null'] },
+        __intent: INTENT_SCHEMA_PROP,
+      },
+      required: [
+        'summary',
+        'coreRequirementIds',
+        'componentMappings',
+        'accessibilityChecklist',
+        'designChallengeNote',
+      ],
+    },
+    compactExampleJson:
+      '{"summary":"完成UI映射","coreRequirementIds":["R1"],"componentMappings":[{"reqId":"R1","designSystemComponent":"DataTable","interactionStates":["default","loading","empty"]}],"accessibilityChecklist":["WCAG AA对比度","键盘焦点可达","ARIA语义"],"designChallengeNote":null,"__intent":{"intentCode":"UI_MAPPING","intentDescription":"映射设计系统组件","confidenceScore":0.95}}',
   },
   [WorkflowStageId.STAGE_3A_TECH_SPEC]: {
     systemPrompt: `${COMMON_DISCIPLINE}
@@ -75,6 +167,41 @@ export const STAGE_PROMPT_SPECS: Partial<Record<WorkflowStageId, StagePromptSpec
   "declaredRiskLevel": "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
   "architecturePatternsUsed": string[]     // ≥2 个模式名
 }`,
+    jsonSchema: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        summary: { type: 'string' },
+        coreRequirementIds: { type: 'array', items: { type: 'string' } },
+        apiContracts: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              method: { type: 'string' },
+              endpoint: { type: 'string' },
+              requestSchema: { type: 'string' },
+              responseSchema: { type: 'string' },
+            },
+            required: ['method', 'endpoint', 'requestSchema', 'responseSchema'],
+          },
+        },
+        databaseDdlStatements: { type: 'array', items: { type: 'string' } },
+        declaredRiskLevel: { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] },
+        architecturePatternsUsed: { type: 'array', items: { type: 'string' } },
+        __intent: INTENT_SCHEMA_PROP,
+      },
+      required: [
+        'summary',
+        'coreRequirementIds',
+        'apiContracts',
+        'databaseDdlStatements',
+        'declaredRiskLevel',
+        'architecturePatternsUsed',
+      ],
+    },
+    compactExampleJson:
+      '{"summary":"完成技术契约","coreRequirementIds":["R1"],"apiContracts":[{"method":"POST","endpoint":"/api/v1/r1","requestSchema":"R1Req","responseSchema":"R1Res"}],"databaseDdlStatements":[],"declaredRiskLevel":"LOW","architecturePatternsUsed":["Template Method","Repository"],"__intent":{"intentCode":"TECH_SPEC","intentDescription":"设计接口与架构","confidenceScore":0.96}}',
   },
   [WorkflowStageId.STAGE_3B_ENGINEER]: {
     systemPrompt: `${COMMON_DISCIPLINE}
@@ -92,6 +219,39 @@ export const STAGE_PROMPT_SPECS: Partial<Record<WorkflowStageId, StagePromptSpec
   ],
   "selfTestPassed": boolean                // 与输入的沙箱自测结果一致
 }`,
+    jsonSchema: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        summary: { type: 'string' },
+        coreRequirementIds: { type: 'array', items: { type: 'string' } },
+        gitWorktreeBranch: { type: 'string' },
+        modifiedFiles: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string' },
+              className: { type: 'string' },
+              designPattern: { type: 'string' },
+              linesChanged: { type: 'number' },
+            },
+            required: ['filePath', 'className', 'designPattern', 'linesChanged'],
+          },
+        },
+        selfTestPassed: { type: 'boolean' },
+        __intent: INTENT_SCHEMA_PROP,
+      },
+      required: [
+        'summary',
+        'coreRequirementIds',
+        'gitWorktreeBranch',
+        'modifiedFiles',
+        'selfTestPassed',
+      ],
+    },
+    compactExampleJson:
+      '{"summary":"完成编码与自测","coreRequirementIds":["R1"],"gitWorktreeBranch":"worktree/run/b1","modifiedFiles":[{"filePath":"src/r1.ts","className":"R1Service","designPattern":"Strategy","linesChanged":42}],"selfTestPassed":true,"__intent":{"intentCode":"ENGINEER_IMPL","intentDescription":"沙箱编码与自测","confidenceScore":0.95}}',
   },
   [WorkflowStageId.STAGE_4_QA]: {
     systemPrompt: `${COMMON_DISCIPLINE}
@@ -109,6 +269,39 @@ export const STAGE_PROMPT_SPECS: Partial<Record<WorkflowStageId, StagePromptSpec
   "securityIssuesFound": number,           // 与输入一致
   "allAcceptanceCriteriaMet": boolean      // 必须与真实结果一致（谎报会被契约校验拦截）
 }`,
+    jsonSchema: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        summary: { type: 'string' },
+        coreRequirementIds: { type: 'array', items: { type: 'string' } },
+        testSuitesExecuted: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              suiteName: { type: 'string' },
+              totalCases: { type: 'number' },
+              passedCases: { type: 'number' },
+              coveragePercent: { type: 'number' },
+            },
+            required: ['suiteName', 'totalCases', 'passedCases', 'coveragePercent'],
+          },
+        },
+        securityIssuesFound: { type: 'number' },
+        allAcceptanceCriteriaMet: { type: 'boolean' },
+        __intent: INTENT_SCHEMA_PROP,
+      },
+      required: [
+        'summary',
+        'coreRequirementIds',
+        'testSuitesExecuted',
+        'securityIssuesFound',
+        'allAcceptanceCriteriaMet',
+      ],
+    },
+    compactExampleJson:
+      '{"summary":"自动化测试通过","coreRequirementIds":["R1"],"testSuitesExecuted":[{"suiteName":"r1.spec.ts","totalCases":2,"passedCases":2,"coveragePercent":100}],"securityIssuesFound":0,"allAcceptanceCriteriaMet":true,"__intent":{"intentCode":"QA_VERIFY","intentDescription":"验收测试与安全扫描","confidenceScore":0.97}}',
   },
   [WorkflowStageId.STAGE_5_DA]: {
     systemPrompt: `${COMMON_DISCIPLINE}
@@ -125,5 +318,39 @@ export const STAGE_PROMPT_SPECS: Partial<Record<WorkflowStageId, StagePromptSpec
     { "metricName": string, "baselineValue": string, "targetValue": string }
   ]
 }`,
+    jsonSchema: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        summary: { type: 'string' },
+        coreRequirementIds: { type: 'array', items: { type: 'string' } },
+        verifiedTrackingEvents: { type: 'array', items: { type: 'string' } },
+        projectedMetrics: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              metricName: { type: 'string' },
+              baselineValue: { type: 'string' },
+              targetValue: { type: 'string' },
+            },
+            required: ['metricName', 'baselineValue', 'targetValue'],
+          },
+        },
+        __intent: INTENT_SCHEMA_PROP,
+      },
+      required: ['summary', 'coreRequirementIds', 'verifiedTrackingEvents', 'projectedMetrics'],
+    },
+    compactExampleJson:
+      '{"summary":"埋点与指标核验完成","coreRequirementIds":["R1"],"verifiedTrackingEvents":["evt_r1_submit"],"projectedMetrics":[{"metricName":"采纳率","baselineValue":"0%","targetValue":"85%"},{"metricName":"耗时","baselineValue":"300ms","targetValue":"180ms"},{"metricName":"错误率","baselineValue":"2%","targetValue":"0.1%"}],"__intent":{"intentCode":"DA_AUDIT","intentDescription":"埋点核验与归因","confidenceScore":0.94}}',
   },
 };
+
+/** 计算指定阶段的 Prompt 规格版本号哈希（Prompt/Schema 变更后自动隔离旧缓存） */
+export function computePromptSpecHash(stageId: WorkflowStageId): string {
+  const spec = STAGE_PROMPT_SPECS[stageId];
+  const raw = spec
+    ? `${STAGE_PROMPT_VERSION}|${spec.systemPrompt}|${spec.taskInstruction}|${spec.jsonSchemaHint}`
+    : `${STAGE_PROMPT_VERSION}|CUSTOM|${stageId}`;
+  return createHash('sha256').update(raw).digest('hex').slice(0, 12);
+}

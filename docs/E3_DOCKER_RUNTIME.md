@@ -39,7 +39,8 @@ docker run --rm --name sdlc-verify-<hash>-<ts> \
 SANDBOX_RUNTIME 未设置            → runtime: 'host'（E2 行为，零变化）
 SANDBOX_RUNTIME=docker + 可用     → runtime: 'docker'（容器执行，TestResultParser.parseSuiteOutput 同口径解析）
 SANDBOX_RUNTIME=docker 但不可用   → runtime: 'host-fallback'（WARN + 宿主机执行）
-容器单套件失败/超时               → 该套件降级宿主机，runtime 标记 'host-fallback'
+容器单套件非 0 退出码或超时       → 保留容器已解析的结果，当前将 runtime 标为 'host-fallback'（不会在宿主机重跑；pipe/退出码问题见 #12）
+dockerRuntime.runSuite() 抛异常   → 进入 catch 分支，该套件降级宿主机 TestResultParser.runSuite() 重跑并标 'host-fallback'
 ```
 
 - `SandboxVerificationResult` 新增 `runtime` 字段（审计口径）；执行日志新增 `[Sandbox Runtime] <runtime>` 行。
@@ -48,15 +49,12 @@ SANDBOX_RUNTIME=docker 但不可用   → runtime: 'host-fallback'（WARN + 宿�
 
 ### 3. 同步执行说明
 
-docker 路径与宿主机路径一致使用同步 `execFileSync`——调用方（QA/Engineer Agent 的模板路径、
-`/api/sandbox/verify`）签名零改动，不波及 6 个 Agent。代价：容器运行期间阻塞事件循环
-（与 E2 宿主机执行已是同一模式，无回归）；若后续要异步化，与 synthesizeTemplateArtifact
-async 化一并做（见遗留）。
+docker 路径与宿主机路径一致使用同步 `execFileSync`——通过 `prepareStageEnvironment()` 接入 `SoftwareEngineerAgent` 与 `QualityAssuranceAgent`（在线 LLM 与离线模板降级两条路径均在步骤 4 统一触发，离线路径复用同一准备结果）以及 `/api/sandbox/verify`，无需改动 6 个 Agent 的主签名。代价：容器运行期间阻塞事件循环；若后续异步化，需一并改造 `prepareStageEnvironment`、`synthesizeTemplateArtifact` 与 `/api/sandbox/verify`。
 
 ## 边界处理
 
 1. **docker 未安装/守护进程不可达** → host-fallback 显式降级 + WARN，流水线永不阻塞（D-2）。
-2. **单套件容器失败** → 仅该套件降级宿主机重跑，其余套件仍在容器内执行；runtime 标记如实反映混合状态。
+2. **仅 `dockerRuntime.runSuite()` 抛出异常时才在宿主机重跑该套件**；若容器成功返回非零退出码/超时但未抛异常，则保留容器输出解析结果，同时当前实现仍会将 `runtime` 标为 `'host-fallback'`（且 BusyBox `sh` 无 `pipefail` 下 `node --test | tee` 会返回 `tee` 退出码，已统一登记 `BACKEND_TODO.md` §五 `#12`）。
 3. **容器内测试超时** → CLI kill + `docker rm -f` 清理；解析口径如实记 1 条失败。
 4. **Windows 路径**：`-v` 挂载由 Docker Desktop 处理盘符路径；容器内路径统一 `/workspace` 正斜杠。
 
@@ -68,9 +66,12 @@ async 化一并做（见遗留）。
 4. 降级：docker 不可用 → `runtime=host-fallback` + 宿主机真实执行（真实 node:test 跑模板套件）
 5. 默认未请求 → `runtime=host`（E2 行为回归）
 
-**测试基线**：117 项（113 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。
+**完成时测试基线**：117 项（113 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
 
 ## 遗留
 
-- 同步阻塞事件循环（见上）；与 `synthesizeTemplateArtifact` async 化一并考虑。
+- `BACKEND_TODO.md` §五 `#12`：`sh -c "... | tee ..."` 管道吞没 `node --test` 退出码，以及容器测试断言失败与 Docker 引擎故障均被归为 `host-fallback`。
+- `docker-results/` 与 I3 冲突：`DockerTestRuntime` 日志目录落在 `<sandboxRoot>/docker-results/<runId>/`，而 I3 `enforceWorktreeRetention` 扫描 `sandboxRootDir` 时未排除 `docker-results`，超限后会将其一并按运行目录清理。
+- simulated 模式未在 worktree 根写 `package.json`（`type: "module"`），容器以只读挂载 `/workspace:ro` 运行 `.ts` 测试依赖 `node:22-alpine` 具体次版本的内置 ESM/strip-types 行为；此外 `Dockerfile` 目前未安装 `docker-cli`，容器部署下若无外挂 CLI/socket 将自动降级 `host-fallback`。
+- 同步阻塞事件循环（见上）；与 `prepareStageEnvironment` / `synthesizeTemplateArtifact` async 化一并考虑。
 - coverage 依赖镜像内 node 版本行为（`node:22-alpine` 需带 `--experimental-test-coverage`；若镜像精简无 tee 可换镜像）。

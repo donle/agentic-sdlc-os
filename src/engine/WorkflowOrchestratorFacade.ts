@@ -65,7 +65,7 @@ import {
 } from '../telemetry/RetrospectiveTaskRunner.ts';
 import { DagWorkflowStateEngine, WorkflowRunState } from './DagWorkflowStateEngine.ts';
 import { ImmutableAuditLedger } from './ImmutableAuditLedger.ts';
-import { PersistenceRepository } from './PersistenceRepository.ts';
+import { PersistenceRepository, type PersistenceDriver } from './PersistenceRepository.ts';
 import { RbacGovernanceService } from './RbacGovernanceService.ts';
 import { WorkflowDslConfiguration, WorkflowDslLoader } from './WorkflowDslLoader.ts';
 import { StateReconstructor } from './pg/StateReconstructor.ts';
@@ -107,11 +107,16 @@ export class WorkflowOrchestratorFacade {
     dslConfiguration?: WorkflowDslConfiguration;
     persistenceDir?: string;
     sandboxRootDir?: string;
+    databaseUrl?: string;
+    persistenceDriver?: PersistenceDriver | null;
   }) {
     this.dslConfig =
       params?.dslConfiguration ?? WorkflowDslLoader.loadFromFile(params?.dslConfigPath);
 
-    this.persistenceRepo = new PersistenceRepository(params?.persistenceDir);
+    this.persistenceRepo = new PersistenceRepository(params?.persistenceDir, {
+      databaseUrl: params?.databaseUrl,
+      driver: params?.persistenceDriver,
+    });
     this.sandboxManager = new GitWorktreeSandboxManager(params?.sandboxRootDir);
     this.rbacService = new RbacGovernanceService();
     this.eventBus = new WorkflowEventBus();
@@ -149,41 +154,190 @@ export class WorkflowOrchestratorFacade {
       this.eventBus,
       params?.maxNegotiationTurns ?? this.dslConfig.guardrails.maxNegotiationTurns,
     );
-    // B1：注入 LLM 轮次执行器（网关在线时用 LLM 生成真实协商内容；离线走剧本降级）
+    // B1 + Pillar 4：注入对抗式双上下文 + 无历史盲审裁判执行器（同时兼容旧单回合 JSON mock；离线降级剧本）
     this.negotiationMediator.setRoundRunner({
       runTurn: async (input) => {
         try {
-          const llm = await this.modelRouter.invokeChatCompletion({
+          const historyText =
+            input.previousTurns.length > 0
+              ? `\n\n历史交锋记录：\n${input.previousTurns
+                  .map(
+                    (t) =>
+                      `- 第 ${t.turnIndex} 轮 [${t.responderAction ?? 'PROPOSAL'}]: ${t.responseResolution}${
+                        t.challengerCritique ? ` | 挑战方否决意见: ${t.challengerCritique}` : ''
+                      }`,
+                  )
+                  .join('\n')}`
+              : '';
+
+          // Step A：响应方独立调用
+          const responderLlm = await this.modelRouter.invokeChatCompletion({
             tier: 'HIGH_REASONING_HYBRID' as never,
-            systemPrompt: `你是研发流水线中的两个智能体角色正在进行受限协商。
+            systemPrompt: `你是研发流水线受限协商中的响应方（${input.responder}）。
 当前是第 ${input.turnIndex}/${input.maxTurns} 轮。挑战方：${input.challenger}，响应方：${input.responder}。
-分歧焦点：${input.challengeContext}。
 协商主题：${input.topic}。
-请以响应方视角输出 JSON：{"responseResolution": "响应内容", "consensusReached": true/false, "optionAProposal": "方案A", "optionBProposal": "方案B"}
-consensusReached=true 表示双方达成一致。仅输出 JSON。`,
-            userPrompt: input.challengeContext,
+强制纪律：必须保住核心业务需求与验收标准，严禁为了结束对话而私自删减功能或用占位词降级；若无法在不降级范围/不增工期的前提下解决分歧，必须选 ESCALATE_TRADEOFF 交由人类拍板。
+仅输出 JSON：{"action":"ACCEPT_AND_PATCH|REBUT_WITH_EVIDENCE|ESCALATE_TRADEOFF","responseResolution":"回应内容","concretePatch":"具体修改方案","optionAProposal":"方案A","optionBProposal":"方案B"}`,
+            userPrompt: `质询焦点：${input.challengeContext}${historyText}`,
             fallbackContentGenerator: () => '',
           });
-          if (!llm.usedLiveGateway) {
+          if (!responderLlm.usedLiveGateway) {
             return null;
           }
-          const extracted = JsonExtractor.extract(llm.content);
-          if (!extracted.ok) {
+          const responderParsed = JsonExtractor.extract(responderLlm.content);
+          if (!responderParsed.ok) {
             return null;
           }
-          const parsed = extracted.value as Record<string, unknown>;
+          const parsed = responderParsed.value as Record<string, unknown>;
+          let totalTokens = responderLlm.receipt.totalTokens;
+
+          const rawAction = parsed.action;
+          const isAdversarialProtocol =
+            rawAction === 'ACCEPT_AND_PATCH' ||
+            rawAction === 'REBUT_WITH_EVIDENCE' ||
+            rawAction === 'ESCALATE_TRADEOFF';
+
+          // 向后兼容旧版单调用 mock（返回 consensusReached 且不带 action）
+          if (!isAdversarialProtocol) {
+            if (
+              typeof parsed.responseResolution !== 'string' ||
+              parsed.responseResolution.trim().length === 0 ||
+              typeof parsed.consensusReached !== 'boolean'
+            ) {
+              return null;
+            }
+            return {
+              responseResolution: parsed.responseResolution.trim(),
+              consensusReached: parsed.consensusReached,
+              optionAProposal: String(parsed.optionAProposal ?? ''),
+              optionBProposal: String(parsed.optionBProposal ?? ''),
+              tokensConsumed: totalTokens,
+            };
+          }
+
+          if (
+            typeof parsed.responseResolution !== 'string' ||
+            parsed.responseResolution.trim().length === 0
+          ) {
+            return null;
+          }
+          const responseResolution = parsed.responseResolution.trim();
+          const concretePatch = String(parsed.concretePatch ?? '').trim();
+          const optionAProposal = String(parsed.optionAProposal ?? '');
+          const optionBProposal = String(parsed.optionBProposal ?? '');
+
+          // 触及权衡即刻上报人类，不空转剩余轮次
+          if (rawAction === 'ESCALATE_TRADEOFF') {
+            return {
+              responseResolution,
+              consensusReached: false,
+              responderAction: 'ESCALATE_TRADEOFF',
+              concretePatch,
+              optionAProposal,
+              optionBProposal,
+              tokensConsumed: totalTokens,
+            };
+          }
+
+          // Step B：挑战方独立复核调用（不与响应方共享同一调用与角色）
+          const challengerLlm = await this.modelRouter.invokeChatCompletion({
+            tier: 'HIGH_REASONING_HYBRID' as never,
+            systemPrompt: `你是研发流水线对峙协商的挑战方独立复核者（${input.challenger}）。
+你的职责是质量与工程边界守门人：
+1. 若响应方未给出可落地的具体修补（concretePatch）或充分反驳证据，触发熔断交给人类拍板是完全正确的决定，严禁为了追求和谐而妥协；
+2. 若发现回应中暗含需求缩水/验收降级，必须拒绝并标记 containsImplicitScopeCut=true。
+仅输出 JSON：{"accepted":true/false,"critique":"复核结论","containsImplicitScopeCut":true/false}`,
+            userPrompt: `原始质询：${input.challengeContext}\n响应方动作：${rawAction}\n响应内容：${responseResolution}\n具体修补方案：${concretePatch || '无'}${historyText}`,
+            fallbackContentGenerator: () => '',
+          });
+          totalTokens += challengerLlm.receipt.totalTokens;
+          const challengerParsed = challengerLlm.usedLiveGateway
+            ? JsonExtractor.extract(challengerLlm.content)
+            : { ok: false, value: null };
+          if (!challengerParsed.ok) {
+            return {
+              responseResolution,
+              consensusReached: false,
+              responderAction: rawAction,
+              concretePatch,
+              challengerVerified: false,
+              challengerCritique: '挑战方独立复核输出格式无效，禁止草率达成共识',
+              optionAProposal,
+              optionBProposal,
+              tokensConsumed: totalTokens,
+            };
+          }
+          const cObj = challengerParsed.value as Record<string, unknown>;
+          const challengerAccepted =
+            cObj.accepted === true && cObj.containsImplicitScopeCut !== true;
+          const challengerCritique = String(cObj.critique ?? '').trim();
+          if (!challengerAccepted) {
+            return {
+              responseResolution,
+              consensusReached: false,
+              responderAction: rawAction,
+              concretePatch,
+              challengerVerified: false,
+              challengerCritique:
+                challengerCritique || '挑战方独立复核认定当前修补仍无法消除工程风险或隐含范围缩水',
+              optionAProposal,
+              optionBProposal,
+              tokensConsumed: totalTokens,
+            };
+          }
+
+          // Step C：无历史盲审裁判（Fresh-Context Blind Judge：不传聊天历史，仅查 Diff/修补是否存在迎合式软降级）
+          const judgeLlm = await this.modelRouter.invokeChatCompletion({
+            tier: 'HIGH_REASONING_HYBRID' as never,
+            systemPrompt: `你是研发流水线的防伪共识独立盲审裁判（Anti-Sycophancy Blind Judge）。
+你看不到双方协商对话客套过程，仅审视原始问题与最终承诺的修补方案：
+一旦发现任何隐性功能阉割、指标/验收标准放宽或占位延迟兑现，必须判定 hasImplicitDowngrade=true。
+仅输出 JSON：{"hasImplicitDowngrade":true/false,"reason":"盲审结论"}`,
+            userPrompt: `原始分歧：${input.challengeContext}\n响应方承诺：${responseResolution}\n具体修补：${concretePatch || '无'}`,
+            fallbackContentGenerator: () => '',
+          });
+          totalTokens += judgeLlm.receipt.totalTokens;
+          const judgeParsed = judgeLlm.usedLiveGateway
+            ? JsonExtractor.extract(judgeLlm.content)
+            : { ok: false, value: null };
+          if (!judgeParsed.ok) {
+            return {
+              responseResolution,
+              consensusReached: false,
+              responderAction: rawAction,
+              concretePatch,
+              challengerVerified: true,
+              challengerCritique,
+              independentJudgePassed: false,
+              independentJudgeReason: '盲审裁判未返回有效 JSON 判定，保守拦截共识',
+              optionAProposal,
+              optionBProposal,
+              tokensConsumed: totalTokens,
+            };
+          }
+          const jObj = judgeParsed.value as Record<string, unknown>;
+          const judgePassed = jObj.hasImplicitDowngrade !== true;
+          const judgeReason = String(jObj.reason ?? '').trim();
+
           return {
-            responseResolution: String(parsed.responseResolution ?? ''),
-            consensusReached: parsed.consensusReached === true,
-            optionAProposal: String(parsed.optionAProposal ?? ''),
-            optionBProposal: String(parsed.optionBProposal ?? ''),
+            responseResolution,
+            consensusReached: judgePassed,
+            responderAction: rawAction,
+            concretePatch,
+            challengerVerified: true,
+            challengerCritique,
+            independentJudgePassed: judgePassed,
+            independentJudgeReason: judgeReason || undefined,
+            optionAProposal,
+            optionBProposal,
+            tokensConsumed: totalTokens,
           };
         } catch {
           return null;
         }
       },
     });
-    this.supervisorAgent = new SupervisorAgent(this.eventBus);
+    this.supervisorAgent = new SupervisorAgent(this.eventBus, this.modelRouter);
     this.stateEngine = new DagWorkflowStateEngine();
     this.retrospectiveRunner = new RetrospectiveTaskRunner({
       cacheManager: this.cacheManager,
@@ -244,6 +398,7 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
     actorUserId: string;
     content: string;
     category?: TeamCommentCategory;
+    persist?: boolean;
   }): StageTeamCommentRecord {
     const user = this.rbacService.getUserOrDefault(params.actorUserId);
     const comment = new StageTeamCommentRecord({
@@ -258,7 +413,22 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
       category: params.category ?? 'COMMENT',
     });
     this.teamComments.push(comment);
+    if (params.persist !== false && this.stateEngine.getAllRuns().length > 0) {
+      this.syncPersistenceState();
+    }
     return comment;
+  }
+
+  /** AUDIT-9：恢复持久化的团队评论（幂等去重，不重新触发持久化） */
+  public restoreTeamComment(comment: StageTeamCommentRecord): void {
+    const exists = this.teamComments.some((c) => c.commentId === comment.commentId);
+    if (!exists) {
+      this.teamComments.push(comment);
+    }
+  }
+
+  public getAllTeamComments(): ReadonlyArray<StageTeamCommentRecord> {
+    return [...this.teamComments];
   }
 
   public getTeamComments(
@@ -279,6 +449,7 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
       actorUserId: 'user-pm-01',
       content: `已完成《${runState.proposal.title}》核心需求（${reqList}）与埋点事件对齐，请各位同事在各环节评审时重点关注权限边界与响应耗时。`,
       category: 'COMMENT',
+      persist: false,
     });
     this.addTeamComment({
       runId,
@@ -287,6 +458,7 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
       content:
         '收到，架构组已审阅 Stage 1 的非功能性约束，后续在 Stage 3a 会同步设计多租户 RBAC 索引与幂等防重机制。',
       category: 'COMMENT',
+      persist: false,
     });
     this.addTeamComment({
       runId,
@@ -295,6 +467,7 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
       content:
         'PD Agent 评估三维实时画布在移动端存在首屏性能瓶颈，我倾向于采纳方案 A（企业标准双栏折叠抽屉组件），既符合现有设计系统又不会拖慢排期。',
       category: 'COMMENT',
+      persist: false,
     });
     this.addTeamComment({
       runId,
@@ -303,6 +476,7 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
       content:
         '研发侧已预检接口契约，一旦架构师签核完 Stage 3a 的表结构变更，Engineer Agent 即可在独立 Worktree 分支落盘领域服务代码。',
       category: 'COMMENT',
+      persist: false,
     });
   }
 
@@ -338,6 +512,7 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
       stagePipeline: this.dslConfig.getStageOrder(),
       workflowTemplateId: this.dslConfig.id,
       scenarioHints: params.scenarioHints,
+      tokenBudget: this.dslConfig.guardrails.tokenBudgetLimit,
     });
 
     this.seedInitialTeamCommentsForRun(runState);
@@ -572,6 +747,7 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
           topic: negotiationOutcome.topic,
           forceDeadlockToMaxTurns: negotiationOutcome.forceDeadlock,
         });
+        runState.recordTokenUsage(negResult.totalTokensConsumed);
         negotiationEscalated = negResult.escalatedToSupervisor;
         deadlockedTurn = negResult.latestTurn;
 
@@ -786,8 +962,10 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
       auditLedger: this.auditLedger,
       mediator: this.negotiationMediator,
       eventBus: this.eventBus,
+      restoreTeamComment: (comment) => this.restoreTeamComment(comment),
     });
-    const result = reconstructor.restore(persisted);
+    const walEntries = this.persistenceRepo.readAuditWalEntries();
+    const result = reconstructor.restore(persisted, walEntries);
     for (const warning of result.warnings) {
       console.warn(`[D1 Restore] ${warning}`);
     }
@@ -815,6 +993,19 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
         lifecycleState: e.lifecycleState,
         headline: e.headline,
         detailPayload: { ...e.detailPayload },
+        timestampIso: e.timestampIso,
+      })),
+      notifications: this.eventBus.getNotificationInbox().map((n) => n.toSerializableRecord()),
+      teamComments: this.teamComments.map((c) => c.toSerializableRecord()),
+      auditEntries: this.auditLedger.getAuditTimeline().map((e) => ({
+        entryId: e.entryId,
+        runId: e.runId,
+        branchId: e.branchId,
+        stageId: e.stageId,
+        actor: e.actor,
+        actionType: e.actionType,
+        summary: e.summary,
+        metadata: { ...e.metadata },
         timestampIso: e.timestampIso,
       })),
     });
@@ -905,6 +1096,7 @@ consensusReached=true 表示双方达成一致。仅输出 JSON。`,
     const parsedDirective = await this.supervisorAgent.parseNaturalLanguageRollback(
       params.dialogueInstruction,
       params.explicitTargetStageId,
+      runState.getStagePipeline(),
     );
 
     let effectiveActor = params.humanActor;

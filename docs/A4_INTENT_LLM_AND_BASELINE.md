@@ -16,8 +16,8 @@
   `"__intent": { intentCode, intentDescription, confidenceScore }`。
 - `executeStagePipeline` 解析主输出后、契约工厂解析前捕获 `__intent`（工厂忽略未知字段，互不影响）：
   - `captureLlmIntent`：intentCode 非空校验（空/缺失静默忽略）、截断（code ≤64 字符、描述 ≤120）、置信度边界处理；
-  - 存入 Agent 实例级 `lastLlmIntent`（同阶段跨 run 复用——Agent 为单例注册表，天然是"上次同阶段"语义）。
-- `resolveStageIntent`（基类新增，替代调用点直调抽象方法）：优先 `lastLlmIntent`，否则回落子类规则实现。
+  - 存入 Agent 实例级 `llmIntentByScope`（按 `stageId + 核心需求 ID/描述签名 + 回退指令` 作用域隔离——同构需求跨 run 零额外往返复用，不同业务提案互不串味）。
+- `resolveStageIntent`（基类新增，替代调用点直调抽象方法）：优先匹配当前需求作用域下的 `llmIntentByScope`，未命中则回落子类规则实现。
   6 个子类的规则实现原样保留 = 兜底路径。
 
 ### 2. 模型体检端点
@@ -43,18 +43,18 @@
    run 2 起复用（测试 1 断言了该时序）。
 2. **非法 `__intent`**（空 code / 缺字段 / 非对象）→ 静默忽略，不污染意图缓存（测试 2）。
 3. **离线模板模式**：fallback 产物不含 `__intent` → 永远规则意图（与旧行为一致）。
-4. **体检端点离线**：返回 offline 标记而非伪造报告（诚实口径）；未认证 403（测试 5）。
+4. **体检端点离线**：返回 offline 标记而非伪造报告（诚实口径）；默认模式（未开启 `AUTH_REQUIRED`/`AUTH_DISABLED`）下未认证/非管理员请求返回 `403`，开启 `AUTH_REQUIRED=true` 时无有效会话将在全局会话守卫层拦截返回 `401`。
 
 ## 验证（tests/a4-intent-and-baseline.spec.ts，5 项）
 
-1. `__intent` 捕获时序：run 1 规则意图（LLM 调用前）→ run 2 复用 `PRD_LLM_INTENT_E2E`
+1. `__intent` 捕获时序与作用域隔离：run 1 规则意图（LLM 调用前）→ run 2 同构需求复用 `PRD_LLM_INTENT_E2E` → run 3 不同需求集合不串味，回落规则意图 `PRD_SYNTHESIS_AND_TRACKING_PLAN_1_REQS`
 2. 空 `intentCode` → 回落规则意图（`PRD_SYNTHESIS_AND_TRACKING_PLAN_1_REQS`）
 3. 体检端点离线 → `offline:true` + 零报告
 4. 体检端点在线（mock transport）→ 2 层级 × 3 任务 = 6 份报告全通过、含 taskName
-5. 无会话 → 403
+5. 默认模式下无会话 → 403
 
-**测试基线**：112 项（108 过 / 4 既有 skip / 0 失败）；typecheck（含前端）+ eslint + prettier 全绿；UI bundle 已构建。
+**完成时测试基线**：112 项（108 过 / 4 既有 skip / 0 失败）；typecheck（含前端）+ eslint + prettier 全绿；UI bundle 已构建。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
 
 ## 遗留
 
-- `lastLlmIntent` 为 Agent 实例级缓存，未持久化（D1 恢复后首个 run 回落规则意图——语义无损，暂不处理）。
+- `llmIntentByScope` 为 Agent 实例级缓存，未持久化（D1 恢复后首个 run 回落规则意图——语义无损，暂不处理）。

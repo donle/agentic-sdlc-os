@@ -103,6 +103,16 @@ export class WorkflowEventBus {
     this.eventHistory.push(event);
   }
 
+  /** D1：恢复历史通知收件箱（保留原有最新在前顺序，不触发观察者写 WAL） */
+  public restoreNotification(notification: AgentUserNotification): void {
+    const exists = this.notificationInbox.some(
+      (item) => item.notificationId === notification.notificationId,
+    );
+    if (!exists) {
+      this.notificationInbox.push(notification);
+    }
+  }
+
   public publishNotification(notification: AgentUserNotification): void {
     this.notificationInbox.unshift(notification);
     for (const observer of this.observers) {

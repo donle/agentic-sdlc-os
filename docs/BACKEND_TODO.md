@@ -3,12 +3,11 @@
 > [!NOTE]
 > 本文档基于对当前代码库的逐模块审计（2026-11-22），对照《SYSTEM_DESIGN_REPORT.md》（设计报告）与《ENGINEERING_BLUEPRINT.md》（工程蓝图），
 > 列出**所有"演示级模拟（Mockup）"与"完全缺失"的后端能力**，并给出可执行的分优先级 TODO 表。
-> 每个条目标注：现状代码位置 → 目标行为 → 验收标准 → 依赖关系。完成一项请勾选对应复选框并注明提交。
+> 每个条目标注：现状代码位置 → 目标行为 → 验收标准 → 依赖关系。（§一至§四作为历史基线不再回勾，新进项以 §五复选框与 `BACKEND_TODO_IMPL_LOG.md` 为准。）
 
 > [!IMPORTANT]
-> **执行状态（2026-11-23 更新）**：本文为**审计基线存档**，逐条勾选状态以 `BACKEND_TODO_IMPL_LOG.md` 为权威——
-> A/B/C/D/E/F/G1/G2/I3/J2/G11/J 全部条目已完成（M1-M7 Mockup 全部替代完毕，P1 清零；P2 仅剩 H1-H3，
-> **用户决策挂起**待业务思考，范围决策见 `P2_REMAINING_PLAN.md`）。新条目开工前先查那两份文档，勿按本文的"现状"列重复审计。
+> **执行状态（2026-11-23 更新）**：本文第一至四章为**初始审计基线存档**（2026-11-22），该批 A/B/C/D/E/F/G1/G2/G10/I1/I2/I3/J2/G11/J 条目及 M1-M7 Mockup 替代已全部实现（其中 D1/D2/D3/E3/I1 等在深度复核中暴露的未闭环缺陷已转入文末 §五 `#8–#14` 跟踪；详见 `BACKEND_TODO_IMPL_LOG.md`；原遗留项 H1-H3 为 P2 外部集成，暂挂待业务范围决策，见 `P2_REMAINING_PLAN.md`）。
+> 2026-11-23 针对当前实现代码的深度复核新发现 **14 个具体工程问题（#1–#14）**：其中 **#1–#7 已完成修复与文档同步**（第八、九轮），**尚待修复的 #8–#14 已统一登记至文末第五章（§五）**（同步索引于 `BACKEND_TODO_IMPL_LOG.md` 的"待实现项"表）。新条目开工前请以本文第五章、`BACKEND_TODO_IMPL_LOG.md` 与 `P2_REMAINING_PLAN.md` 为准。
 
 ---
 
@@ -234,3 +233,65 @@
 | 沙箱伪 git / 硬编码测试数                                      | `GitWorktreeSandboxManager.ts:90-92 / 273-283`，全文件无 git 子进程调用 |
 | 认证缺失 + admin 兜底                                          | `WorkbenchServer.ts:127-144`、`RbacGovernanceService.ts:181-186`        |
 | 协商剧本化                                                     | `BoundedNegotiationMediator.ts:75-84`（`forceDeadlockToMaxTurns` 编排） |
+
+---
+
+## 五、2026-11-23 后端深度审计待修复 TODO（#8–#14）
+
+> 本章记录 2026-11-23 后端深度审计中识别、且在第八/九轮修复（#1–#7）后**仍未解决的 7 个具体工程问题**。执行状态同步索引于 [`BACKEND_TODO_IMPL_LOG.md`](./BACKEND_TODO_IMPL_LOG.md) 的"待实现项"表（编号 `AUDIT-8` 至 `AUDIT-14`）。
+
+### P0 阻断级（持久化与重启恢复可靠性）
+
+- [x] **#8（AUDIT-8 / 关联 D2）修复 PostgreSQL 同步缺失 `negotiation_logs` 表，并打通 `PgPersistenceDriver` 与用户系统 Schema**（✅ 已于第十二轮修复）
+  - **现状**：
+    - `src/engine/pg/PgPersistenceDriver.ts` 新增统一构建器 `buildPgUpsertSql()` 作为唯一 SQL 事实源，`PersistenceRepository.generatePostgreSqlStatements()` 已消除重复拼装并补齐 `negotiation_logs`、`team_comments` 及来自 `WorkflowRunState.getTokenBudget()` 的真实 `token_budget` / `token_used`（杜绝 `120000` 硬编码）；`workflow_snapshot_yaml` / `artifact_json.__snapshotMeta` 完整承载重建元数据。
+    - `PersistenceRepository` 构造函数与 `persistFullState()` / `loadPersistedSnapshot()` / `appendAuditEntryToWal()` 已接入 `selectPersistenceDriver()`；`PgPersistenceDriver.loadFullState()` 完整回读 6 张业务表并在空库/故障时回落 `ledger-store.json`。
+    - `deploy/init-pgvector-schema.sql` 已补全用户体系与评论表（`users`、`user_owned_stages`、`auth_sessions`、`auth_login_audit`、`team_comments`）及 `workflow_runs.created_by_user_id` / `human_decisions.reviewer_user_id` 双轨关联外键；`src/server/auth/UserStore.ts` 实现 `JsonUserStore` + `PgUserStore` + `selectUserStore`，并由 `SessionService` 与 `WorkbenchServer` 正式消费。
+  - **验收**：已在 `tests/pg-persistence-driver.spec.ts` 新增 5 项验收测试，覆盖 SQL 完整性（含定制 `tokenBudgetLimit: 88000`、`negotiation_logs`、`team_comments`）、`selectPersistenceDriver` 驱动切换、删除 `ledger-store.json` 后经 `PgPersistenceDriver.loadFullState()` 完整重启恢复、10 表 Schema 断言及 `PgUserStore` + `SessionService` PG 往返闭环，全数通过（详见 `BACKEND_TODO_IMPL_LOG.md` 第十二轮）。
+
+- [x] **#9（AUDIT-9 / 关联 D1）修复启动恢复 `StateReconstructor` 丢失 5 项关键运行态数据**（✅ 已于第十一轮修复）
+  - **现状**：
+    - **1) `ScopeDiffReport` 字段丢失**：`StageSnapshotMemento.toSerializableRecord()`（`src/domain/models.ts`）已补齐 `baselineRequirementIds` / `currentRequirementIds`，且 `ScopeDiffReport.fromJSON()` 兼容历史仅含 `droppedRequirementIds` 的快照。
+    - **2) `notificationInbox` 丢失**：`AgentUserNotification` 支持序列化/反序列化，经 `PersistedLedgerSnapshot.notifications` 与 `WorkflowEventBus.restoreNotification()` 保持原有倒序恢复待办审批通知卡。
+    - **3) `teamComments` 丢失**：`StageTeamCommentRecord` 支持序列化，独立调用 `addTeamComment()` 时自动同步持久化并在 `restoreFromPersistence()` 完整恢复。
+    - **4) `autoRepairCounts` 丢失**：`PersistedRunRecord.autoRepairCounts` 持久化与 `WorkflowRunState.restoreInternals()` 完整恢复 QA 自动返修计数。
+    - **5) `auditEntries` 丢失**：`StateReconstructor.restore()` 从 `PersistenceRepository.readAuditWalEntries()`（及快照兜底）调用 `ImmutableAuditLedger.restoreAuditEntry()` 重建审计时间轴，且不重复写回 WAL 或触发二次 RAG。
+  - **验收**：已在 `tests/state-reconstructor.spec.ts` 新增 Test 4–5 验证全量 5 项 round-trip、WAL 零重复及历史/损坏数据容错，全数通过（见 `BACKEND_TODO_IMPL_LOG.md` 第十一轮）。
+
+### P1 核心工程缺陷（交互异常、沙箱真实性与并发安全）
+
+- [ ] **#10（AUDIT-10 / 关联 A2、B3）修复熔断通知 `RETRY_STAGE` 按钮点击报 400 的交互死路**
+  - **现状**：`src/engine/WorkflowOrchestratorFacade.ts` 的 `continueExecutionUntilGateOrComplete()` catch 块在捕获 `StageContractError` 或 `TokenBudgetExceededError` 时，发布 `STAGE_CONTRACT_FAILED` / `TOKEN_BUDGET_EXCEEDED` 通知，携带 `relatedSnapshotId: 'ROOT'` 与 `actionOptions`（其中 `RETRY_STAGE` 对应 `verdict: DecisionVerdict.APPROVE`）；但点击该按钮触发 `submitHumanGateDecision()` 时，代码调用 `runState.findSnapshotById('ROOT')` 并抛出 `未找到待审核快照 [ROOT]`，导致前端请求返回 400 错误。
+  - **目标**：为契约熔断 / 预算超限通知绑定真实可恢复的阶段标识或专属重试入口（或当 `RETRY_STAGE` 命中熔断恢复路径时由 `WorkflowOrchestratorFacade` 安全重启失败节点），确保用户点击通知动作可真正触发阶段重试而非 400。
+  - **验收**：新增测试模拟 `StageContractError`（及 `TokenBudgetExceededError`）触发通知后调用决策/重试接口，验证返回 200 且该阶段重新进入执行状态，不再抛出 `未找到待审核快照 [ROOT]`。
+
+- [ ] **#11（AUDIT-11）修复 `RealGitWorktree.remove()` 匹配逻辑错误导致无法清理或误删其他 Worktree**
+  - **现状**：`src/sandbox/RealGitWorktree.ts` 的 `remove(branchName)` 对 `git worktree list --porcelain` 输出按 `.find((line) => line.startsWith('worktree ') && line.includes('/worktree/'))` 匹配目录；实际磁盘路径（如 `.sandbox-worktrees/<runId>/<branchId>`）通常不包含 `/worktree/`（该前缀位于 `branch refs/heads/worktree/...` 行），且 `.find()` 未按 `branchName` 对应的 porcelain stanza 精确绑定，导致清理静默失败或误删同一仓库下的其他 worktree。
+  - **目标**：按 `git worktree list --porcelain` 的空行分段（stanza）解析每组 `worktree <path>` 与 `branch refs/heads/<branch>`，严格匹配目标 `branchName` 后再执行 `git worktree remove` 与分支清理。
+  - **验收**：在真实临时 Git 仓库创建至少 2 个不同 branch 的 worktree，调用 `remove(branchA)` 后仅 `branchA` 对应 worktree 与分支被移除，`branchB` 完整保留。
+
+- [ ] **#12（AUDIT-12 / 关联 E3）修复 `DockerTestRuntime` 管道吞没退出码与测试失败被误标为 `host-fallback`**
+  - **现状**：
+    - `src/sandbox/DockerTestRuntime.ts` 执行 `sh -c "node --test --test-reporter=spec --experimental-test-coverage ${containerTestPath} 2>&1 | tee /results/${resultsBasename}"` 时未开启 `pipefail`（Alpine BusyBox `sh` 亦需注意兼容性），管道返回的是 `tee` 的退出码 `0` 而非 `node --test` 的真实退出码。
+    - `src/sandbox/GitWorktreeSandboxManager.ts` 在 `dockerResult.exitCode !== 0` 时直接设置 `runtime = 'host-fallback'`，将单元测试用例失败混同为 Docker 容器启动/引擎故障；同时需核验 `node:22-alpine` 镜像内直接运行 TypeScript 测试文件的兼容性。
+  - **目标**：
+    - 使用不依赖管道掩码的方式保留容器内测试真实退出码（如文件重定向或显式保存 `$?`），并校验 `node:22-alpine` 下 TypeScript 测试执行链路。
+    - 在 `GitWorktreeSandboxManager.ts` 区分"Docker 引擎/容器基础设施不可用"与"容器内测试断言失败"，仅前者才触发 `host-fallback`。
+  - **验收**：单测验证容器内测试失败（退出码非 0）时 `runtime` 仍准确报告为 `docker` 且失败用例数正确解析；仅当 Docker daemon 不可用/超时/镜像缺失时才降级为 `host-fallback`。
+
+- [ ] **#13（AUDIT-13 / 关联 D3）消除 `WorkbenchServer` 全局单一 `activeRunId` 并发串台，并接线 SSE `Last-Event-ID` 重放**
+  - **现状**：
+    - `src/server/WorkbenchServer.ts` 使用单一实例级 `this.activeRunId`：`GET /api/state?runId=` 会修改全局 `this.activeRunId`；`/api/decisions`、`/api/supervisor/rollback`、`/api/comments`、`/api/sandbox/file`、`/api/sandbox/verify` 均直接读取 `this.activeRunId` 而非请求自带 `runId`；`broadcastSseStateUpdate()` 向全部 SSE 客户端广播当前全局 `this.activeRunId` 状态，多用户或多标签页查看不同 Run 时会互相覆盖甚至误操作错误 Run。
+    - `/api/events/stream` 未读取请求头 `last-event-id` 并调用 `this.sseBridge.replay()`（`src/server/SseBridge.ts` 已实现 `replay(clientLastId, write)` 但未接线）。
+  - **目标**：
+    - 所有读写接口优先以请求显式传入的 `runId`（query/body/path）定位目标 Run，不再用 `GET /api/state` 覆盖实例全局状态（仅无 `runId` 时回退默认最新 Run）；SSE 连接按订阅 `runId` 隔离推送或携带精确事件通道。
+    - `/api/events/stream` 读取 `req.headers['last-event-id']` 并调用 `this.sseBridge.replay()` 补发断线期间缺失事件。
+  - **验收**：并发打开两个不同 `runId` 的状态查询与审批请求互不串台；`GET /api/events/stream` 携带 `Last-Event-ID` 请求头时能够重放该 ID 之后的增量事件。
+
+- [ ] **#14（AUDIT-14 / 关联 I1）补全 `Dockerfile` 的 `postgresql-client` 与 `docker-compose.yml` 的 `LITELLM_ENABLE_LIVE_HTTP=true`**
+  - **现状**：
+    - `Dockerfile` 仅执行 `apk add --no-cache git`，缺少 `postgresql-client`，导致容器化部署时 `PersistenceRepository` 与 `WarehouseQueryProvider` 调用 `execFileSync('psql', ...)` 抛出 `ENOENT`。
+    - `deploy/docker-compose.yml` 中 `agentic-workbench` 服务的 `environment` 缺少 `LITELLM_ENABLE_LIVE_HTTP=true`，导致通过 Compose 一键拉起后 LLM 调用仍停留在离线回退模式。
+  - **目标**：
+    - 在 `Dockerfile` 中补齐 `postgresql-client` 安装；在 `deploy/docker-compose.yml` 的 `agentic-workbench` 环境变量中默认启用 `LITELLM_ENABLE_LIVE_HTTP=true`（及检查镜像运行所需环境一致）。
+  - **验收**：容器内可执行 `psql --version` 且 `docker compose config` 校验 `agentic-workbench` 含 `LITELLM_ENABLE_LIVE_HTTP=true`。

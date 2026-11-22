@@ -23,11 +23,20 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { ProjectProposalContract } from '../domain/contracts.ts';
 import { DecisionVerdict, WorkflowStageId } from '../domain/enums.ts';
+import { SystemPermissionCode } from '../domain/rbac.ts';
 import type { ScenarioHints } from '../domain/scenario.ts';
-import { SessionService } from './auth/SessionService.ts';
+import { type AuthUserView, SessionService } from './auth/SessionService.ts';
+import { selectUserStore } from './auth/UserStore.ts';
 import { SseBridge } from './SseBridge.ts';
 import { WorkflowDslLoader } from '../engine/WorkflowDslLoader.ts';
 import { WorkflowOrchestratorFacade } from '../engine/WorkflowOrchestratorFacade.ts';
+
+interface ResolvedAuthContext {
+  readonly actorUserId: string;
+  readonly user: AuthUserView | null;
+  readonly rawToken: string | null;
+  readonly authSource: 'session' | 'invalid_token' | 'workbench_header' | 'none';
+}
 
 export class WorkbenchHttpServer {
   private readonly orchestrator: WorkflowOrchestratorFacade;
@@ -52,7 +61,9 @@ export class WorkbenchHttpServer {
       persistenceDir: options?.persistenceDir,
       sandboxRootDir: options?.sandboxRootDir,
     });
-    this.sessionService = new SessionService();
+    const usersFilePath = path.join(orchestrator.persistenceRepo.getStorageDir(), 'users.json');
+    const userStore = selectUserStore({ usersFilePath });
+    this.sessionService = new SessionService(userStore, orchestrator.rbacService);
     this.orchestrator = orchestrator;
     this.sseBridge = new SseBridge((frame, eventName, seqId) => {
       this.sseClients.forEach((_clientData: string, clientRes: http.ServerResponse) => {
@@ -137,15 +148,26 @@ data: ${frame}
     return runState.runId;
   }
 
+  public async waitUntilReady(): Promise<void> {
+    await this.seedPromise.catch(() => undefined);
+  }
+
+  public async handleHttpRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    try {
+      await this.routeRequest(req, res);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '未知服务器异常';
+      const statusCode = message.includes('[RBAC') ? 403 : 400;
+      this.sendJson(res, statusCode, { ok: false, error: message });
+    }
+  }
+
   public async start(): Promise<http.Server> {
     const server = http.createServer(async (req, res) => {
-      try {
-        await this.routeRequest(req, res);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : '未知服务器异常';
-        const statusCode = message.includes('[RBAC') ? 403 : 400;
-        this.sendJson(res, statusCode, { ok: false, error: message });
-      }
+      await this.handleHttpRequest(req, res);
     });
 
     await this.seedPromise.catch(() => undefined);
@@ -161,43 +183,104 @@ data: ${frame}
     return server;
   }
 
-  private resolveActorUserId(
-    req: http.IncomingMessage,
-    urlObj: URL,
-    body?: Record<string, unknown>,
-  ): string {
-    // AUTH_DISABLED=true（本地开发/测试）→ 保留旧 X-Actor-Id 行为
-    if (process.env.AUTH_DISABLED === 'true') {
-      const headerActor = req.headers['x-actor-id'];
-      if (typeof headerActor === 'string' && headerActor.trim().length > 0) {
-        return headerActor.trim();
-      }
-      const queryActor = urlObj.searchParams.get('actorId');
-      if (queryActor && queryActor.trim().length > 0) {
-        return queryActor.trim();
-      }
-      if (body && typeof body.actorUserId === 'string' && body.actorUserId.trim().length > 0) {
-        return body.actorUserId.trim();
-      }
-      return 'user-admin-01';
-    }
-    // F1：从会话 Cookie / Bearer token 提取 userId
+  private extractSessionToken(req: http.IncomingMessage): string | null {
     const cookieHeader = req.headers.cookie ?? '';
     const match = cookieHeader.match(/sdlc_session=([^\s;]+)/);
-    if (match) {
-      const user = this.sessionService.validate(match[1]);
-      if (user) {
-        return user.userId;
-      }
+    if (match && match[1]) {
+      return match[1];
     }
     const authHeader = req.headers.authorization;
     if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-      const user = this.sessionService.validate(authHeader.slice(7));
-      if (user) {
-        return user.userId;
+      const bearer = authHeader.slice(7).trim();
+      if (bearer.length > 0) {
+        return bearer;
       }
     }
-    return 'UNAUTHENTICATED';
+    return null;
+  }
+
+  private resolveAuthContext(
+    req: http.IncomingMessage,
+    urlObj: URL,
+    body: Record<string, unknown> | undefined,
+    rawToken: string | null,
+    sessionUser: AuthUserView | null,
+  ): ResolvedAuthContext {
+    if (rawToken) {
+      if (sessionUser) {
+        return {
+          actorUserId: sessionUser.userId,
+          user: sessionUser,
+          rawToken,
+          authSource: 'session',
+        };
+      }
+      return {
+        actorUserId: 'UNAUTHENTICATED',
+        user: null,
+        rawToken,
+        authSource: 'invalid_token',
+      };
+    }
+
+    if (process.env.AUTH_REQUIRED === 'true') {
+      return {
+        actorUserId: 'UNAUTHENTICATED',
+        user: null,
+        rawToken: null,
+        authSource: 'none',
+      };
+    }
+
+    const headerActor = req.headers['x-actor-id'];
+    const queryActor = urlObj.searchParams.get('actorId');
+    const bodyActor = body && typeof body.actorUserId === 'string' ? body.actorUserId : undefined;
+    const explicitId =
+      (typeof headerActor === 'string' && headerActor.trim()) ||
+      (queryActor && queryActor.trim()) ||
+      (bodyActor && bodyActor.trim()) ||
+      '';
+
+    if (explicitId) {
+      if (process.env.AUTH_DISABLED === 'true') {
+        return {
+          actorUserId: explicitId,
+          user: this.sessionService.getUserById(explicitId),
+          rawToken: null,
+          authSource: 'workbench_header',
+        };
+      }
+      if (this.orchestrator.rbacService.isUserActive(explicitId)) {
+        return {
+          actorUserId: explicitId,
+          user: this.sessionService.getUserById(explicitId),
+          rawToken: null,
+          authSource: 'workbench_header',
+        };
+      }
+      return {
+        actorUserId: 'UNAUTHENTICATED',
+        user: null,
+        rawToken: null,
+        authSource: 'workbench_header',
+      };
+    }
+
+    if (process.env.AUTH_DISABLED === 'true') {
+      return {
+        actorUserId: 'user-admin-01',
+        user: this.sessionService.getUserById('user-admin-01'),
+        rawToken: null,
+        authSource: 'none',
+      };
+    }
+
+    return {
+      actorUserId: 'UNAUTHENTICATED',
+      user: null,
+      rawToken: null,
+      authSource: 'none',
+    };
   }
 
   private broadcastSseStateUpdate(): void {
@@ -254,116 +337,7 @@ data: ${frame}
       }
     }
 
-    if (method === 'GET' && pathname === '/api/events/stream') {
-      const actorUserId = this.resolveActorUserId(req, urlObj);
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-      });
-      const initialState = this.orchestrator.buildWorkbenchDashboardState(
-        this.activeRunId,
-        actorUserId,
-      );
-      res.write(`event: state_updated\ndata: ${JSON.stringify(initialState)}\n\n`);
-      this.sseClients.set(res, actorUserId);
-      req.on('close', () => {
-        this.sseClients.delete(res);
-      });
-      return;
-    }
-
-    if (method === 'GET' && pathname === '/api/state') {
-      const actorUserId = this.resolveActorUserId(req, urlObj);
-      const requestedRunId = urlObj.searchParams.get('runId') ?? this.activeRunId;
-      this.activeRunId = requestedRunId;
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.sendJson(res, 200, { ok: true, data: state });
-      return;
-    }
-
-    if (method === 'POST' && pathname === '/api/runs/select') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
-      const targetRunId = String(body.runId ?? '').trim();
-      const runState = this.orchestrator.stateEngine.getRunOrThrow(targetRunId);
-      this.activeRunId = runState.runId;
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
-      this.sendJson(res, 200, { ok: true, data: state });
-      return;
-    }
-
-    if (method === 'GET' && pathname === '/api/workflows/templates') {
-      const templates = WorkflowDslLoader.listAvailableTemplates().map((t) => ({
-        fileName: t.fileName,
-      }));
-      this.sendJson(res, 200, {
-        ok: true,
-        data: {
-          activeTemplateFile: this.orchestrator.getWorkflowDslConfig().sourceFilePath,
-          templates,
-        },
-      });
-      return;
-    }
-
-    if (method === 'POST' && pathname === '/api/workflows/template') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
-      const templateFileName = String(body.templateFileName ?? 'enterprise_sdlc.yaml');
-      const available = WorkflowDslLoader.listAvailableTemplates();
-      const matched = available.find((t) => t.fileName === templateFileName);
-      if (!matched) {
-        throw new Error(`未找到指定的工作流 YAML 模板: ${templateFileName}`);
-      }
-      this.orchestrator.reloadWorkflowDsl(matched.fullPath);
-
-      const user = this.orchestrator.rbacService.getUserOrDefault(actorUserId);
-      const proposal = new ProjectProposalContract({
-        proposalId: `PROP-DSL-${Date.now()}`,
-        title:
-          templateFileName === 'backend_api_only.yaml'
-            ? '纯后端核心清算 API 研发（动态跳过 PD 阶段）'
-            : '企业级研发权限与智能工单协同模块（全栈 6 阶段）',
-        summary: `当前由声明式 YAML 模板 [${templateFileName}] 动态驱动阶段拓扑流转`,
-        requirements: {
-          REQ_CORE_API: '核心领域接口契约与幂等状态流转',
-          REQ_AUDIT_TRACE: '全链路不可变审计日志与负向经验检索',
-        },
-        involvesDatabaseMigration: false,
-        involvesPermissionOrPayment: false,
-      });
-
-      const runState = await this.orchestrator.startProposalWorkflow({
-        proposal,
-        initiatorActor: `${user.displayName} (${user.jobTitle})`,
-      });
-      this.activeRunId = runState.runId;
-
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
-      this.sendJson(res, 200, { ok: true, data: state });
-      return;
-    }
-
-    // ---- F1: 认证端点 ----
-    // ---- A4: 模型基线体检端点（admin-only）——两级端点各发 3 个固定 JSON 任务 ----
-    if (method === 'POST' && pathname === '/api/admin/model-baseline') {
-      const actorUserId = this.resolveActorUserId(req, urlObj, {});
-      if (process.env.AUTH_DISABLED !== 'true') {
-        const user = this.sessionService.getUserById(actorUserId);
-        if (!user || user.tier !== 'PROJECT_ADMIN') {
-          this.sendJson(res, 403, { ok: false, error: '仅项目管理员可执行模型体检' });
-          return;
-        }
-      }
-      const result = await this.orchestrator.modelRouter.runModelBaselineCheck();
-      this.sendJson(res, 200, { ok: true, data: result });
-      return;
-    }
-
-    // ---- I2: 健康检查（运维探针） ----
+    // ---- I2: 健康检查（运维探针，匿名放行） ----
     if (method === 'GET' && pathname === '/api/health') {
       this.sendJson(res, 200, {
         ok: true,
@@ -373,6 +347,7 @@ data: ${frame}
           sseClients: this.sseClients.size,
           persistenceDir: process.env.LOCAL_PERSISTENCE_DIR ?? '.runtime-data',
           authDisabled: process.env.AUTH_DISABLED === 'true',
+          authRequired: process.env.AUTH_REQUIRED === 'true',
           databaseUrl: process.env.DATABASE_URL ? 'configured' : 'json-file-mode',
           llmLiveHttp: process.env.LITELLM_ENABLE_LIVE_HTTP === 'true',
           uptimeSec: Math.round(process.uptime()),
@@ -381,11 +356,12 @@ data: ${frame}
       return;
     }
 
+    // ---- F1: 登录/登出端点（匿名放行） ----
     if (method === 'POST' && pathname === '/api/auth/login') {
-      const body = await this.readJsonBody(req);
+      const loginBody = await this.readJsonBody(req);
       const result = this.sessionService.login(
-        String(body.username ?? ''),
-        String(body.password ?? ''),
+        String(loginBody.username ?? ''),
+        String(loginBody.password ?? ''),
       );
       if (!result.ok) {
         const statusCode =
@@ -415,9 +391,9 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/auth/logout') {
-      const cookie = req.headers.cookie?.match(/sdlc_session=([^\s;]+)/);
-      if (cookie) {
-        this.sessionService.logout(cookie[1]);
+      const logoutToken = this.extractSessionToken(req);
+      if (logoutToken) {
+        this.sessionService.logout(logoutToken);
       }
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
@@ -427,37 +403,200 @@ data: ${frame}
       return;
     }
 
-    if (method === 'GET' && pathname === '/api/auth/me') {
-      const cookie = req.headers.cookie?.match(/sdlc_session=([^\s;]+)/);
-      const token =
-        cookie?.[1] ??
-        (req.headers.authorization?.startsWith('Bearer ')
-          ? req.headers.authorization.slice(7)
-          : '');
-      const user = token ? this.sessionService.validate(token) : null;
-      const impersonating = token ? this.sessionService.isImpersonating(token) : null;
-      if (!user) {
+    if (!pathname.startsWith('/api/')) {
+      this.sendJson(res, 404, { ok: false, error: `未知路由: ${method} ${pathname}` });
+      return;
+    }
+
+    // ---- F1: 全局 API 会话守卫与强制改密拦截 ----
+    const rawToken = this.extractSessionToken(req);
+    const sessionUser = rawToken ? this.sessionService.validate(rawToken) : null;
+    if (rawToken && !sessionUser) {
+      this.sendJson(res, 401, { ok: false, error: '会话已过期或令牌无效，请重新登录' });
+      return;
+    }
+    if (process.env.AUTH_REQUIRED === 'true') {
+      if (!sessionUser) {
         this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
         return;
       }
+      if (
+        sessionUser.mustChangePassword &&
+        pathname !== '/api/auth/me' &&
+        pathname !== '/api/auth/change-password'
+      ) {
+        this.sendJson(res, 403, {
+          ok: false,
+          error: '首次登录或重置口令后必须先修改密码',
+          mustChangePassword: true,
+        });
+        return;
+      }
+    }
+
+    const body = method === 'POST' || method === 'PATCH' ? await this.readJsonBody(req) : undefined;
+    const authCtx = this.resolveAuthContext(req, urlObj, body, rawToken, sessionUser);
+    const actorUserId = authCtx.actorUserId;
+
+    if (method === 'GET' && pathname === '/api/events/stream') {
+      const streamActorId =
+        process.env.AUTH_REQUIRED !== 'true' && authCtx.authSource === 'none'
+          ? 'user-admin-01'
+          : actorUserId;
+      if (streamActorId === 'UNAUTHENTICATED') {
+        this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+      });
+      const initialState = this.orchestrator.buildWorkbenchDashboardState(
+        this.activeRunId,
+        streamActorId,
+      );
+      res.write(`event: state_updated\ndata: ${JSON.stringify(initialState)}\n\n`);
+      this.sseClients.set(res, streamActorId);
+      req.on('close', () => {
+        this.sseClients.delete(res);
+      });
+      return;
+    }
+
+    if (method === 'GET' && pathname === '/api/state') {
+      const stateActorId =
+        process.env.AUTH_REQUIRED !== 'true' && authCtx.authSource === 'none'
+          ? 'user-admin-01'
+          : actorUserId;
+      if (stateActorId === 'UNAUTHENTICATED') {
+        this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
+        return;
+      }
+      const requestedRunId = urlObj.searchParams.get('runId') ?? this.activeRunId;
+      this.activeRunId = requestedRunId;
+      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, stateActorId);
+      this.sendJson(res, 200, { ok: true, data: state });
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/runs/select') {
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+        );
+      }
+      const targetRunId = String(body?.runId ?? '').trim();
+      const runState = this.orchestrator.stateEngine.getRunOrThrow(targetRunId);
+      this.activeRunId = runState.runId;
+      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
+      this.broadcastSseStateUpdate();
+      this.sendJson(res, 200, { ok: true, data: state });
+      return;
+    }
+
+    if (method === 'GET' && pathname === '/api/workflows/templates') {
+      const templates = WorkflowDslLoader.listAvailableTemplates().map((t) => ({
+        fileName: t.fileName,
+      }));
       this.sendJson(res, 200, {
         ok: true,
-        data: { user, impersonating },
+        data: {
+          activeTemplateFile: this.orchestrator.getWorkflowDslConfig().sourceFilePath,
+          templates,
+        },
+      });
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/workflows/template') {
+      const effectiveActorId =
+        process.env.AUTH_REQUIRED !== 'true' && authCtx.authSource === 'none'
+          ? 'user-admin-01'
+          : actorUserId;
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          effectiveActorId,
+          SystemPermissionCode.MANAGE_WORKFLOW_DSL_AND_GUARDRAILS,
+        );
+      }
+      const templateFileName = String(body?.templateFileName ?? 'enterprise_sdlc.yaml');
+      const available = WorkflowDslLoader.listAvailableTemplates();
+      const matched = available.find((t) => t.fileName === templateFileName);
+      if (!matched) {
+        throw new Error(`未找到指定的工作流 YAML 模板: ${templateFileName}`);
+      }
+      this.orchestrator.reloadWorkflowDsl(matched.fullPath);
+
+      const user = this.orchestrator.rbacService.getUserOrDefault(effectiveActorId);
+      const proposal = new ProjectProposalContract({
+        proposalId: `PROP-DSL-${Date.now()}`,
+        title:
+          templateFileName === 'backend_api_only.yaml'
+            ? '纯后端核心清算 API 研发（动态跳过 PD 阶段）'
+            : '企业级研发权限与智能工单协同模块（全栈 6 阶段）',
+        summary: `当前由声明式 YAML 模板 [${templateFileName}] 动态驱动阶段拓扑流转`,
+        requirements: {
+          REQ_CORE_API: '核心领域接口契约与幂等状态流转',
+          REQ_AUDIT_TRACE: '全链路不可变审计日志与负向经验检索',
+        },
+        involvesDatabaseMigration: false,
+        involvesPermissionOrPayment: false,
+      });
+
+      const runState = await this.orchestrator.startProposalWorkflow({
+        proposal,
+        initiatorActor: `${user.displayName} (${user.jobTitle})`,
+      });
+      this.activeRunId = runState.runId;
+
+      const state = this.orchestrator.buildWorkbenchDashboardState(
+        this.activeRunId,
+        effectiveActorId,
+      );
+      this.broadcastSseStateUpdate();
+      this.sendJson(res, 200, { ok: true, data: state });
+      return;
+    }
+
+    // ---- A4: 模型基线体检端点（admin-only）——两级端点各发 3 个固定 JSON 任务 ----
+    if (method === 'POST' && pathname === '/api/admin/model-baseline') {
+      if (process.env.AUTH_DISABLED !== 'true') {
+        const user = this.sessionService.getUserById(actorUserId);
+        if (!user || user.tier !== 'PROJECT_ADMIN' || user.status !== 'ACTIVE') {
+          this.sendJson(res, 403, { ok: false, error: '仅项目管理员可执行模型体检' });
+          return;
+        }
+      }
+      const result = await this.orchestrator.modelRouter.runModelBaselineCheck();
+      this.sendJson(res, 200, { ok: true, data: result });
+      return;
+    }
+
+    if (method === 'GET' && pathname === '/api/auth/me') {
+      if (authCtx.authSource !== 'session' || !authCtx.rawToken || !authCtx.user) {
+        this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
+        return;
+      }
+      const impersonating = this.sessionService.isImpersonating(authCtx.rawToken);
+      this.sendJson(res, 200, {
+        ok: true,
+        data: { user: authCtx.user, impersonating },
       });
       return;
     }
 
     if (method === 'POST' && pathname === '/api/auth/change-password') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
       if (actorUserId === 'UNAUTHENTICATED') {
         this.sendJson(res, 401, { ok: false, error: '未登录' });
         return;
       }
       const result = this.sessionService.changePassword(
         actorUserId,
-        String(body.oldPassword ?? ''),
-        String(body.newPassword ?? ''),
+        String(body?.oldPassword ?? ''),
+        String(body?.newPassword ?? ''),
+        authCtx.rawToken ?? undefined,
       );
       if (!result.ok) {
         this.sendJson(res, 400, { ok: false, error: result.reason });
@@ -468,16 +607,18 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/auth/act-as') {
-      const body = await this.readJsonBody(req);
-      const cookie = req.headers.cookie?.match(/sdlc_session=([^\s;]+)/);
-      const adminToken =
-        cookie?.[1] ??
-        (req.headers.authorization?.startsWith('Bearer ')
-          ? req.headers.authorization.slice(7)
-          : '');
-      const result = this.sessionService.actAs(adminToken, String(body.targetUserId ?? ''));
-      if (!result) {
+      if (
+        authCtx.authSource !== 'session' ||
+        !authCtx.rawToken ||
+        !authCtx.user ||
+        authCtx.user.tier !== 'PROJECT_ADMIN'
+      ) {
         this.sendJson(res, 403, { ok: false, error: '仅项目管理员可切换视角' });
+        return;
+      }
+      const result = this.sessionService.actAs(authCtx.rawToken, String(body?.targetUserId ?? ''));
+      if (!result) {
+        this.sendJson(res, 404, { ok: false, error: '目标成员不存在或已停用' });
         return;
       }
       res.writeHead(200, {
@@ -489,9 +630,8 @@ data: ${frame}
     }
 
     if (method === 'GET' && pathname === '/api/admin/users') {
-      const actorUserId = this.resolveActorUserId(req, urlObj);
       const user = this.sessionService.getUserById(actorUserId);
-      if (!user || user.tier !== 'PROJECT_ADMIN') {
+      if (!user || user.tier !== 'PROJECT_ADMIN' || user.status !== 'ACTIVE') {
         this.sendJson(res, 403, { ok: false, error: '仅项目管理员可查看成员列表' });
         return;
       }
@@ -499,20 +639,35 @@ data: ${frame}
       return;
     }
 
+    if (method === 'GET' && pathname === '/api/admin/login-audit') {
+      const user = this.sessionService.getUserById(actorUserId);
+      if (!user || user.tier !== 'PROJECT_ADMIN' || user.status !== 'ACTIVE') {
+        this.sendJson(res, 403, { ok: false, error: '仅项目管理员可查看登录审计' });
+        return;
+      }
+      const username = urlObj.searchParams.get('username') ?? undefined;
+      const limitParam = urlObj.searchParams.get('limit');
+      const limit = limitParam ? Number(limitParam) : 20;
+      const entries = this.sessionService.getLoginAudit({
+        username: username || undefined,
+        limit: Number.isFinite(limit) ? limit : 20,
+      });
+      this.sendJson(res, 200, { ok: true, data: { entries } });
+      return;
+    }
+
     if (method === 'POST' && pathname === '/api/admin/users') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
       const result = this.sessionService.createUser(actorUserId, {
-        username: String(body.username ?? ''),
-        displayName: String(body.displayName ?? ''),
-        jobTitle: body.jobTitle ? String(body.jobTitle) : undefined,
-        department: body.department ? String(body.department) : undefined,
-        tier: String(body.tier ?? 'STAGE_SPECIALIST'),
-        specialistDomain: String(body.specialistDomain ?? 'SOFTWARE_ENGINEERING'),
-        counterpartAgentRole: String(body.counterpartAgentRole ?? 'ENGINEER_AGENT'),
-        ownedStageIds: ((body.ownedStageIds as string[] | undefined) ?? []).map(String),
-        avatarBadge: body.avatarBadge ? String(body.avatarBadge) : undefined,
-        tempPassword: body.tempPassword ? String(body.tempPassword) : undefined,
+        username: String(body?.username ?? ''),
+        displayName: String(body?.displayName ?? ''),
+        jobTitle: body?.jobTitle ? String(body.jobTitle) : undefined,
+        department: body?.department ? String(body.department) : undefined,
+        tier: String(body?.tier ?? 'STAGE_SPECIALIST'),
+        specialistDomain: String(body?.specialistDomain ?? 'SOFTWARE_ENGINEERING'),
+        counterpartAgentRole: String(body?.counterpartAgentRole ?? 'ENGINEER_AGENT'),
+        ownedStageIds: ((body?.ownedStageIds as string[] | undefined) ?? []).map(String),
+        avatarBadge: body?.avatarBadge ? String(body.avatarBadge) : undefined,
+        tempPassword: body?.tempPassword ? String(body.tempPassword) : undefined,
       });
       if (!result.ok) {
         this.sendJson(res, result.reason === '用户名已存在' ? 409 : 403, {
@@ -529,19 +684,29 @@ data: ${frame}
     }
 
     if (method === 'PATCH' && pathname.startsWith('/api/admin/users/')) {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
       const targetUserId = pathname.split('/').pop() ?? '';
       const result = this.sessionService.updateUser(actorUserId, targetUserId, {
-        displayName: body.displayName ? String(body.displayName) : undefined,
-        jobTitle: body.jobTitle ? String(body.jobTitle) : undefined,
-        ownedStageIds: body.ownedStageIds
+        displayName: body?.displayName ? String(body.displayName) : undefined,
+        jobTitle: body?.jobTitle ? String(body.jobTitle) : undefined,
+        department: body?.department !== undefined ? String(body.department) : undefined,
+        tier:
+          body?.tier === 'PROJECT_ADMIN' || body?.tier === 'STAGE_SPECIALIST'
+            ? body.tier
+            : undefined,
+        ownedStageIds: body?.ownedStageIds
           ? ((body.ownedStageIds as string[] | undefined) ?? []).map(String)
           : undefined,
-        status: body.status ? (String(body.status) as 'ACTIVE' | 'DISABLED') : undefined,
+        status: body?.status ? (String(body.status) as 'ACTIVE' | 'DISABLED') : undefined,
       });
       if (!result.ok) {
-        this.sendJson(res, result.reason === '不能停用最后一个 ACTIVE 管理员' ? 409 : 403, {
+        const statusCode =
+          result.reason === '不能停用最后一个 ACTIVE 管理员' ||
+          result.reason === '不能降级最后一个 ACTIVE 管理员'
+            ? 409
+            : result.reason === '目标用户不存在'
+              ? 404
+              : 403;
+        this.sendJson(res, statusCode, {
           ok: false,
           error: result.reason,
         });
@@ -556,8 +721,6 @@ data: ${frame}
       pathname.startsWith('/api/admin/users/') &&
       pathname.endsWith('/reset-password')
     ) {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
       const targetUserId = pathname.split('/')[4];
       const result = this.sessionService.resetPassword(actorUserId, targetUserId);
       if (!result) {
@@ -569,10 +732,14 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/proposals') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
-      const user = this.orchestrator.rbacService.getUserOrDefault(actorUserId);
-      const preset = String(body.preset ?? 'CONFLICT_AND_DDL');
+      const user =
+        process.env.AUTH_DISABLED === 'true'
+          ? this.orchestrator.rbacService.getUserOrDefault(actorUserId)
+          : this.orchestrator.rbacService.assertHasPermission(
+              actorUserId,
+              SystemPermissionCode.CREATE_PROPOSAL,
+            );
+      const preset = String(body?.preset ?? 'CONFLICT_AND_DDL');
 
       let proposal: ProjectProposalContract;
       let scenarioHints: ScenarioHints = {};
@@ -580,9 +747,9 @@ data: ${frame}
       // J1：演示开关已迁出提案契约，由 preset 映射为 ScenarioHints（运行元数据）
 
       if (preset === 'CUSTOM') {
-        const customTitle = String(body.title ?? '').trim();
-        const customSummary = String(body.summary ?? '').trim() || customTitle;
-        const rawReqs = (body.requirements as Record<string, string> | undefined) ?? {};
+        const customTitle = String(body?.title ?? '').trim();
+        const customSummary = String(body?.summary ?? '').trim() || customTitle;
+        const rawReqs = (body?.requirements as Record<string, string> | undefined) ?? {};
         const cleanReqs: Record<string, string> = {};
         for (const [k, v] of Object.entries(rawReqs)) {
           if (k.trim() && String(v).trim()) {
@@ -599,12 +766,12 @@ data: ${frame}
           title: customTitle,
           summary: customSummary,
           requirements: cleanReqs,
-          involvesDatabaseMigration: Boolean(body.involvesDatabaseMigration),
-          involvesPermissionOrPayment: Boolean(body.involvesPermissionOrPayment),
+          involvesDatabaseMigration: Boolean(body?.involvesDatabaseMigration),
+          involvesPermissionOrPayment: Boolean(body?.involvesPermissionOrPayment),
         });
         scenarioHints = {
-          forceNegotiationDeadlock: Boolean(body.simulateNegotiationConflict),
-          forceScopeReduction: Boolean(body.simulateScopeReductionAttempt),
+          forceNegotiationDeadlock: Boolean(body?.simulateNegotiationConflict),
+          forceScopeReduction: Boolean(body?.simulateScopeReductionAttempt),
         };
       } else if (preset === 'LOW_RISK_FAST_TRACK') {
         proposal = new ProjectProposalContract({
@@ -649,9 +816,9 @@ data: ${frame}
         scenarioHints = { forceNegotiationDeadlock: true, forceTransientRetry: true };
         proposal = new ProjectProposalContract({
           proposalId: `PROP-FULL-${Date.now()}`,
-          title: String(body.title ?? '企业级研发权限与智能工单协同模块'),
+          title: String(body?.title ?? '企业级研发权限与智能工单协同模块'),
           summary: String(
-            body.summary ??
+            body?.summary ??
               '包含 PM-PD 3轮协商熔断裁决、Stage 3a 数据库 DDL 高风险门禁与 Stage 4 QA 终审',
           ),
           requirements: {
@@ -666,7 +833,7 @@ data: ${frame}
 
       const runState = await this.orchestrator.startProposalWorkflow({
         proposal,
-        initiatorActor: String(body.initiatorActor ?? `${user.displayName} (${user.jobTitle})`),
+        initiatorActor: String(body?.initiatorActor ?? `${user.displayName} (${user.jobTitle})`),
         scenarioHints,
       });
       this.activeRunId = runState.runId;
@@ -678,13 +845,17 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/decisions') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
-      const snapshotId = String(body.snapshotId ?? '');
-      const verdict = String(body.verdict ?? DecisionVerdict.APPROVE) as DecisionVerdict;
-      const reviewerActor = String(body.reviewerActor ?? '领域专家审核员');
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.APPROVE_ASSIGNED_STAGE_GATE,
+        );
+      }
+      const snapshotId = String(body?.snapshotId ?? '');
+      const verdict = String(body?.verdict ?? DecisionVerdict.APPROVE) as DecisionVerdict;
+      const reviewerActor = String(body?.reviewerActor ?? '领域专家审核员');
       const comment = String(
-        body.comment ?? '经人工交叉核验，当前阶段 Agent 契约产出符合质量标准，准予放行',
+        body?.comment ?? '经人工交叉核验，当前阶段 Agent 契约产出符合质量标准，准予放行',
       );
 
       await this.orchestrator.submitHumanGateDecision({
@@ -703,15 +874,20 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/supervisor/rollback') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.INVOKE_SUPERVISOR_ROLLBACK,
+        );
+      }
       const dialogueInstruction = String(
-        body.dialogueInstruction ?? '回退到 PD Agent，将弹窗改为双栏折叠侧边抽屉并重新执行下游阶段',
+        body?.dialogueInstruction ??
+          '回退到 PD Agent，将弹窗改为双栏折叠侧边抽屉并重新执行下游阶段',
       );
-      const explicitTargetStageId = body.targetStageId
+      const explicitTargetStageId = body?.targetStageId
         ? (String(body.targetStageId) as WorkflowStageId)
         : undefined;
-      const humanActor = String(body.humanActor ?? '项目总负责人');
+      const humanActor = String(body?.humanActor ?? '项目总负责人');
 
       await this.orchestrator.invokeSupervisorConversationalRollback({
         runId: this.activeRunId,
@@ -728,10 +904,14 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/comments') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
-      const stageId = String(body.stageId ?? WorkflowStageId.STAGE_1_PM) as WorkflowStageId;
-      const content = String(body.content ?? '').trim();
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+        );
+      }
+      const stageId = String(body?.stageId ?? WorkflowStageId.STAGE_1_PM) as WorkflowStageId;
+      const content = String(body?.content ?? '').trim();
       if (!content) {
         throw new Error('评论内容不能为空');
       }
@@ -748,6 +928,12 @@ data: ${frame}
     }
 
     if (method === 'GET' && pathname === '/api/sandbox/file') {
+      if (process.env.AUTH_DISABLED !== 'true' && authCtx.authSource !== 'none') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+        );
+      }
       const runState = this.orchestrator.stateEngine.getRunOrThrow(this.activeRunId);
       const workspacePath = this.orchestrator.sandboxManager.resolveWorkspacePath(
         runState.runId,
@@ -771,8 +957,12 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/sandbox/verify') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.EXECUTE_SANDBOX_VERIFICATION,
+        );
+      }
       const runState = this.orchestrator.stateEngine.getRunOrThrow(this.activeRunId);
       const verifyResult = this.orchestrator.sandboxManager.executeSandboxVerification({
         runId: runState.runId,
@@ -793,9 +983,16 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/rag/query') {
-      const body = await this.readJsonBody(req);
-      const stageId = String(body.stageId ?? WorkflowStageId.STAGE_3A_TECH_SPEC) as WorkflowStageId;
-      const queryText = String(body.queryText ?? '').trim();
+      if (process.env.AUTH_DISABLED !== 'true' && authCtx.authSource !== 'none') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+        );
+      }
+      const stageId = String(
+        body?.stageId ?? WorkflowStageId.STAGE_3A_TECH_SPEC,
+      ) as WorkflowStageId;
+      const queryText = String(body?.queryText ?? '').trim();
       const matches = await this.orchestrator.auditLedger.ragEngine.retrieveTopKSimilarLessons({
         stageId,
         queryText,
@@ -806,11 +1003,17 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/rag/ingest') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
-      const user = this.orchestrator.rbacService.getUserOrDefault(actorUserId);
-      const stageId = String(body.stageId ?? WorkflowStageId.STAGE_3A_TECH_SPEC) as WorkflowStageId;
-      const rawLesson = String(body.lessonText ?? '').trim();
+      const user =
+        process.env.AUTH_DISABLED === 'true'
+          ? this.orchestrator.rbacService.getUserOrDefault(actorUserId)
+          : this.orchestrator.rbacService.assertHasPermission(
+              actorUserId,
+              SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+            );
+      const stageId = String(
+        body?.stageId ?? WorkflowStageId.STAGE_3A_TECH_SPEC,
+      ) as WorkflowStageId;
+      const rawLesson = String(body?.lessonText ?? '').trim();
       if (!rawLesson) {
         throw new Error('避坑经验内容不能为空');
       }
@@ -825,18 +1028,22 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/admin/governance') {
-      const body = await this.readJsonBody(req);
-      const actorUserId = this.resolveActorUserId(req, urlObj, body);
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.MANAGE_WORKFLOW_DSL_AND_GUARDRAILS,
+        );
+      }
       this.orchestrator.updateAdminGovernanceConfig({
         actorUserId,
         maxNegotiationTurns:
-          body.maxNegotiationTurns !== undefined ? Number(body.maxNegotiationTurns) : undefined,
+          body?.maxNegotiationTurns !== undefined ? Number(body.maxNegotiationTurns) : undefined,
         highRiskScoreThreshold:
-          body.highRiskScoreThreshold !== undefined
+          body?.highRiskScoreThreshold !== undefined
             ? Number(body.highRiskScoreThreshold)
             : undefined,
         allowSpecialistCrossStageRollback:
-          body.allowSpecialistCrossStageRollback !== undefined
+          body?.allowSpecialistCrossStageRollback !== undefined
             ? Boolean(body.allowSpecialistCrossStageRollback)
             : undefined,
       });

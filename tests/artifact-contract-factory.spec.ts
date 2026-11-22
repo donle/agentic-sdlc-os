@@ -98,9 +98,7 @@ describe('A1 — ArtifactContractFactory 边界测试', () => {
     assert.equal(result.ok, true);
   });
 
-  it('7. QA 契约 allAcceptanceCriteriaMet=true 但 failedCases > 0 → 由 Agent 层校验拦截（反谎报）', () => {
-    // 注意：契约本身不做 cross-field 校验，由 AbstractWorkerAgent/QA prompt 约束
-    // 此测试确认 QA 契约可正确反序列化（谎报防护在 A1 层的 QA prompt 中声明）
+  it('7. QA 契约 allAcceptanceCriteriaMet=true 但 failedCases > 0 → 契约完整性校验拦截（反谎报）', () => {
     const qa = {
       summary: '全通过',
       coreRequirementIds: ['R1'],
@@ -112,6 +110,12 @@ describe('A1 — ArtifactContractFactory 边界测试', () => {
     };
     const result = ArtifactContractFactory.parse(WorkflowStageId.STAGE_4_QA, qa);
     assert.equal(result.ok, true);
+    const validation = result.artifact!.validateContractIntegrity();
+    assert.equal(
+      validation.isValid(),
+      false,
+      'passedCases < totalCases 时谎报 allAcceptanceCriteriaMet=true 必须被契约校验拦截',
+    );
   });
 
   it('8. 序列化/反序列化 round-trip（D1 启动恢复）', () => {

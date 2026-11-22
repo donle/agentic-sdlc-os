@@ -24,7 +24,10 @@ import { AgentRole, ModelRoutingTier, WorkflowStageId } from '../domain/enums.ts
 import { WorkflowEventBus } from '../patterns/EventBus.ts';
 import { FalseConsensusGuard } from '../patterns/FalseConsensusGuard.ts';
 import { ModelRouterGateway } from '../patterns/ModelRouterGateway.ts';
-import { GitWorktreeSandboxManager } from '../sandbox/GitWorktreeSandboxManager.ts';
+import {
+  GitWorktreeSandboxManager,
+  type SandboxVerificationResult,
+} from '../sandbox/GitWorktreeSandboxManager.ts';
 import { IntentFulfillmentTracker } from '../telemetry/IntentFulfillmentTracker.ts';
 import { PromptCacheManager } from '../telemetry/PromptCacheManager.ts';
 import {
@@ -35,6 +38,12 @@ import {
 
 export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArtifactContract> {
   private readonly sandboxManager: GitWorktreeSandboxManager;
+  private lastPreparedVerification: {
+    readonly key: string;
+    readonly reqIds: ReadonlyArray<string>;
+    readonly verification: SandboxVerificationResult;
+    readonly forceQaFailure: boolean;
+  } | null = null;
 
   public constructor(deps: {
     eventBus: WorkflowEventBus;
@@ -63,10 +72,17 @@ export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArt
     );
   }
 
-  protected override synthesizeTemplateArtifact(
-    context: AgentExecutionInputContext,
-    _attemptIndex: number,
-  ): QaVerificationArtifactContract {
+  private ensureSandboxVerified(context: AgentExecutionInputContext): {
+    readonly key: string;
+    readonly reqIds: ReadonlyArray<string>;
+    readonly verification: SandboxVerificationResult;
+    readonly forceQaFailure: boolean;
+  } {
+    const key = `${context.runId}::${context.branchId}::${context.humanFeedbackDirective ?? ''}`;
+    if (this.lastPreparedVerification && this.lastPreparedVerification.key === key) {
+      return this.lastPreparedVerification;
+    }
+
     const upstreamCode = context.upstreamArtifacts.get(WorkflowStageId.STAGE_3B_ENGINEER) as
       CodeImplementationArtifactContract | undefined;
 
@@ -74,7 +90,7 @@ export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArt
       ? upstreamCode.coreRequirementIds
       : context.proposal.coreRequirementIds;
 
-    // E2：真实执行 node:test 并解析计数/覆盖率（不再使用硬编码套件与覆盖率）
+    // E2/E3：真实执行 node:test / Docker 容器并解析计数/覆盖率
     const verification = this.sandboxManager.executeSandboxVerification({
       runId: context.runId,
       branchId: context.branchId,
@@ -82,9 +98,82 @@ export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArt
       runSubprocessNodeTest: true,
     });
 
-    const totalCases = verification.totalTestCases;
-    // J1 演示开关：强制 QA 失败（驱动 B2 Engineer 修复闭环的可测试路径）
     const forceQaFailure = context.scenarioHints?.forceQaFailure === true;
+    this.lastPreparedVerification = { key, reqIds, verification, forceQaFailure };
+    return this.lastPreparedVerification;
+  }
+
+  /**
+   * A1 + E2/E3 闭环：在进入 LLM 推理前先执行真实沙箱 node:test / Docker 测试与静态安全扫描，
+   * 并将真实测试套件结果注入 Prompt 的 sandboxVerification 字段（对齐 StagePromptSpecs 声明）。
+   */
+  protected override prepareStageEnvironment(
+    context: AgentExecutionInputContext,
+  ): Record<string, unknown> {
+    const { verification, forceQaFailure } = this.ensureSandboxVerified(context);
+    const effectiveSecurityIssues = forceQaFailure
+      ? verification.securityIssuesFound + 1
+      : verification.securityIssuesFound;
+    return {
+      filesVerifiedCount: verification.filesVerifiedCount,
+      totalTestCases: verification.totalTestCases,
+      passedTestCases: verification.passedTestCases,
+      failedTestCases: verification.failedTestCases,
+      coveragePercent: verification.coveragePercent,
+      securityIssuesFound: effectiveSecurityIssues,
+      allAcceptanceCriteriaMet:
+        verification.failedTestCases === 0 && effectiveSecurityIssues === 0 && !forceQaFailure,
+      runtime: verification.runtime,
+      suites: verification.suites.map((suite) => ({
+        suiteName: suite.suiteName,
+        totalCases: suite.totalCases,
+        passedCases: suite.passedCases,
+        failedCases: suite.failedCases,
+        coveragePercent: suite.coveragePercent ?? 0,
+      })),
+    };
+  }
+
+  /**
+   * 防 LLM 谎报校验：对比真实沙箱测试结果与 LLM 输出的 QaVerificationArtifactContract，
+   * 若真实沙箱存在失败单测或安全漏洞但 LLM 谎报 allAcceptanceCriteriaMet=true，直接产生违规触发 A2 自愈重试。
+   */
+  protected override validateStageSpecificConstraints(
+    candidate: QaVerificationArtifactContract,
+    context: AgentExecutionInputContext,
+  ): ReadonlyArray<string> {
+    const key = `${context.runId}::${context.branchId}::${context.humanFeedbackDirective ?? ''}`;
+    if (!this.lastPreparedVerification || this.lastPreparedVerification.key !== key) {
+      return [];
+    }
+    const { verification, forceQaFailure } = this.lastPreparedVerification;
+    const effectiveSecurityIssues = forceQaFailure
+      ? verification.securityIssuesFound + 1
+      : verification.securityIssuesFound;
+    const realHasFailure =
+      verification.failedTestCases > 0 || effectiveSecurityIssues > 0 || forceQaFailure;
+
+    const violations: string[] = [];
+    if (realHasFailure && candidate.allAcceptanceCriteriaMet) {
+      violations.push(
+        `QA 真实沙箱验证未通过（失败单测 ${verification.failedTestCases} 条，高危安全漏洞 ${effectiveSecurityIssues} 个），allAcceptanceCriteriaMet 严禁谎报为 true`,
+      );
+    }
+    if (effectiveSecurityIssues > 0 && candidate.securityIssuesFound < effectiveSecurityIssues) {
+      violations.push(
+        `QA 真实沙箱扫描发现 ${effectiveSecurityIssues} 个高危安全漏洞，报告不得瞒报（当前填报 ${candidate.securityIssuesFound}）`,
+      );
+    }
+    return violations;
+  }
+
+  protected override synthesizeTemplateArtifact(
+    context: AgentExecutionInputContext,
+    _attemptIndex: number,
+  ): QaVerificationArtifactContract {
+    const { reqIds, verification, forceQaFailure } = this.ensureSandboxVerified(context);
+
+    const totalCases = verification.totalTestCases;
     const coverageText =
       verification.coveragePercent !== null
         ? `，平均行覆盖率 ${verification.coveragePercent}%`

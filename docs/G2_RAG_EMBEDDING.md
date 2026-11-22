@@ -12,9 +12,9 @@
 
 ### 1. 引擎双路径（`src/engine/NegativeExperienceRagEngine.ts`）
 
-| 路径 | 触发条件 | 行为 |
-| :--- | :--- | :--- |
-| **哈希降级（同步）** | 始终先行 | `ingestRejectionLesson` 同步计算 1536 维哈希向量立即落库（零延迟、零依赖，M7 兼容） |
+| 路径                       | 触发条件                       | 行为                                                                                        |
+| :------------------------- | :----------------------------- | :------------------------------------------------------------------------------------------ |
+| **哈希降级（同步）**       | 始终先行                       | `ingestRejectionLesson` 同步计算 1536 维哈希向量立即落库（零延迟、零依赖，M7 兼容）         |
 | **真实 embedding（后台）** | 构造注入了 `EmbeddingProvider` | 后台**串行队列**逐条调用真实 embedding 替换向量；失败保持哈希并标记 `needsReembedding=true` |
 
 - 维度统一为 **1536**（与 PG `vector(1536)` 对齐；哈希投影桶数同步扩大）。
@@ -39,14 +39,17 @@
 ### 4. PG 同步（D2 联动）
 
 `deploy/init-pgvector-schema.sql`：`rejected_history_rag.embedding vector(64)` → `vector(1536)`。
-`PgPersistenceDriver` 的向量字面量生成是维度无关的（`[${embedding.join(',')}]`），无需改动。
+`PgPersistenceDriver` 的向量字面量生成是维度无关的（`[${embedding.join(',')}]`），但现行 PG 同步存在两项实操边界需注意：
+
+1. **升级后向量尚未回写已有 PG 行**：`PersistenceRepository` 与 `PgPersistenceDriver` 对 `rejected_history_rag` 均生成 `INSERT ... ON CONFLICT (id) DO NOTHING`，因此后台队列把哈希记录升级为 `REAL_EMBEDDING` 后不会覆写已落 PG 的旧哈希向量（且 `PgPersistenceDriver` 本身尚未接线，见 `BACKEND_TODO.md` §五 `#8`）。
+2. **模型默认维度需与建表维度一致**：`ModelRouterGateway` 默认 `EMBEDDING_MODEL` 为 `'bge-m3-local'`（1024 维），若对接真实 PG `vector(1536)` 列，需保证部署模型输出维度与建表维度一致（否则写入报错）。
 
 ## 边界处理
 
 1. **provider 缺席（离线单机）**：全部哈希路径，行为与 M7 时代完全一致，`needsReembedding` 恒 false（哈希即该环境的目标形态，不产生噪音标记）。
 2. **升级失败**（端点不可达/返回 null）：保持哈希向量 + `needsReembedding=true`，队列链条不断（单条失败不影响后续）。
 3. **升级只替换向量**，不动脱敏文本（`desensitizedLesson`）与审计字段。
-4. **D1 恢复防双计**：`restoreRecord` 不触发观察者/WAL 重放的既有契约不变；升级只改内存对象。
+4. **D1 恢复防双计**：`restoreRecord` 不触发观察者/WAL 重放的既有契约不变；升级仅先改内存对象，直到下次 `syncPersistenceState()` 调用时才会写入 `ledger-store.json`。
 5. `flushPendingEmbeddingUpgrades()` 供测试与优雅关停等待队列排空。
 
 ## 验证（tests/persistence-rag.spec.ts，5 项）
@@ -57,8 +60,9 @@
 4. 恢复的旧格式记录自动入升级队列（跨重启收敛）
 5. 持久化 round-trip + pgvector SQL 脚本生成（原 test 2 不变，仍通过）
 
-**测试基线**：98 项（94 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。
+**完成时测试基线**：98 项（94 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
 
 ## 遗留
 
 - 已有 `needsReembedding` 记录的重试调度（当前仅在恢复/新沉淀时入队；可用定时任务兜底，暂无必要）。
+- PG `rejected_history_rag` 的 `ON CONFLICT` 更新语义与模型输出维度对齐（随 `#8`/`#14` 真实 PG 联调一并完善）。

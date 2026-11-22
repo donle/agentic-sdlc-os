@@ -18,7 +18,11 @@
  * ============================================================================
  */
 
-import { TechSpecArtifactContract, UiDesignArtifactContract } from '../domain/contracts.ts';
+import {
+  containsPlaceholderText,
+  TechSpecArtifactContract,
+  UiDesignArtifactContract,
+} from '../domain/contracts.ts';
 import {
   AgentRole,
   BusinessRiskLevel,
@@ -63,6 +67,59 @@ export class TechLeadAgent extends AbstractWorkerAgent<TechSpecArtifactContract>
         : '制定无破坏性变更的面向对象模块契约与 API 接口规范',
       0.98,
     );
+  }
+
+  private static readonly VALID_HTTP_METHODS = new Set([
+    'GET',
+    'POST',
+    'PUT',
+    'PATCH',
+    'DELETE',
+    'HEAD',
+    'OPTIONS',
+  ]);
+  private static readonly VALID_DDL_PREFIX =
+    /^(?:CREATE|ALTER|DROP|COMMENT|TRUNCATE|GRANT|REVOKE)\b/i;
+
+  protected override validateStageSpecificConstraints(
+    candidate: TechSpecArtifactContract,
+    context: AgentExecutionInputContext,
+  ): ReadonlyArray<string> {
+    const violations: string[] = [];
+    if (containsPlaceholderText(candidate.summary, true)) {
+      violations.push('技术架构 summary 不得为空或包含 TBD/待定 等未完成占位词');
+    }
+    for (const api of candidate.apiContracts) {
+      const upperMethod = api.method.trim().toUpperCase();
+      if (!TechLeadAgent.VALID_HTTP_METHODS.has(upperMethod)) {
+        violations.push(`API [${api.endpoint || '(空)'}] 的 HTTP 方法非法 [${api.method}]`);
+      }
+      if (!api.endpoint.trim().startsWith('/')) {
+        violations.push(`API endpoint [${api.endpoint}] 必须以 "/" 开头`);
+      }
+      if (
+        containsPlaceholderText(api.requestSchema) ||
+        containsPlaceholderText(api.responseSchema)
+      ) {
+        violations.push(`API [${api.endpoint}] 的请求或响应 Schema 包含占位符`);
+      }
+    }
+    for (const ddl of candidate.databaseDdlStatements) {
+      const trimmedDdl = ddl.trim();
+      if (containsPlaceholderText(trimmedDdl)) {
+        violations.push(`DDL 语句 [${trimmedDdl}] 包含未完成占位符`);
+      } else if (!TechLeadAgent.VALID_DDL_PREFIX.test(trimmedDdl)) {
+        violations.push(`DDL 语句 [${trimmedDdl}] 缺少合法 SQL DDL 动词 (CREATE/ALTER/DROP 等)`);
+      }
+    }
+    const requiresElevatedRisk =
+      context.proposal.involvesDatabaseMigration ||
+      context.proposal.involvesPermissionOrPayment ||
+      candidate.databaseDdlStatements.length > 0;
+    if (requiresElevatedRisk && candidate.declaredRiskLevel === BusinessRiskLevel.LOW) {
+      violations.push('提案涉及数据库迁移或权限/支付核心域时，declaredRiskLevel 不得低报为 LOW');
+    }
+    return violations;
   }
 
   protected override synthesizeTemplateArtifact(

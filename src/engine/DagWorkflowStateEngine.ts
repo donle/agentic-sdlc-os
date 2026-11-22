@@ -42,6 +42,7 @@ export class WorkflowRunState {
   private currentStageIndex: number;
   private runStatus: WorkflowRunStatus;
   private pendingRollbackDirective: string | null;
+  private readonly tokenBudget: number;
   private tokensUsedTotal = 0;
   private readonly allSnapshots: StageSnapshotMemento[];
   private readonly branchHistory: string[];
@@ -54,6 +55,7 @@ export class WorkflowRunState {
     workflowTemplateId?: string;
     createdAtIso?: string;
     scenarioHints?: ScenarioHints;
+    tokenBudget?: number;
   }) {
     this.runId = params.runId;
     this.proposal = params.proposal;
@@ -61,6 +63,10 @@ export class WorkflowRunState {
     this.workflowTemplateId = params.workflowTemplateId ?? 'enterprise_standard_sdlc_v1';
     this.createdAtIso = params.createdAtIso ?? new Date().toISOString();
     this.scenarioHints = params.scenarioHints ?? {};
+    this.tokenBudget =
+      typeof params.tokenBudget === 'number' && Number.isFinite(params.tokenBudget)
+        ? Math.floor(params.tokenBudget)
+        : 120000;
     this.stagePipeline = params.stagePipeline
       ? [...params.stagePipeline]
       : [...STANDARD_STAGE_PIPELINE];
@@ -129,6 +135,7 @@ export class WorkflowRunState {
     branchHistory: string[];
     tokensUsedTotal: number;
     status: string;
+    autoRepairCounts?: Record<string, number>;
   }): void {
     this.activeBranchId = params.activeBranchId;
     this.currentStageIndex = params.currentStageIndex;
@@ -139,14 +146,34 @@ export class WorkflowRunState {
     }
     this.tokensUsedTotal = params.tokensUsedTotal;
     this.runStatus = params.status as WorkflowRunStatus;
+    this.autoRepairCounts.clear();
+    if (params.autoRepairCounts) {
+      for (const [key, count] of Object.entries(params.autoRepairCounts)) {
+        if (typeof count === 'number' && Number.isFinite(count) && count >= 0) {
+          this.autoRepairCounts.set(key, Math.floor(count));
+        }
+      }
+    }
   }
 
   public getTokensUsedTotal(): number {
     return this.tokensUsedTotal;
   }
 
+  public getTokenBudget(): number {
+    return this.tokenBudget;
+  }
+
   /** B2：每类自动修复闭环的已尝试次数（防死循环；key 如 QA_TO_ENG） */
   private readonly autoRepairCounts = new Map<string, number>();
+
+  public getAutoRepairCountsRecord(): Record<string, number> {
+    const record: Record<string, number> = {};
+    for (const [key, count] of this.autoRepairCounts.entries()) {
+      record[key] = count;
+    }
+    return record;
+  }
 
   public recordAutoRepair(key: string): number {
     const next = (this.autoRepairCounts.get(key) ?? 0) + 1;
@@ -309,6 +336,7 @@ export class DagWorkflowStateEngine {
     stagePipeline?: ReadonlyArray<WorkflowStageId>;
     workflowTemplateId?: string;
     scenarioHints?: ScenarioHints;
+    tokenBudget?: number;
   }): WorkflowRunState {
     const runState = new WorkflowRunState(params);
     this.runs.set(runState.runId, runState);

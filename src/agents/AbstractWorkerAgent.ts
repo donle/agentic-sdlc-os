@@ -28,7 +28,7 @@ import { FalseConsensusGuard } from '../patterns/FalseConsensusGuard.ts';
 import { ModelRouterGateway } from '../patterns/ModelRouterGateway.ts';
 import { ArtifactContractFactory } from './deserialize/ArtifactContractFactory.ts';
 import { JsonExtractor } from './prompt/JsonExtractor.ts';
-import { STAGE_PROMPT_SPECS } from './prompt/StagePromptSpecs.ts';
+import { computePromptSpecHash, STAGE_PROMPT_SPECS } from './prompt/StagePromptSpecs.ts';
 import {
   IntentExecutionTraceRecord,
   IntentFulfillmentTracker,
@@ -187,8 +187,11 @@ export abstract class AbstractWorkerAgent<
   protected readonly falseConsensusGuard: FalseConsensusGuard;
   protected readonly maxExecutionRetries: number;
   protected contextRegistry: ToolRegistry | null = null;
-  /** A4：上次同阶段 LLM 顺带输出的意图（缓存键依赖同步签名，避免单独一次 LLM 往返） */
-  private lastLlmIntent: RecognizedStageIntent | null = null;
+  /**
+   * A4：按需求集合与回退指令签名隔离的 LLM 意图缓存
+   * （同构需求跨 run 复用零额外 LLM 往返；不同业务提案互不串味，回落子类规则兜底）
+   */
+  private readonly llmIntentByScope = new Map<string, RecognizedStageIntent>();
 
   protected constructor(params: {
     role: AgentRole;
@@ -218,20 +221,37 @@ export abstract class AbstractWorkerAgent<
   }
 
   /**
-   * A4：意图解析入口（同步签名，缓存键依赖）——优先复用上次同阶段 LLM 顺带输出的 `__intent`，
-   * 无缓存/离线时回落到子类规则实现（M5 兜底）。
+   * 计算意图缓存的作用域签名（阶段 + 核心需求 ID/描述 + 回退指令），防止不同业务提案跨 run 污染意图
+   */
+  private buildIntentScopeSignature(context: AgentExecutionInputContext): string {
+    const reqPart = Object.entries(context.proposal.requirementDescriptions)
+      .sort(([idA], [idB]) => idA.localeCompare(idB))
+      .map(([id, desc]) => `${id}:${desc.trim()}`)
+      .join('|');
+    const directive = (context.humanFeedbackDirective ?? '').trim();
+    return `${this.stageId}::${reqPart}::${directive}`;
+  }
+
+  /**
+   * A4：意图解析入口（同步签名，缓存键依赖）——优先复用同需求作用域下 LLM 顺带输出的 `__intent`，
+   * 无匹配缓存/离线时回落到子类规则实现（M5 兜底）。
    */
   private resolveStageIntent(context: AgentExecutionInputContext): RecognizedStageIntent {
-    if (this.lastLlmIntent) {
-      return this.lastLlmIntent;
+    const scopeKey = this.buildIntentScopeSignature(context);
+    const cached = this.llmIntentByScope.get(scopeKey);
+    if (cached) {
+      return cached;
     }
     return this.recognizeStageIntent(context);
   }
 
   /**
-   * A4：从 LLM 主输出的 JSON 顶层捕获 `__intent` 并缓存（校验失败静默忽略 → 继续用规则意图）。
+   * A4：从 LLM 主输出的 JSON 顶层捕获 `__intent` 并按需求作用域缓存（校验失败静默忽略 → 继续用规则意图）。
    */
-  private captureLlmIntent(raw: Record<string, unknown>): void {
+  private captureLlmIntent(
+    raw: Record<string, unknown>,
+    context: AgentExecutionInputContext,
+  ): void {
     const intent = raw['__intent'] as
       { intentCode?: unknown; intentDescription?: unknown; confidenceScore?: unknown } | undefined;
     if (!intent || typeof intent.intentCode !== 'string' || intent.intentCode.trim().length === 0) {
@@ -247,10 +267,14 @@ export abstract class AbstractWorkerAgent<
       intent.confidenceScore <= 1
         ? intent.confidenceScore
         : 0.99;
-    this.lastLlmIntent = new RecognizedStageIntent(
-      intent.intentCode.trim().slice(0, 64),
-      description.slice(0, 120),
-      confidence,
+    const scopeKey = this.buildIntentScopeSignature(context);
+    this.llmIntentByScope.set(
+      scopeKey,
+      new RecognizedStageIntent(
+        intent.intentCode.trim().slice(0, 64),
+        description.slice(0, 120),
+        confidence,
+      ),
     );
   }
 
@@ -261,6 +285,7 @@ export abstract class AbstractWorkerAgent<
     context: AgentExecutionInputContext,
   ): Promise<AgentExecutionOutcome<TArtifact>> {
     const endpoint = this.modelRouter.resolveEndpoint(this.modelTier);
+    const promptSpecHash = computePromptSpecHash(this.stageId);
 
     // 步骤 1 & 2：意图识别并向前端实时广播交互状态
     const recognizedIntent = this.resolveStageIntent(context);
@@ -274,7 +299,7 @@ export abstract class AbstractWorkerAgent<
       },
     );
 
-    // 步骤 3：双层缓存检索（L1 精确签名 + L2 语义意图向量，G1）
+    // 步骤 3：双层缓存检索（L1 精确签名 + L2 语义意图向量；Pillar 2 跨模型防质量倒挂 + 向量空间隔离）
     const exactKey = this.cacheManager.buildExactCacheKey({
       stageId: this.stageId,
       agentRole: this.role,
@@ -290,7 +315,11 @@ export abstract class AbstractWorkerAgent<
       feedbackInstruction: context.humanFeedbackDirective ?? undefined,
     });
 
-    const cacheOutcome = await this.cacheManager.lookup<TArtifact>(exactKey, semanticIntentText);
+    const cacheOutcome = await this.cacheManager.lookup<TArtifact>(exactKey, semanticIntentText, {
+      minQualityRank: endpoint.capabilities.qualityRank,
+      promptSpecHash,
+      stageId: this.stageId,
+    });
     if (cacheOutcome.isHit && cacheOutcome.cachedArtifact !== null) {
       this.broadcastProgress(
         context,
@@ -341,7 +370,11 @@ export abstract class AbstractWorkerAgent<
       });
     }
 
-    // 步骤 4：LLM 生成（含自愈重试循环）——A1/A2/A3
+    // 步骤 4：物理环境准备（Stage 3b Worktree 创建与自测 / Stage 4 真实沙箱验证）+ LLM 生成（含停滞检测与自动升舱）
+    const stageEnvironment = this.prepareStageEnvironment(context);
+    let activeTier: ModelRoutingTier = this.modelTier;
+    let previousViolationSignature: string | null = null;
+    let lastRawCandidate: Record<string, unknown> | null = null;
     let violations: string[] = [];
     let attemptIndex = 0;
     let retryCount = 0;
@@ -355,6 +388,9 @@ export abstract class AbstractWorkerAgent<
 
     while (attemptIndex <= this.maxExecutionRetries) {
       const isRetryAttempt = attemptIndex > 0;
+      const activeEndpoint = this.modelRouter.resolveEndpoint(activeTier);
+      let attemptUsedLiveGateway = false;
+
       // B3：预算守卫（每次 attempt 前检查；估算按输入长度保守估计）
       if (context.tokenBudgetRemaining >= 0) {
         const estimatedInputTokens = Math.ceil(this.estimatePromptChars(context, violations) / 1.5);
@@ -386,15 +422,15 @@ export abstract class AbstractWorkerAgent<
         this.broadcastProgress(
           context,
           SnapshotLifecycleState.RETRYING,
-          `[${this.role}] 执行第 ${attemptIndex}/${this.maxExecutionRetries} 次自愈重试：修正契约违规...`,
-          { attemptIndex, violations },
+          `[${this.role}] 执行第 ${attemptIndex}/${this.maxExecutionRetries} 次自愈重试（${activeEndpoint.modelIdentifier}）：修正契约违规...`,
+          { attemptIndex, violations, activeTier },
         );
       } else {
         this.broadcastProgress(
           context,
           SnapshotLifecycleState.EXECUTING,
-          `[${this.role}] 正在通过模型 [${endpoint.modelIdentifier}] 生成结构化阶段契约...`,
-          { model: endpoint.modelIdentifier, tier: this.modelTier },
+          `[${this.role}] 正在通过模型 [${activeEndpoint.modelIdentifier}] 生成结构化阶段契约...`,
+          { model: activeEndpoint.modelIdentifier, tier: activeTier },
         );
       }
 
@@ -412,14 +448,30 @@ export abstract class AbstractWorkerAgent<
       }
 
       try {
-        const prompt = this.buildStagePrompt(context, attemptIndex, violations);
+        const stageSpec = STAGE_PROMPT_SPECS[this.stageId];
+        const prompt = this.buildStagePrompt(
+          context,
+          attemptIndex,
+          violations,
+          stageEnvironment,
+          activeEndpoint.capabilities.preferFewShotExample,
+          lastRawCandidate,
+        );
         const llm = await this.modelRouter.invokeChatCompletion({
-          tier: this.modelTier,
+          tier: activeTier,
           systemPrompt: prompt.systemPrompt,
           userPrompt: prompt.userPrompt,
           fallbackContentGenerator: () =>
             JSON.stringify(this.synthesizeTemplateArtifact(context, attemptIndex)),
+          jsonSchema: stageSpec?.jsonSchema
+            ? {
+                name: `${this.stageId.toLowerCase()}_contract`,
+                schema: stageSpec.jsonSchema,
+              }
+            : undefined,
+          temperature: activeEndpoint.capabilities.recommendedTemperature,
         });
+        attemptUsedLiveGateway = llm.usedLiveGateway;
         totalTokensConsumed += llm.receipt.totalTokens;
         totalCostUsd += llm.receipt.estimatedCostUsd;
         usageEstimated = usageEstimated || llm.receipt.usageEstimated;
@@ -432,22 +484,23 @@ export abstract class AbstractWorkerAgent<
         if (!extracted.ok) {
           violations = [`OUTPUT_NOT_JSON: ${extracted.error ?? ''}`];
         } else {
+          lastRawCandidate = extracted.value as Record<string, unknown>;
           // A4：先捕获 LLM 顺带输出的 __intent（工厂解析忽略未知字段，互不影响）
-          this.captureLlmIntent(extracted.value as Record<string, unknown>);
-          const parsed = ArtifactContractFactory.parse(
-            this.stageId,
-            extracted.value as Record<string, unknown>,
-          );
+          this.captureLlmIntent(lastRawCandidate, context);
+          const parsed = ArtifactContractFactory.parse(this.stageId, lastRawCandidate);
           if (!parsed.ok) {
             violations = [...parsed.violations];
           } else {
-            const validation = (parsed.artifact as TArtifact).validateContractIntegrity();
-            if (validation.isValid()) {
-              candidate = parsed.artifact as TArtifact;
+            const parsedCandidate = parsed.artifact as TArtifact;
+            const validation = parsedCandidate.validateContractIntegrity();
+            const stageViolations = this.validateStageSpecificConstraints(parsedCandidate, context);
+            const allViolations = [...validation.getViolations(), ...stageViolations];
+            if (validation.isValid() && stageViolations.length === 0) {
+              candidate = parsedCandidate;
               violations = [];
               break;
             }
-            violations = [...validation.getViolations()];
+            violations = allViolations;
           }
         }
       } catch (err) {
@@ -457,7 +510,38 @@ export abstract class AbstractWorkerAgent<
         violations = [err instanceof Error ? err.message.slice(0, 200) : String(err)];
       }
 
+      const normalizedSig = [...violations]
+        .map((v) => v.trim())
+        .sort()
+        .join('||');
+      retryReasons.push(...violations);
       retryCount += 1;
+
+      if (
+        normalizedSig.length > 0 &&
+        previousViolationSignature !== null &&
+        normalizedSig === previousViolationSignature
+      ) {
+        if (
+          activeTier === ModelRoutingTier.PRIVACY_SENSITIVE_LOCAL &&
+          attemptUsedLiveGateway &&
+          attemptIndex < this.maxExecutionRetries
+        ) {
+          activeTier = ModelRoutingTier.HIGH_REASONING_HYBRID;
+          previousViolationSignature = null;
+          retryReasons.push(
+            'STAGNATION_MODEL_ESCALATED: 连续两轮触发相同契约违规，已自动升舱至高阶推理模型破局',
+          );
+          attemptIndex += 1;
+          continue;
+        }
+        retryReasons.push(
+          'STAGNATION_CIRCUIT_BREAKER: 连续两轮触发相同契约违规，提前熔断避免无效 Token 消耗',
+        );
+        break;
+      }
+
+      previousViolationSignature = normalizedSig;
       attemptIndex += 1;
     }
 
@@ -488,8 +572,9 @@ export abstract class AbstractWorkerAgent<
       context.proposal,
       candidate,
     );
+    const finalEndpoint = this.modelRouter.resolveEndpoint(activeTier);
 
-    // 步骤 6：若未发生非法范围阉割，则将合格契约产物写入双层缓存
+    // 步骤 6：若未发生非法范围阉割，则将合格契约产物写入双层缓存（带模型等级与 Prompt 版本元数据）
     if (!scopeDiffReport.hasUnauthorizedScopeReduction) {
       await this.cacheManager.storeVerifiedArtifact({
         exactKey,
@@ -497,6 +582,10 @@ export abstract class AbstractWorkerAgent<
         artifact: candidate,
         estimatedTokens: totalTokensConsumed - retryOverheadTokens,
         estimatedCostUsd: totalCostUsd,
+        modelQualityRank: finalEndpoint.capabilities.qualityRank,
+        modelIdentifier: finalEndpoint.modelIdentifier,
+        promptSpecHash,
+        stageId: this.stageId,
       });
     }
 
@@ -527,7 +616,7 @@ export abstract class AbstractWorkerAgent<
 
     return new AgentExecutionOutcome<TArtifact>({
       artifact: candidate,
-      modelUsed: endpoint.modelIdentifier,
+      modelUsed: finalEndpoint.modelIdentifier,
       cacheHit: false,
       cacheLayer: 'MISS',
       retryCount,
@@ -570,6 +659,9 @@ export abstract class AbstractWorkerAgent<
     context: AgentExecutionInputContext,
     attemptIndex: number,
     violations: ReadonlyArray<string>,
+    stageEnvironment?: Record<string, unknown> | null,
+    includeCompactExample = false,
+    previousCandidate?: Record<string, unknown> | null,
   ): { systemPrompt: string; userPrompt: string } {
     const spec = STAGE_PROMPT_SPECS[this.stageId] ?? {
       systemPrompt: `你是研发流水线职能 Agent（${this.role}）。仅输出一个 JSON 对象。`,
@@ -605,19 +697,38 @@ export abstract class AbstractWorkerAgent<
       })
       .filter((c): c is { type: string; content: string; source: string } => c !== null);
 
+    const repairMode = attemptIndex > 0 && previousCandidate ? 'TARGETED_PATCH' : undefined;
+    const previousValidKeys =
+      repairMode === 'TARGETED_PATCH' && previousCandidate
+        ? Object.keys(previousCandidate).filter((k) => k !== '__intent')
+        : undefined;
+
     const payload = {
       task: spec.taskInstruction,
       proposal: context.proposal.toSerializableRecord(),
       upstreamDigests, // 压缩后的上游摘要（非全文）
       externalContext: externalContexts.length > 0 ? externalContexts : undefined,
+      sandboxVerification: stageEnvironment ?? undefined,
       rejectionLessons: context.historicalRejectionLessons.slice(0, 5),
       humanDirective: context.humanFeedbackDirective,
       attemptIndex,
       priorViolations: violations.slice(0, 5),
+      repairMode,
+      previousValidKeys,
     };
+
+    const exampleSegment =
+      includeCompactExample && attemptIndex === 0 && spec.compactExampleJson
+        ? `\n\n标准参考样例（仅格式锚点，内容须严格依据输入重新生成）：\n${spec.compactExampleJson}`
+        : '';
+    const patchSegment =
+      repairMode === 'TARGETED_PATCH'
+        ? '\n\n注意：当前为靶向局部修复模式（TARGETED_PATCH），请尽量保留 previousValidKeys 中已合法字段，仅针对 priorViolations 中列出的违规字段做局部修正。'
+        : '';
+
     return {
       systemPrompt: spec.systemPrompt,
-      userPrompt: `${spec.jsonSchemaHint}\n\n另外必须在 JSON 顶层包含 "__intent" 字段：{ "intentCode": "稳定的英文大写下划线意图编码", "intentDescription": "一句话中文意图描述", "confidenceScore": 0到1之间的小数 }。\n\n以下为本阶段的全部结构化输入（JSON）：\n${JSON.stringify(payload)}`,
+      userPrompt: `${spec.jsonSchemaHint}${exampleSegment}${patchSegment}\n\n另外必须在 JSON 顶层包含 "__intent" 字段：{ "intentCode": "稳定的英文大写下划线意图编码", "intentDescription": "一句话中文意图描述", "confidenceScore": 0到1之间的小数 }。\n\n以下为本阶段的全部结构化输入（JSON）：\n${JSON.stringify(payload)}`,
     };
   }
 
@@ -635,6 +746,28 @@ export abstract class AbstractWorkerAgent<
       violations.join('').length +
       (context.humanFeedbackDirective?.length ?? 0)
     );
+  }
+
+  /**
+   * 子类钩子（可选）：在进入 LLM 推理/降级模板前执行物理环境准备（如 Stage 3b 创建真实 Git Worktree 沙箱并自测、
+   * Stage 4 执行真实沙箱 node:test / Docker 验证），返回的数据将注入 buildStagePrompt 的 sandboxVerification 字段，
+   * 并供 synthesizeTemplateArtifact 复用（避免离线降级时重复执行子进程）。
+   */
+  protected prepareStageEnvironment(
+    _context: AgentExecutionInputContext,
+  ): Record<string, unknown> | null {
+    return null;
+  }
+
+  /**
+   * 子类钩子（可选）：针对特定阶段的物理环境真实性交叉校验（如 QA/Engineer 阶段核对 LLM 产出的通过状态与真实沙箱结果是否矛盾）。
+   * 返回违规描述数组（空数组 = 校验通过）。
+   */
+  protected validateStageSpecificConstraints(
+    _candidate: TArtifact,
+    _context: AgentExecutionInputContext,
+  ): ReadonlyArray<string> {
+    return [];
   }
 
   /**

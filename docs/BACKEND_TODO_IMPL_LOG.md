@@ -162,13 +162,13 @@
   - `actAs(adminToken, targetUserId)`：管理员视角切换（session 记录 `impersonatedBy`）
   - 用户 CRUD：`createUser` / `updateUser`（停用= 吊销会话）/ `resetPassword`（吊销 + 临时口令）
   - 首次初始化播种 7 个企业成员（口令=username，`mustChangePassword=true`）
-- `WorkbenchServer` 新增 7 个认证端点（login/logout/me/change-password/act-as + admin/users × 2）+ `/api/admin/users` 管理 API。
-- `resolveActorUserId()` 重写：`AUTH_DISABLED=true` → 旧行为（测试/演示）；否则从 Cookie/Bearer 校验会话 → 返回真实 userId → 未认证返回 `'UNAUTHENTICATED'`。
+- `WorkbenchServer` 新增 7 个认证端点（login/logout/me/change-password/act-as + admin/users × 2）+ `/api/admin/users` 管理 API。`[复核注：至第九轮已演进为 10 个认证与用户管理/审计端点，新增 PATCH /api/admin/users/:id、POST /api/admin/users/:id/reset-password、GET /api/admin/login-audit]`
+- `resolveActorUserId()` 重写：`AUTH_DISABLED=true` → 旧行为（测试/演示）；否则从 Cookie/Bearer 校验会话 → 返回真实 userId → 未认证返回 `'UNAUTHENTICATED'`。`[复核注：已在第九轮进一步收紧并重命名为 resolveAuthContext()]`
 - `RbacGovernanceService.getUserOrDefault` 保留（AUTH_DISABLED 时兼容）。
 
 **边界处理**：①防用户枚举（统一文案）；②锁定 423 + Retry-After；③停用即时踢出（validate 查 status）；④改密吊销其他会话；⑤act-as 会话 `impersonatedBy` 审计；⑥最后一个 ACTIVE admin 不可停用（409）。
 
-**验证**：登录 → me → 裁决（RBAC 403/200）→ act-as → 改密 → 全流程测试待补。
+**验证**：登录 → me → 裁决（RBAC 403/200）→ act-as → 改密 → 全流程测试待补。`[复核注：已在第九轮由 session-service.spec.ts 共 23 项测试补齐]`
 
 ---
 
@@ -179,7 +179,7 @@
 **改动**：
 
 - `PersistenceRepository` 新增 `PersistenceDriver` 接口；`persistFullState` 尾部在 `DATABASE_URL` 存在时通过 `psql -f` 执行 SQL 同步脚本（失败不阻塞主流程，JSON 兜底）。
-- 新增 `src/engine/pg/PgPersistenceDriver.ts`：upsert 5 表（workflow_runs / stage_snapshots / negotiation_logs / human_decisions / rejected_history_rag），参数化查询防注入。
+- 新增 `src/engine/pg/PgPersistenceDriver.ts`：upsert 5 表（workflow_runs / stage_snapshots / negotiation_logs / human_decisions / rejected_history_rag），参数化查询防注入。`[复核纠正：现行 PgPersistenceDriver 仅覆盖 4 表、遗漏 negotiation_logs 且 token_budget 硬编码为 120000，使用字符串 escape 拼接 SQL 且尚未在 src/ 接线，loadFullState() 返回 null；已登记为 AUDIT-8]`
 - `selectPersistenceDriver(databaseUrl)` 选择器：PG / JSON 切换。
 
 **边界**：PG 不可达 → WARN + JSON 兜底（D-2）；psql CLI 方式避免引入 pg 原生依赖。
@@ -210,7 +210,7 @@
 
 - `SupervisorAgent` 构造器增加可选 `modelRouter` 参数；`parseNaturalLanguageRollback` 改为 `async`。
 - 新增 `tryLlmParse(text)`：用 LLM 输出 `{targetStageId, cleanInstruction}`（枚举校验拦截注入）；失败/离线 → 回退到 `keywordParse`（原有关键词匹配不变）。
-- Facade 构造 SupervisorAgent 时传入 `modelRouter`；`invokeSupervisorConversationalRollback` 对 parse 调用加 `await`。
+- Facade 构造 SupervisorAgent 时传入 `modelRouter`；`invokeSupervisorConversationalRollback` 对 parse 调用加 `await`。`[复核注：当时 Facade 实为漏传 modelRouter，已在第八轮 #2 补齐]`
 
 **边界**：①枚举外 targetStageId → 拒绝；②离线 → 关键词回退；③指令仅作为 directive 传递，不执行为代码。
 
@@ -231,7 +231,7 @@
 
 ### ✅ I1 compose 联通验证
 
-**改动**：`WorkbenchServer` 健康检查端点 (`/api/health`) 返回 `databaseUrl` 配置状态；`PgPersistenceDriver` 在 `DATABASE_URL` 存在时自动启用 psql 同步。
+**改动**：`WorkbenchServer` 健康检查端点 (`/api/health`) 返回 `databaseUrl` 配置状态；`PgPersistenceDriver` 在 `DATABASE_URL` 存在时自动启用 psql 同步。`[复核注：实际由 PersistenceRepository.persistFullState 直接调 psql，PgPersistenceDriver 尚未接线（AUDIT-8），且容器缺 postgresql-client 与 LITELLM_ENABLE_LIVE_HTTP=true（AUDIT-14）]`
 
 ### 复盘发现（第二轮）
 
@@ -279,7 +279,7 @@
 
 **验证**：新增 `tests/agent-context.spec.ts`（11 项）——Compressor 提取（Stage 0/1/4 真实契约类 + token 上限）、ToolRegistry（Provider 匹配 + runCache 命中计数 / required 缺失显式 truncated / optional 缺失静默 / Provider 抛错降级）、BudgetTrimmer（required 优先 / maxTokens 上限 / 剩余 <100 跳过）、estimateTokens 计数口径。
 
-**测试基线（第三轮末）**：92 项测试（30 套件）——88 通过 / 4 跳过（既有 Windows 平台 skip）/ 0 失败；typecheck + eslint + prettier 全绿。
+**测试基线（第三轮末）**：92 项测试（30 套件）——88 通过 / 4 跳过（`test-result-parser.spec` 2 项含 Windows 超时及空输出兼容性 + `a1-llm-integration.spec` 2 项）/ 0 失败；typecheck + eslint + prettier 全绿。
 
 ---
 
@@ -360,72 +360,189 @@
 
 ---
 
-## 待实现项（设计已定稿于 BACKEND_TODO_DESIGN.md）
+## 第八轮实现（审计修复：核心 AI 编排与沙箱链路设计断层，2026-11-23）
 
-| 编号             | 优先级 | 设计状态    | 预估工作量 |
-| :--------------- | :----- | :---------- | :--------- |
-| H1-H3 外部集成   | P2     | ✅ 设计定稿 | 各 2h      |
+### ✅ 1. 在线 LLM 模式下 Stage 3b/4 真实物理沙箱落盘与防谎报校验（A1 ↔ E1/E2/E3 闭环）
 
-> 已完成并从表中移除：C2 总管四工具 / C3 NL 解析 LLM 化 / B1 协商 LLM 化 / F2 用户管理 API / I1 compose 联通 / G10 上下文介入 / **G1 L2 语义缓存 embedding / G2 RAG embedding / A4 意图识别 LLM + 体检端点 / E3 docker 运行时 / I3 数据保留 / J2 可插拔节点 / G11 Stage 5 闭环（mock 可验证范围）**（见上方各节记录，均有独立实现文档）。
-> **M1-M7 Mockup 全部替代完毕；P1 清零；P2 仅剩 H1-H3——用户决策挂起，待业务思考后按 `P2_REMAINING_PLAN.md` 执行**。
+- **问题根因**：`provisionWorktreeAndWriteCode` 与 `executeSandboxVerification` 原先仅写在 `SoftwareEngineerAgent` / `QualityAssuranceAgent` 的 `synthesizeTemplateArtifact()`（离线 fallback）中；在线 LLM 模式下不走 fallback，导致既不创建物理沙箱/落盘代码，也不执行真实 `node:test`/Docker 单测，且 `buildStagePrompt` 未注入 `sandboxVerification`。
+- **修复**：
+  - `AbstractWorkerAgent` 新增 `prepareStageEnvironment(context)` 与 `validateStageSpecificConstraints(candidate, context)` 两个生命周期钩子；步骤 4 重试循环前先执行物理环境准备并将结果作为 `sandboxVerification` 注入 `buildStagePrompt`；同时修复重试违规未推入 `retryReasons` 的遗漏。
+  - `SoftwareEngineerAgent` 在 `prepareStageEnvironment` 中执行真实 Git Worktree 沙箱代码落盘与 `node:test` 自测（离线模板复用同一结果，避免重复执行子进程），并在 `validateStageSpecificConstraints` 中拦截真实自测失败却谎报 `selfTestPassed=true`。
+  - `QualityAssuranceAgent` 在 `prepareStageEnvironment` 中执行真实沙箱测试与静态安全扫描；`QaVerificationArtifactContract.validateContractIntegrity()` 与 `QualityAssuranceAgent.validateStageSpecificConstraints()` 双重拦截 `passedCases < totalCases` 或真实沙箱存在未通过用例/安全漏洞时谎报 `allAcceptanceCriteriaMet=true` 的行为，触发 A2 自愈重试。
+
+### ✅ 2. C3 总管自然语言解析在 Facade 接线 + 动态阶段白名单
+
+- **问题根因**：`WorkflowOrchestratorFacade` 构造 `SupervisorAgent` 时漏传 `this.modelRouter`，导致生产路径中 `tryLlmParse()` 恒返回 `null`；且 `tryLlmParse` 仅校验静态枚举，未校验当前流水线启用阶段与 J2 自定义节点。
+- **修复**：`Facade` 构造 `new SupervisorAgent(this.eventBus, this.modelRouter)`；`invokeSupervisorConversationalRollback` 将 `runState.getStagePipeline()` 传入 `parseNaturalLanguageRollback`，`tryLlmParse` 与 `keywordParse` 均受当前活跃阶段拓扑与 `AgentRegistry` 白名单约束。
+
+### ✅ 3. B1 受限协商多轮博弈、死锁方案生成与 Token 记账修复
+
+- **问题根因**：`BoundedNegotiationMediator.mediateChallenge` 在 `forceDeadlockToMaxTurns=false` 时循环上限写死为 1 且 `escalated` 写死为 `false`（首轮未共识即停止且不熔断）；而在 `forceDeadlockToMaxTurns=true` 时跳过了 `roundRunner`（熔断时反而不用 LLM 生成方案 A/B，且 QA 修复熔断复用了 PD/PM 三维画布硬编码文案）；此外协商 LLM 调用未校验必填字段且未计入 `runState` Token 消耗。
+- **修复**：循环上限统一为 `maxNegotiationTurns`，达成共识即 `break`、持续分歧则推进至满轮触发 `escalatedToSupervisor=true`；死锁模式下仍调用 `roundRunner` 生成真实方案 A/B；新增 `QA_REPAIR` 主题专属兜底方案 A/B；`BoundedNegotiationOutcome` 增加 `totalTokensConsumed` 并由 `Facade` 计入 `runState.recordTokenUsage()`。
+
+### ✅ 4. A4 意图缓存按需求集合签名隔离（防跨提案串味）
+
+- **问题根因**：`AbstractWorkerAgent.lastLlmIntent` 为单例 Agent 上的无作用域属性，不同业务提案跨 run 执行时会复用上一提案的意图编码与描述，污染 L2 语义缓存查询文本。
+- **修复**：改为 `llmIntentByScope: Map<string, RecognizedStageIntent>`，按 `stageId + 核心需求 ID/描述签名 + humanFeedbackDirective` 隔离——同构需求跨 run 仍零往返复用 `__intent`，不同需求提案自动回落规则意图。
+
+**测试基线（第八轮末）**：136 项测试（43 套件）——新增在线沙箱落盘与 QA 防谎报自愈、C3 总管 Facade LLM 接线、B1 在线多轮协商演进、A4 跨提案防串味断言。
+
+---
+
+## 第九轮实现（审计修复：认证、会话与 RBAC 权限体系安全漏洞，2026-11-23）
+
+### ✅ 5. 关闭未认证/未知用户的管理员静默提权漏洞 + 补齐服务端权限码守卫（F1）
+
+- **问题根因**：`WorkbenchServer.resolveActorUserId` 在未开启 `AUTH_DISABLED` 且未登录时返回 `'UNAUTHENTICATED'`，但业务写路由未拦截 `'UNAUTHENTICATED'`；当传入 `orchestrator` 后，`RbacGovernanceService.getUserOrDefault` 将未知字符串一律回落为 `'user-admin-01'`（最高管理员），造成未认证请求与未知 `X-Actor-Id` 直接以管理员身份通过审批与全局治理；同时 `AUTH_REQUIRED` 守卫、`mustChangePassword` 强制改密拦截及 `ROUTE_PERMISSIONS` 权限码中间件尚未在服务端落地。
+- **修复**：
+  - `RbacGovernanceService` 新增 `getUserStrict()` 与 `assertHasPermission()`，并将 `assertCanApproveStageGate` / `assertIsProjectAdmin` / `assertCanInvokeRollback` 全部改为调用 `getUserStrict()`（未认证、未知或已停用账号一律抛 `[RBAC 权限拦截]`）；`evaluateStageAccess()` 对未知/未认证/已停用用户返回 `canApproveOrArbitrate: false`。`getUserOrDefault()` 仅保留给只读默认展示投影，不再用于任何权限校验。
+  - `WorkbenchHttpServer` 重写为 `extractSessionToken()` + `resolveAuthContext()`：失效/伪造 Token 统一拦截返回 `401`；开启 `AUTH_REQUIRED=true` 时，除 `/api/health`、`POST /api/auth/login`、`POST /api/auth/logout` 与静态资源外全部要求有效会话（`401`），且 `mustChangePassword=true` 仅放行 `/api/auth/me` 与 `/api/auth/change-password`（其余 `403`）；对 `POST /api/proposals`、`POST /api/decisions`、`POST /api/supervisor/rollback`、`POST /api/sandbox/verify`、`POST /api/admin/governance`、`POST /api/workflows/template`、`POST /api/runs/select`、`POST /api/comments`、`POST /api/rag/ingest` 接入 `assertHasPermission` 系统权限码校验；新增 `GET /api/admin/login-audit` 审计查询端点；暴露 `handleHttpRequest()` / `waitUntilReady()` 支持进程内 HTTP 守卫测试。
+
+### ✅ 6. 打通 `SessionService` 与 `RbacGovernanceService` 用户数据源（F2）
+
+- **问题根因**：`SessionService` 读写 `users.json`，而 `RbacGovernanceService` 独立维护硬编码 7 人内存 Map，导致后台新建成员 `usr_xxx` 不被 RBAC 识别（甚至回落成管理员），且修改 `ownedStageIds` 或停用账号不实时生效。
+- **修复**：
+  - `RbacGovernanceService` 新增 `derivePermissionsForRole()`、`upsertUserAccount()`、`setUserStatus()`、`isUserActive()`。
+  - `WorkbenchHttpServer` 将 `SessionService` 的 `users.json` 指向 `orchestrator.persistenceRepo.getStorageDir()` 并绑定 `orchestrator.rbacService`；`SessionService` 初始化、`createUser()`、`updateUser()` 实时同步账号与停用状态至 `RbacGovernanceService`。
+
+### ✅ 7. `SessionService` 会话存储与安全细节修复
+
+- **修复**：
+  - 服务端会话表 `sessions` 键由明文 token 改为 `SHA-256(token)` 十六进制摘要（对齐 `USER_SYSTEM_DESIGN.md` §2.1）。
+  - 修复 `changePassword()` 中 `token !== userId` 导致误删当前会话的缺陷，新增 `currentToken` 参数并按摘要精确保留当前会话、仅吊销其他设备会话。
+  - 补齐 `loginAudit`（记录 `UNKNOWN_USER` / `BAD_PASSWORD` / `LOCKED` / `DISABLED` / `OK` / `ACT_AS`）；`updateUser()` 支持 `department` 与 `tier` 修改，并禁止降级最后一个 ACTIVE 管理员（`409`）；对齐 7 人默认花名册 `displayName` 与 `ownedStageIds`（含 `STAGE_0_INITIATION`），去除重复 `...def`。
+
+**测试基线（第九轮末）**：143 项测试（45 套件，25 个测试文件：139 通过 / 4 既有跳过 / 0 失败）——新增会话 SHA-256 摘要校验、改密保留当前会话、最后管理员防降级、登录审计、用户源双向同步与禁止未知用户提权、`AUTH_REQUIRED=true` 进程内 HTTP 路由守卫等 7 项测试；`typecheck:backend` 与 `lint:backend` 全绿。
+
+---
+
+## 第十轮实现（Agent 准确率、跨模型缓存、Token/防死循环与反迎合协商治理，2026-11-23）
+
+> 正式设计、交付标准（DS-1~DS-4）与量化验收标准（AC-1~AC-12）见独立规范文档：[`docs/AGENT_QUALITY_AND_EFFICIENCY_DESIGN.md`](./AGENT_QUALITY_AND_EFFICIENCY_DESIGN.md)。
+
+### ✅ Pillar 1：多模型准确率与非代码阶段确定性语义校验（DS-1 / DS-2）
+
+- **`ModelRouterGateway`**：新增 `ModelCapabilityProfile`（`qualityRank`、`supportsJsonSchema`、`recommendedTemperature`、`preferFewShotExample`、`supportsPromptPrefixCache`），支持下发 `response_format: { type: 'json_schema', json_schema: { strict: true } }` 并在不支持端点回落 `json_object`；`ModelInvocationReceipt` 记录提供商侧前缀缓存 `cachedPromptTokens`。
+- **`StagePromptSpecs`**：新增 `STAGE_PROMPT_VERSION` 与 `computePromptSpecHash()`，并为 6 个核心阶段补充精确 `jsonSchema` 与中小模型 1-shot `compactExampleJson`。
+- **`ProductManagerAgent` / `ProductDesignerAgent` / `TechLeadAgent`**：实现 `validateStageSpecificConstraints()`，共享 `containsPlaceholderText()`（`src/domain/contracts.ts`）拦截 `TBD`/`TODO`/`待定`/`暂不实现` 占位符、缺失 Story/组件映射、非法 HTTP 方法与 DDL 动词及高危需求低报 `LOW`（同时保留 `forceScopeReduction` 进入 Step 5）。
+
+### ✅ Pillar 2：跨模型三层缓存防质量倒挂与向量空间隔离（DS-3）
+
+- **`PromptCacheManager` + `EmbeddingProvider`**：L1/L2 条目记录 `modelQualityRank`、`modelIdentifier`、`promptSpecHash` 与 `embeddingSpaceId`。检索时高能力请求（`minQualityRank`）自动绕过低等级缓存（`qualityUpgradeBypasses`），禁止弱模型污染/覆写同版本强模型条目；切换 Embedding 模型或变更 `promptSpecHash`/阶段自动隔离分桶（`crossSpaceSkips`）。
+
+### ✅ Pillar 3：Token 节省、停滞升舱熔断与工具防死循环（DS-3）
+
+- **`AbstractWorkerAgent`**：步骤 4 重试循环接入违规签名停滞检测——连续两轮相同违规时，本地私有小模型在线路径自动升舱至 `HIGH_REASONING_HYBRID` 破局，高阶或模板路径提前触发 `STAGNATION_CIRCUIT_BREAKER`；部分校验失败次轮自动注入 `repairMode: 'TARGETED_PATCH'` 与 `previousValidKeys`。
+- **`ToolRegistry` + `ToolCallLoopGuard`**：独立导出 `ToolCallLoopGuard` 实现参数哈希去重（`deduplicatedCalls`）、单阶段调用次数预算上限（`budgetBlockedCalls`，默认 8 次）与超长结果截断（`truncatedResults`，默认 6000 字符并标 `truncated: true`）。
+
+### ✅ Pillar 4：对抗式双上下文协商、盲审裁判与语义不变量（DS-4）
+
+- **`BoundedNegotiationMediator` + `WorkflowOrchestratorFacade`**：`NegotiationRoundRunner` 透传累积历史 `previousTurns`，将单轮拆分为「响应方独立调用（强制 `ACCEPT_AND_PATCH` / `REBUT_WITH_EVIDENCE` / `ESCALATE_TRADEOFF` 离散动作，触及权衡即刻上交人类并终止剩余轮次）→ 挑战方独立复核（否定迎合）→ 无历史盲审裁判（Fresh-Context Blind Judge 专查隐性软降级）」（同时兼容既有单调用 mock）。
+- **`FalseConsensusGuard`**：保留 `evaluateScopeIntegrity()` 需求 ID 差集守卫，新增 `evaluateSemanticInvariants()` 拦截未删 ID 的占位软阉割、高危低报 `LOW` 及带漏洞宣称全部验收通过的自相矛盾交付物。
+
+**测试基线（第十轮末）**：154 项测试（46 套件，26 个测试文件：150 通过 / 4 既有跳过 / 0 失败）——新增 `tests/agent-quality-efficiency.spec.ts`（AC-1 ~ AC-11 共 11 项验收测试）；`typecheck:backend` 与 `lint:backend` 全绿。
+
+---
+
+## 第十一轮实现（AUDIT-9 / D1 启动恢复 5 项运行态完整还原，2026-11-23）
+
+- **`#9（AUDIT-9）` 5 项运行态持久化与还原闭环**：
+  - **1) `ScopeDiffReport`**：`StageSnapshotMemento.toSerializableRecord()`（`src/domain/models.ts`）补齐 `baselineRequirementIds` 与 `currentRequirementIds`，`ScopeDiffReport.fromJSON()` 兼容仅含 `droppedRequirementIds` 的历史快照。
+  - **2) `notificationInbox`**：`AgentUserNotification` 增加 `toSerializableRecord()` / `fromJSON()`（保留 `resolved` 与 `createdAtIso`），经 `PersistedLedgerSnapshot.notifications` 与 `WorkflowEventBus.restoreNotification()` 保序还原待审批门禁卡片。
+  - **3) `teamComments`**：`StageTeamCommentRecord` 增加序列化方法；`WorkflowOrchestratorFacade.addTeamComment()`（非初始化批量播种路径）即时触发 `syncPersistenceState()`，并经 `restoreTeamComment()` 去重还原。
+  - **4) `autoRepairCounts`**：`PersistedRunRecord` 与 `WorkflowRunState.getAutoRepairCountsRecord()` / `restoreInternals()` 完整持久化与恢复 QA 自动返修次数。
+  - **5) `auditEntries`**：`AuditTrailEntry.fromJSON()`、`ImmutableAuditLedger.restoreAuditEntry()` 与 `PersistenceRepository.readAuditWalEntries()`（新增损坏行容错）联动在 `StateReconstructor.restore()` 重建审计时间轴且不重放 WAL；另保留 `NegotiationTurnRecord` / `HumanDecisionRecord` 的 `createdAtIso`。
+
+**测试基线（第十一轮末）**：156 项测试（46 套件，26 个测试文件：152 通过 / 4 既有跳过 / 0 失败）——`tests/state-reconstructor.spec.ts` 新增第 4–5 项测试（5 项全量 round-trip、WAL 零重复及历史/损坏容错）。
+
+---
+
+## 第十二轮实现（AUDIT-8 / D2：PostgreSQL 完整同步、PgPersistenceDriver 接线与用户体系 Schema/PgUserStore，2026-11-23）
+
+- **`#8（AUDIT-8 / D2）` PG 持久化全量同步与恢复闭环**：
+  - **真实 `token_budget` 传递链**：`WorkflowRunState`（`src/engine/DagWorkflowStateEngine.ts`）新增 `tokenBudget` / `getTokenBudget()`，经 `WorkflowOrchestratorFacade.startProposalWorkflow()` 从 DSL `guardrails.tokenBudgetLimit` 写入、`PersistedRunRecord.tokenBudget` 持久化并由 `StateReconstructor.restoreRun()` 原样还原。
+  - **统一 SQL 单一事实源 + PG 读回**：`src/engine/pg/PgPersistenceDriver.ts` 导出 `buildPgUpsertSql()`，完整生成 `workflow_runs`（真实 `token_budget`/`token_used`/`workflow_snapshot_yaml`）、`stage_snapshots`（含 `__snapshotMeta`）、`negotiation_logs`（mapped `from_stage`/`to_stage`、`message_structured`、`is_escalated`）、`human_decisions`、`rejected_history_rag` 与 `team_comments` UPSERT 语句；实现 `PgPersistenceDriver.loadFullState()` 从 PG 聚合读回全量结构并兼容老库缺失 `team_comments` 降级查询。
+  - **驱动接线**：`PersistenceRepository`（`src/engine/PersistenceRepository.ts`）消除重复 SQL 拼装代码，构造时通过 `selectPersistenceDriver()` 接入 PG 驱动，实现 `persistFullState()`、`loadPersistedSnapshot()`（PG 优先 + JSON 兜底）与 `appendAuditEntryToWal()` 统一经驱动协同。
+  - **用户体系 Schema 与 `PgUserStore`**：`deploy/init-pgvector-schema.sql` 扩充 `users`、`user_owned_stages`、`auth_sessions`、`auth_login_audit`、`team_comments` 共 10 张表及 `workflow_runs.created_by_user_id` / `human_decisions.reviewer_user_id` 双轨关联外键；新增 `src/server/auth/UserStore.ts`（`JsonUserStore`、`PgUserStore`、`selectUserStore`），`SessionService.ts` 与 `WorkbenchServer.ts` 全面迁移至 `UserStore` 接口。
+
+**测试基线（第十二轮末）**：161 项测试（47 套件，27 个测试文件：157 通过 / 4 既有跳过 / 0 失败）——新增 `tests/pg-persistence-driver.spec.ts`（5 项：SQL 完整生成与定制预算、`selectPersistenceDriver` 选择、删 JSON 后经 PG `loadFullState` 全量恢复、10 表 Schema、`PgUserStore` + `SessionService` 闭环）。
+
+---
+
+## 待实现项（详见 `BACKEND_TODO.md` 第五章与 `BACKEND_TODO_DESIGN.md`）
+
+| 编号                              | 优先级 | 设计/审计状态                                          | 预估工作量 |
+| :-------------------------------- | :----- | :----------------------------------------------------- | :--------- |
+| AUDIT-10（#10 熔断 RETRY_STAGE）  | P1     | 🔍 已定位问题，待实现（见 `BACKEND_TODO.md` §五 #10）  | 1–2h       |
+| AUDIT-11（#11 Worktree 清理）     | P1     | 🔍 已定位问题，待实现（见 `BACKEND_TODO.md` §五 #11）  | 1–2h       |
+| AUDIT-12（#12 Docker 沙箱退出码） | P1     | 🔍 已定位问题，待实现（见 `BACKEND_TODO.md` §五 #12）  | 2h         |
+| AUDIT-13（#13 并发 runId / SSE）  | P1     | 🔍 已定位问题，待实现（见 `BACKEND_TODO.md` §五 #13）  | 3h         |
+| AUDIT-14（#14 容器 psql / LLM）   | P1     | 🔍 已定位问题，待实现（见 `BACKEND_TODO.md` §五 #14）  | 1h         |
+| H1-H3 外部集成                    | P2     | ✅ 设计定稿，用户决策挂起（见 `P2_REMAINING_PLAN.md`） | 各 2h      |
+
+> 已完成并从表中移除：C2 总管四工具 / C3 NL 解析 LLM 化 / B1 协商 LLM 化 / F2 用户管理 API / I1 compose 联通 / G10 上下文介入 / G1 L2 语义缓存 embedding / G2 RAG embedding / A4 意图识别 LLM + 体检端点 / E3 docker 运行时 / I3 数据保留 / J2 可插拔节点 / G11 Stage 5 闭环（mock 可验证范围）/ 第八轮核心编排与沙箱闭环修复（`#1–#4`）/ 第九轮认证与 RBAC 安全加固（`#5–#7`）/ 第十轮 Agent 质量与协商治理（`DS-1~DS-4` / `AC-1~AC-12`）/ 第十一轮 D1 启动恢复 5 项运行态补全（`#9 / AUDIT-9`）/ **第十二轮 D2 PostgreSQL 同步、PG 驱动恢复与用户 Schema（`#8 / AUDIT-8`）**（见上方各节记录）。
+> **当前待处理**：2026-11-23 深度审计 P0 已全部清零，剩余 **5 项 P1（`#10`–`#14`）**（详情与验收标准见 `BACKEND_TODO.md` §五），以及用户决策挂起的 **3 项 P2（`H1-H3`）**。
 
 ---
 
 ## 测试覆盖率诚实分析
 
-### 新增测试文件（本轮补充）
+### 新增测试文件（全库 27 个文件 / 47 套件 / 161 项测试：157 通过 + 4 跳过）
 
-| 文件                                | 测试数 | 覆盖目标                                                                  | 通过 |
-| :---------------------------------- | :----- | :------------------------------------------------------------------------ | :--- |
-| `json-extractor.spec.ts`            | 9      | A1 JsonExtractor 全边界（围栏/散文/空/数组/截断/嵌套/多对象）             | ✅   |
-| `artifact-contract-factory.spec.ts` | 8      | A1 工厂（正常/缺字段→违规触发A2/未知阶段/riskLevel/round-trip）           | ✅   |
-| `session-service.spec.ts`           | 17     | F1 SessionService 全套（登录/锁定/token/act-as/改密/用户管理/持久化恢复） | ✅   |
-| `state-reconstructor.spec.ts`       | 3      | D1 状态恢复（round-trip/空数据/恢复后可裁决）                             | ✅   |
-| `test-result-parser.spec.ts`        | 2      | E2 TestResultParser（全通过/部分失败）                                    | ✅   |
-| `qa-repair-loop.spec.ts`            | 2      | B2 修复闭环（2轮修复+超限仲裁/正常路径回归）                              | ✅   |
-| `a1-llm-integration.spec.ts`        | 4      | A1/A2/A3 集成（LLM成功/降级/散文耗尽/B3预算熔断；2项skip标注原因）        | ✅   |
-| `full-pipeline-llm.spec.ts`         | 3      | 高优缺口1：6 阶段全部 LLM JSON 驱动的完整管道 + 缺字段自愈                 | ✅   |
-| `concurrency-and-cache.spec.ts`     | 7      | 并发隔离 + PromptCacheManager（G1 后 7 项：含语义命中/误命中修复/降级记账） | ✅   |
-| `supervisor-tools.spec.ts`          | 4      | C2 总管四工具契约（overview/裁决卡/覆写推进/schema）                       | ✅   |
-| `agent-context.spec.ts`             | 11     | G10 上下文介入（Compressor 提取/ToolRegistry 缓存与降级/Trimmer 预算）     | ✅   |
-| `context-providers.spec.ts`         | 7      | 步骤 3（MCP JSON-RPC/错误边界 + Figma/数仓 stub 确定性 + Registry 集成）   | ✅   |
-| `dynamic-context-needs.spec.ts`     | 2      | 步骤 4（端到端动态注入 + 注入拦截 + 离线零调用回归）                       | ✅   |
-| `a4-intent-and-baseline.spec.ts`    | 5      | A4（__intent 捕获时序/非法回落 + 体检端点离线/在线 6 报告/403）            | ✅   |
-| `docker-runtime.spec.ts`            | 5      | E3（命令构造/超时清理 + docker 集成/host-fallback 降级/默认回归）          | ✅   |
-| `data-retention.spec.ts`            | 5      | I3（WAL 月度分片/旧文件兼容 + 保留策略/保护名单/Facade 终态钩子）          | ✅   |
-| `warehouse-query.spec.ts`           | 5      | G11（SQL 白名单/runId 净化/真实注入/stub 兜底/工厂 env 三级选择）          | ✅   |
-| `pluggable-nodes.spec.ts`           | 6      | J2（注册表口径/RBAC 映射/DSL 新节点/幂等/核心保护/检查点端到端）           | ✅   |
+| 文件                                | 测试数           | 覆盖目标                                                                                               | 通过 |
+| :---------------------------------- | :--------------- | :----------------------------------------------------------------------------------------------------- | :--- |
+| `pg-persistence-driver.spec.ts`     | 5                | 第十二轮 AUDIT-8 / D2（SQL `negotiation_logs`/真实预算、PG 驱动全量恢复、10 表 Schema、`PgUserStore`） | ✅   |
+| `agent-quality-efficiency.spec.ts`  | 11               | 第十轮 DS-1~DS-4（json_schema/确定性语义/L1-L2 跨模型缓存/停滞升舱/LoopGuard/对抗协商与盲审 AC-1~11）  | ✅   |
+| `json-extractor.spec.ts`            | 9                | A1 JsonExtractor 全边界（围栏/散文/空/数组/截断/嵌套/多对象）                                          | ✅   |
+| `artifact-contract-factory.spec.ts` | 8                | A1 工厂（正常/缺字段→违规触发A2/未知阶段/riskLevel/round-trip）                                        | ✅   |
+| `session-service.spec.ts`           | 23               | F1/F2 SessionService 全套 + SHA-256/改密保留/防降级/登录审计 + AUTH_REQUIRED HTTP 路由守卫             | ✅   |
+| `state-reconstructor.spec.ts`       | 5                | D1 / AUDIT-9 状态恢复（全量 5 项状态 round-trip / 历史与损坏 WAL 容错 / 恢复后可裁决）                 | ✅   |
+| `test-result-parser.spec.ts`        | 5（3 过/2 skip） | E2 TestResultParser（全通过/部分失败/Node 解析兼容性等；2 项既有 skip）                                | ✅   |
+| `qa-repair-loop.spec.ts`            | 2                | B2 修复闭环（2轮修复+超限仲裁/正常路径回归）                                                           | ✅   |
+| `a1-llm-integration.spec.ts`        | 5（3 过/2 skip） | A1/A2/A3 集成（LLM成功/降级/散文耗尽/B3预算熔断；2项既有 skip）                                        | ✅   |
+| `full-pipeline-llm.spec.ts`         | 6                | 高优缺口1：6 阶段全 LLM 管道 + 缺字段自愈 + 3b/4 在线真实沙箱与防谎报 + C3 总管接线 + B1 多轮协商      | ✅   |
+| `concurrency-and-cache.spec.ts`     | 9                | 并发隔离（2 项）+ PromptCacheManager（7 项：含 L1/L2 语义命中/误命中修复/降级记账）                    | ✅   |
+| `supervisor-tools.spec.ts`          | 4                | C2 总管四工具契约（overview/裁决卡/覆写推进/schema）                                                   | ✅   |
+| `agent-context.spec.ts`             | 11               | G10 上下文介入（Compressor 提取/ToolRegistry 缓存与降级/Trimmer 预算）                                 | ✅   |
+| `context-providers.spec.ts`         | 7                | 步骤 3（MCP JSON-RPC/错误边界 + Figma/数仓 stub 确定性 + Registry 集成）                               | ✅   |
+| `dynamic-context-needs.spec.ts`     | 2                | 步骤 4（端到端动态注入 + 注入拦截 + 离线零调用回归）                                                   | ✅   |
+| `a4-intent-and-baseline.spec.ts`    | 5                | A4（__intent 捕获时序/跨提案不串味 + 体检端点离线/在线 6 报告/403）                                    | ✅   |
+| `docker-runtime.spec.ts`            | 5                | E3（命令构造/超时清理 + docker 集成/host-fallback 降级/默认回归）                                      | ✅   |
+| `data-retention.spec.ts`            | 5                | I3（WAL 月度分片/旧文件兼容 + 保留策略/保护名单/Facade 终态钩子）                                      | ✅   |
+| `warehouse-query.spec.ts`           | 5                | G11（SQL 白名单/runId 净化/真实注入/stub 兜底/工厂 env 三级选择）                                      | ✅   |
+| `pluggable-nodes.spec.ts`           | 6                | J2（注册表口径/RBAC 映射/DSL 新节点/幂等/核心保护/检查点端到端）                                       | ✅   |
 
-> 注：`persistence-rag.spec.ts` 在 G2 后扩为 5 项（1536 维回归 + 后台升级/失败标记/跨重启收敛）。
+> 注：`persistence-rag.spec.ts` 在 G2 后扩为 5 项（1536 维回归 + 后台升级/失败标记/跨重启收敛）；其余既有套件（`architecture` 4、`dsl-loader` 5、`model-gateway` 5、`rbac-governance` 4、`sandbox-manager` 4、`server-sse-api` 1）共 27 项，加本轮 `agent-quality-efficiency.spec.ts` 11 项、`state-reconstructor.spec.ts` 新增 2 项及 `pg-persistence-driver.spec.ts` 5 项，全库总计 161 项（157 通过 / 4 跳过 / 0 失败）。
 
 ### 按层级的覆盖率评估
 
-| 层级         | 实际覆盖                                                                                                                                                                   | 缺口                                                                                                    |
-| :----------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------ |
-| **单元测试** | JsonExtractor（9 场景全覆盖）、ArtifactContractFactory（8 场景含 round-trip）、SessionService（17 场景含持久化恢复）、TestResultParser（2 场景：通过/失败）                | TestResultParser 超时/空文件 2 项因跨平台不一致 skip；PromptCacheManager L2 语义指纹未独立测            |
-| **集成测试** | LLM 集成（mock transport：成功/缺字段自愈/散文耗尽/网关不可达降级）× 4；B2 修复闭环 × 2；B3 预算熔断（skip，需 C1 异步化后精确控制估算）；D1 状态恢复 × 3；QA↔Engineer × 2 | **LLM→PD→3a→3b→QA 全阶段用真实 LLM JSON 逐阶段驱动的完整管道测试缺失**（现有测试只用 LLM 驱动 PM 阶段） |
-| **系统测试** | 浏览器走查（前端 UI 回归，人工）                                                                                                                                           | **无自动化 E2E 系统测试**（Playwright 未接入）；**未启动过带真实 LLM 网关的服务端做系统级验证**         |
-| **边界检测** | 设计文档逐项列边界 → 部分转为测试（JsonExtractor 9 项、SessionService 17 项）；NODE_TEST_CONTEXT 边界发现于测试过程中并修复                                                | TokenBudgetExceededError 的精确估算阈值**未验证**（B3 test 5 skip）；并发提案的竞态条件**未测试**       |
+| 层级         | 实际覆盖                                                                                                                                                                                                                             | 缺口                                                                                                                         |
+| :----------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------- |
+| **单元测试** | JsonExtractor（9 场景全覆盖）、ArtifactContractFactory（8 场景含 round-trip）、SessionService（23 场景含 SHA-256/审计/同步/HTTP 路由守卫）、TestResultParser（3 过 + 2 skip）、PromptCacheManager（7 场景含 L2 语义命中/误命中修复） | TestResultParser 超时/空文件 2 项因跨平台不一致 skip；Agent 6 子类部分离线模板细节主要由集成测试覆盖                         |
+| **集成测试** | 6 阶段 mock-transport 全 LLM 管道 + 自愈 + 3b/4 在线沙箱 + C3 + B1（`full-pipeline-llm.spec` 6 项）；LLM 集成 × 3 过 + 2 skip；B2 修复闭环 × 2；并发隔离 × 2；D1 状态恢复 × 5；D2 PG 驱动 × 5；RBAC × 4；E3/I3/G11/J2 各 5–6 项      | 真实外部网关（Ollama/vLLM）+ 真实 Postgres pgvector + Docker daemon 联合端到端需真实部署环境；B3 精确预算阈值 test 5 仍 skip |
+| **系统测试** | `AUTH_REQUIRED=true` 进程内 HTTP 路由守卫（`session-service.spec`）+ 浏览器走查（人工）                                                                                                                                              | **无自动化 Playwright UI E2E 系统测试**；**未在容器编排环境完整跑通带真实 LLM 网关 + PG 的端到端验证**                       |
+| **边界检测** | JsonExtractor 9 项、SessionService 23 项、并发提案 2 项、Cache L2 7 项、D1 恢复 × 5、D2 PG 驱动 × 5、NODE_TEST_CONTEXT 环境泄漏已修复                                                                                                | `TokenBudgetExceededError` 阈值触发（`ABORTED_TOKEN_BUDGET`）无活跃断言；其余 `#10–#14` 边界缺陷待补回归测试                 |
 
 ### 对用户四个问题的诚实回答
 
-1. **"有针对每个功能写单元测试吗？"** —— 核心新模块（JsonExtractor / SessionService）有；但 Agent 6 个子类的 `synthesizeTemplateArtifact` 降级路径、`PromptCacheManager` L2 语义指纹、`ModelRouterGateway.preparePromptForTier` 无独立单测。
+1. **"有针对每个功能写单元测试吗？"** —— 核心模块（JsonExtractor 9 / SessionService 23 / PromptCacheManager 7 / ArtifactContractFactory 8 / Context 11 / Warehouse 5 / PluggableNodes 6 / PG 驱动 5）均有独立单测；仅 Agent 各子类的部分离线模板分支依赖集成测试间接覆盖。
 
-2. **"最后功能合并有做功能测试吗？"** —— 21 项原有测试跑通了"模板降级模式"下的全链路（Facade→Agent→沙箱→审计→恢复），但这是**降级路径**的集成测试。**真实 LLM 路径的端到端集成测试缺失**（A1 集成测试只覆盖 PM 阶段）。
+2. **"最后功能合并有做功能测试吗？"** —— 不仅原有降级全链路通过，第三轮与第八轮补充的 `full-pipeline-llm.spec.ts`（6 项）已通过 mock LLM transport 跑通 **Stage 0→5 六阶段全 LLM 驱动管道、缺字段自愈重试、3b/4 物理沙箱落盘防谎报、C3 总管与 B1 多轮协商**；仅接真实外部 Ollama/vLLM 网关的实网集成依赖本地推理服务，CI 默认离线。
 
-3. **"整个系统联合起来跑过系统测试吗？"** —— 没有自动化系统测试。浏览器走查验证了 UI 交互，但那是**手动+降级模式**。`LITELLM_ENABLE_LIVE_HTTP=true` + 真实网关的系统级验证需要环境支撑（Ollama/vLLM），当前环境无法运行。
+3. **"整个系统联合起来跑过系统测试吗？"** —— 已补齐进程内 `AUTH_REQUIRED=true` HTTP 路由守卫测试（`session-service.spec`），但缺少自动化浏览器 UI E2E（Playwright）；带 `LITELLM_ENABLE_LIVE_HTTP=true` 与真实网关+PG 的容器化联调仍依赖运行环境（且容器缺少 `psql` 等问题已登记 `#14`）。
 
-4. **"边界检测如何做的？"** —— 设计文档逐项列了 5-8 个边界/条目，但只有部分转为了测试用例。NODE_TEST_CONTEXT 是实际发现并修复的边界（而非预设的）。
+4. **"边界检测如何做的？"** —— 核心与安全边界（JSON 截断、并发隔离、Session SHA-256/锁定/防降级/路由守卫、RBAC 严格拦截、3b/4 防谎报、D1 五项恢复、D2 PG 全量同步等）均已转为自动化断言；当前 2026-11-23 深度审计剩余的 `#10–#14` 边界缺陷（含 B3 `ABORTED_TOKEN_BUDGET`）已列入待修与待补测清单。
 
 ### 下一步优先补测项
 
-| 优先级 | 缺口                        | 建议测试                                                         |
-| :----- | :-------------------------- | :--------------------------------------------------------------- |
-| **高** | 全阶段 LLM 管道测试         | mock transport 按阶段返回不同 JSON → 断言 6 阶段全部通过契约校验 |
-| **高** | PromptCacheManager 独立测试 | L1 精确命中 / L2 语义命中 / 缓存未启用                           |
-| **高** | 并发提案                    | 两个 run 同时推进 → 断言 runId 隔离、无状态交叉污染              |
-| **中** | F1 + AUTH_ENABLED 联合测试  | 启动带认证的服务端 → 登录 → 带 cookie 请求                       |
-| **中** | 修复闭环真实测试            | QA 失败注入（非 forceQaFailure，而是 E2 解析出真实失败）         |
+| 优先级 | 缺口                        | 建议测试                                                                                                                                  | 状态                   |
+| :----- | :-------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------- | :--------------------- |
+| **高** | 全阶段 LLM 管道测试         | mock transport 按阶段返回不同 JSON → 断言 6 阶段全部通过契约校验                                                                          | ✅ 已补齐（第三/八轮） |
+| **高** | PromptCacheManager 独立测试 | L1 精确命中 / L2 语义命中 / 缓存未启用 / 误命中修复                                                                                       | ✅ 已补齐（第三/四轮） |
+| **高** | 并发提案                    | 两个 run 同时推进 → 断言 runId 隔离、无状态交叉污染（`concurrency-and-cache.spec`）                                                       | ✅ 已补齐（第三轮）    |
+| **高** | `#8–#14` 审计缺陷回归测试   | ✅ 已补齐 `#9`（StateReconstructor 5 项恢复）与 `#8`（PG 驱动/Schema/PgUserStore）；待随 `#10–#14` 补齐 `RETRY_STAGE`/Worktree/Docker/SSE | 🔍 部分完成（P0 清零） |
+| **中** | F1 + AUTH_REQUIRED 联合测试 | 进程内 HTTP 路由守卫已覆盖（`session-service.spec`）；带真实 TCP 监听的端到端测试保留作系统级补强                                         | ✅（部分已补齐）       |
+| **中** | B3 预算熔断活跃测试         | 解除 `a1-llm-integration.spec` test 5 skip（改为独立/正确调用 DSL 字符串解析），覆盖 `ABORTED_TOKEN_BUDGET`                               | ⏸ 待处理               |
 
 ---
 

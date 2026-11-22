@@ -1,31 +1,29 @@
 /**
  * @file SessionService.ts
- * @description F1 认证与会话服务：scrypt 口令哈希、SHA-256 token 会话、act-as 管理员视角切换。
- * 存储驱动：无 DATABASE_URL 时 JSON 文件（单机降级），PG 直连后切换（D2）。
+ * @description F1 / AUDIT-8 认证与会话服务：scrypt 口令哈希、SHA-256 token 会话、act-as 管理员视角切换。
+ * 存储驱动：无 DATABASE_URL 时 JsonUserStore（单机降级），DATABASE_URL 在位时切换 PgUserStore（D2）。
  * 参考：docs/USER_SYSTEM_DESIGN.md §3。
  */
 
 import * as crypto from 'node:crypto';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 
-export interface AuthUserRecord {
-  userId: string;
-  username: string;
-  displayName: string;
-  jobTitle: string;
-  department: string;
-  tier: 'PROJECT_ADMIN' | 'STAGE_SPECIALIST';
-  specialistDomain: string;
-  counterpartAgentRole: string;
-  avatarBadge: string;
-  ownedStageIds: string[];
-  passwordHash: string;
-  mustChangePassword: boolean;
-  status: 'ACTIVE' | 'DISABLED';
-  failedLoginCount: number;
-  lockedUntil: string | null;
-}
+import type { AgentRole, WorkflowStageId } from '../../domain/enums.ts';
+import {
+  EnterpriseUserAccount,
+  type SpecialistDomain,
+  type SystemPermissionCode,
+  type UserHierarchyTier,
+} from '../../domain/rbac.ts';
+import { RbacGovernanceService } from '../../engine/RbacGovernanceService.ts';
+import {
+  type AuthUserRecord,
+  JsonUserStore,
+  type LoginAuditEntry,
+  type StoredSessionRecord,
+  type UserStore,
+} from './UserStore.ts';
+
+export type { AuthUserRecord, LoginAuditEntry, StoredSessionRecord, UserStore };
 
 export interface AuthUserView {
   userId: string;
@@ -38,6 +36,7 @@ export interface AuthUserView {
   counterpartAgentRole: string;
   avatarBadge: string;
   ownedStageIds: string[];
+  permissions: SystemPermissionCode[];
   mustChangePassword: boolean;
   status: string;
 }
@@ -58,34 +57,111 @@ function scryptHash(password: string, salt: string): string {
   return crypto.scryptSync(password, salt, 64).toString('base64url');
 }
 
+function hashSessionToken(rawToken: string): string {
+  return crypto.createHash('sha256').update(rawToken).digest('hex');
+}
+
 function verifyPassword(password: string, storedHash: string): boolean {
   const [algo, saltB64, hashB64] = storedHash.split(':');
-  if (algo !== 'scrypt') {
+  if (algo !== 'scrypt' || !saltB64 || !hashB64) {
     return false;
   }
   const computed = scryptHash(password, saltB64);
-  return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(hashB64));
+  const bufA = Buffer.from(computed);
+  const bufB = Buffer.from(hashB64);
+  if (bufA.length !== bufB.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 export class SessionService {
   private users!: AuthUserRecord[];
-  private readonly usersFilePath: string;
-  private readonly sessions = new Map<
-    string,
-    { userId: string; impersonatedBy: string | null; expiresAt: number }
-  >();
+  private readonly store: UserStore;
+  private rbacService: RbacGovernanceService | null;
 
-  public constructor(usersFilePath?: string) {
-    this.usersFilePath =
-      usersFilePath ?? path.resolve(process.cwd(), '.runtime-data', 'users.json');
+  public constructor(
+    usersFilePathOrStore?: string | UserStore,
+    rbacService?: RbacGovernanceService,
+  ) {
+    this.store =
+      typeof usersFilePathOrStore === 'object' && usersFilePathOrStore !== null
+        ? usersFilePathOrStore
+        : new JsonUserStore(usersFilePathOrStore);
+    this.rbacService = rbacService ?? null;
     this.loadUsers();
+    this.syncAllUsersToRbac();
+  }
+
+  /** 绑定 RbacGovernanceService 并立即全量同步花名册（消除两套用户数据源割裂） */
+  public bindRbacService(rbacService: RbacGovernanceService): void {
+    this.rbacService = rbacService;
+    this.syncAllUsersToRbac();
+  }
+
+  private syncAllUsersToRbac(): void {
+    if (!this.rbacService) {
+      return;
+    }
+    for (const user of this.users) {
+      this.syncSingleUserToRbac(user);
+    }
+  }
+
+  private syncSingleUserToRbac(user: AuthUserRecord): void {
+    if (!this.rbacService) {
+      return;
+    }
+    const permissions = RbacGovernanceService.derivePermissionsForRole(
+      user.tier,
+      user.specialistDomain,
+    );
+    const account = new EnterpriseUserAccount({
+      userId: user.userId,
+      displayName: user.displayName,
+      jobTitle: user.jobTitle,
+      department: user.department,
+      tier: user.tier as UserHierarchyTier,
+      specialistDomain: user.specialistDomain as SpecialistDomain,
+      counterpartAgentRole: user.counterpartAgentRole as AgentRole,
+      ownedStageIds: user.ownedStageIds as WorkflowStageId[],
+      permissions,
+      avatarBadge: user.avatarBadge,
+    });
+    this.rbacService.upsertUserAccount(account, user.status);
+  }
+
+  private recordLoginAudit(
+    username: string,
+    success: boolean,
+    reason: LoginAuditEntry['reason'],
+  ): void {
+    this.store.appendLoginAudit({
+      username,
+      success,
+      reason,
+      createdAtIso: new Date().toISOString(),
+    });
+  }
+
+  public getLoginAudit(params?: {
+    username?: string;
+    limit?: number;
+  }): ReadonlyArray<LoginAuditEntry> {
+    return this.store.listLoginAudit(params);
+  }
+
+  /** 观测/测试用：返回当前会话表中存储的 key（均为 64 位 SHA-256 hex） */
+  public getStoredSessionTokenHashes(): ReadonlyArray<string> {
+    return this.store.listStoredSessionTokenHashes();
   }
 
   private loadUsers(): void {
-    if (fs.existsSync(this.usersFilePath)) {
-      this.users = JSON.parse(fs.readFileSync(this.usersFilePath, 'utf-8'));
+    const existing = this.store.loadAllUsers();
+    if (existing && existing.length > 0) {
+      this.users = existing;
     } else {
-      // 首次初始化：播种 7 个企业成员（口令=username，首登强制改密）
+      // 首次初始化：播种 7 个企业成员（口令=username，首登强制改密；字段与 RbacGovernanceService 严格对齐）
       const seedDefs: Array<{
         userId: string;
         username: string;
@@ -109,6 +185,7 @@ export class SessionService {
           counterpartAgentRole: 'SUPERVISOR_AGENT',
           avatarBadge: '👑 ADMIN',
           ownedStageIds: [
+            'STAGE_0_INITIATION',
             'STAGE_1_PM',
             'STAGE_2_PD',
             'STAGE_3A_TECH_SPEC',
@@ -120,19 +197,19 @@ export class SessionService {
         {
           userId: 'user-pm-01',
           username: 'pm',
-          displayName: '陈工',
+          displayName: '陈工 (PM)',
           jobTitle: '资深产品经理',
           department: 'B端核心业务产品部',
           tier: 'STAGE_SPECIALIST',
           specialistDomain: 'PRODUCT_MANAGEMENT',
           counterpartAgentRole: 'PM_AGENT',
           avatarBadge: '📋 PM',
-          ownedStageIds: ['STAGE_1_PM', 'STAGE_2_PD'],
+          ownedStageIds: ['STAGE_0_INITIATION', 'STAGE_1_PM', 'STAGE_2_PD'],
         },
         {
           userId: 'user-pd-01',
           username: 'pd',
-          displayName: '林工',
+          displayName: '林工 (PD/UX)',
           jobTitle: '主任体验与交互设计师',
           department: '企业级设计系统中心 (UED)',
           tier: 'STAGE_SPECIALIST',
@@ -144,7 +221,7 @@ export class SessionService {
         {
           userId: 'user-tech-01',
           username: 'arch',
-          displayName: '赵工',
+          displayName: '赵工 (Tech Lead)',
           jobTitle: '首席系统架构师',
           department: '平台架构与数据安全委员会',
           tier: 'STAGE_SPECIALIST',
@@ -156,7 +233,7 @@ export class SessionService {
         {
           userId: 'user-eng-01',
           username: 'eng',
-          displayName: '刘工',
+          displayName: '刘工 (Engineer)',
           jobTitle: '高级核心研发工程师',
           department: '核心业务研发工程部',
           tier: 'STAGE_SPECIALIST',
@@ -168,7 +245,7 @@ export class SessionService {
         {
           userId: 'user-qa-01',
           username: 'qa',
-          displayName: '孙工',
+          displayName: '孙工 (QA)',
           jobTitle: '质量保证与自动化测试负责人',
           department: '质量工程与发布保障部',
           tier: 'STAGE_SPECIALIST',
@@ -180,7 +257,7 @@ export class SessionService {
         {
           userId: 'user-da-01',
           username: 'da',
-          displayName: '周工',
+          displayName: '周工 (DA)',
           jobTitle: '资深数据分析师',
           department: '商业智能与数据科学部 (BI)',
           tier: 'STAGE_SPECIALIST',
@@ -191,7 +268,6 @@ export class SessionService {
         },
       ];
       this.users = seedDefs.map((def): AuthUserRecord => ({
-        ...def,
         ...def,
         passwordHash: this.hashPassword(def.username),
         mustChangePassword: true,
@@ -209,11 +285,7 @@ export class SessionService {
   }
 
   private persistUsers(): void {
-    const dir = path.dirname(this.usersFilePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(this.usersFilePath, JSON.stringify(this.users, null, 2), 'utf-8');
+    this.store.saveAllUsers(this.users);
   }
 
   private toView(user: AuthUserRecord): AuthUserView {
@@ -228,6 +300,9 @@ export class SessionService {
       counterpartAgentRole: user.counterpartAgentRole,
       avatarBadge: user.avatarBadge,
       ownedStageIds: [...user.ownedStageIds],
+      permissions: [
+        ...RbacGovernanceService.derivePermissionsForRole(user.tier, user.specialistDomain),
+      ],
       mustChangePassword: user.mustChangePassword,
       status: user.status,
     };
@@ -237,13 +312,16 @@ export class SessionService {
     const normalized = username.trim().toLowerCase();
     const user = this.users.find((u) => u.username === normalized);
     if (!user) {
+      this.recordLoginAudit(normalized, false, 'UNKNOWN_USER');
       return { ok: false, reason: 'BAD_PASSWORD' };
     }
     if (user.status === 'DISABLED') {
+      this.recordLoginAudit(user.username, false, 'DISABLED');
       return { ok: false, reason: 'DISABLED' };
     }
     if (user.lockedUntil && Date.now() < Date.parse(user.lockedUntil)) {
       const retryAfterSec = Math.ceil((Date.parse(user.lockedUntil) - Date.now()) / 1000);
+      this.recordLoginAudit(user.username, false, 'LOCKED');
       return { ok: false, reason: 'LOCKED', retryAfterSec };
     }
 
@@ -253,16 +331,19 @@ export class SessionService {
         user.lockedUntil = new Date(Date.now() + LOCKOUT_MS).toISOString();
         user.failedLoginCount = 0;
       }
-      this.persistUsers();
+      this.store.upsertUser(user);
+      this.recordLoginAudit(user.username, false, 'BAD_PASSWORD');
       return { ok: false, reason: 'BAD_PASSWORD' };
     }
 
     user.failedLoginCount = 0;
     user.lockedUntil = null;
-    this.persistUsers();
+    this.store.upsertUser(user);
+    this.recordLoginAudit(user.username, true, 'OK');
 
     const token = crypto.randomBytes(32).toString('base64url');
-    this.sessions.set(token, {
+    this.store.saveSession({
+      tokenHash: hashSessionToken(token),
       userId: user.userId,
       impersonatedBy: null,
       expiresAt: Date.now() + SESSION_TTL_MS,
@@ -271,26 +352,30 @@ export class SessionService {
   }
 
   public validate(token: string): AuthUserView | null {
-    const session = this.sessions.get(token);
+    if (!token) {
+      return null;
+    }
+    const tokenHash = hashSessionToken(token);
+    const session = this.store.getSessionByHash(tokenHash);
     if (!session || Date.now() > session.expiresAt) {
-      this.sessions.delete(token);
+      this.store.deleteSession(tokenHash);
       return null;
     }
     const user = this.users.find((u) => u.userId === session.userId);
     if (!user || user.status !== 'ACTIVE') {
-      this.sessions.delete(token);
+      this.store.deleteSession(tokenHash);
       return null;
     }
     // 滑动续期
-    session.expiresAt = Date.now() + SESSION_TTL_MS;
-    // act-as 视角：session.userId = 被代理用户，validate 始终返回被代理用户
-    // impersonatedBy 仅用于审计与 isImpersonating()
-    void session;
+    this.store.touchSession(tokenHash, Date.now() + SESSION_TTL_MS);
     return this.toView(user);
   }
 
   public logout(token: string): void {
-    this.sessions.delete(token);
+    if (!token) {
+      return;
+    }
+    this.store.deleteSession(hashSessionToken(token));
   }
 
   /** 管理员切换视角（act-as） */
@@ -298,11 +383,14 @@ export class SessionService {
     adminToken: string,
     targetUserId: string,
   ): { token: string; user: AuthUserView } | null {
-    const session = this.sessions.get(adminToken);
+    if (!adminToken) {
+      return null;
+    }
+    const session = this.store.getSessionByHash(hashSessionToken(adminToken));
     if (!session || Date.now() > session.expiresAt) {
       return null;
     }
-    const admin = this.users.find((u) => u.userId === session.userId);
+    const admin = this.users.find((u) => u.userId === session.userId && u.status === 'ACTIVE');
     if (!admin || admin.tier !== 'PROJECT_ADMIN') {
       return null;
     }
@@ -311,16 +399,21 @@ export class SessionService {
       return null;
     }
     const newToken = crypto.randomBytes(32).toString('base64url');
-    this.sessions.set(newToken, {
+    this.store.saveSession({
+      tokenHash: hashSessionToken(newToken),
       userId: targetUserId,
       impersonatedBy: admin.userId,
       expiresAt: Date.now() + SESSION_TTL_MS,
     });
+    this.recordLoginAudit(admin.username, true, 'ACT_AS');
     return { token: newToken, user: this.toView(target) };
   }
 
   public isImpersonating(token: string): AuthUserView | null {
-    const session = this.sessions.get(token);
+    if (!token) {
+      return null;
+    }
+    const session = this.store.getSessionByHash(hashSessionToken(token));
     if (!session || session.impersonatedBy === null) {
       return null;
     }
@@ -332,6 +425,7 @@ export class SessionService {
     userId: string,
     oldPassword: string,
     newPassword: string,
+    currentToken?: string,
   ): { ok: boolean; reason?: string } {
     const user = this.users.find((u) => u.userId === userId);
     if (!user || !verifyPassword(oldPassword, user.passwordHash)) {
@@ -345,14 +439,10 @@ export class SessionService {
     }
     user.passwordHash = this.hashPassword(newPassword);
     user.mustChangePassword = false;
-    this.persistUsers();
-    // 吊销其他会话（保留当前）
-    const currentSessions = [...this.sessions.entries()];
-    for (const [token, session] of currentSessions) {
-      if (session.userId === userId && token !== userId) {
-        this.sessions.delete(token);
-      }
-    }
+    this.store.upsertUser(user);
+    // 吊销该用户的全部其他会话，保留当前发起改密的会话
+    const keepHash = currentToken ? hashSessionToken(currentToken) : null;
+    this.store.deleteSessionsByUser(userId, keepHash);
     return { ok: true };
   }
 
@@ -380,7 +470,7 @@ export class SessionService {
       tempPassword?: string;
     },
   ): { ok: boolean; user?: AuthUserView; tempPassword?: string; reason?: string } {
-    const admin = this.users.find((u) => u.userId === adminUserId);
+    const admin = this.users.find((u) => u.userId === adminUserId && u.status === 'ACTIVE');
     if (!admin || admin.tier !== 'PROJECT_ADMIN') {
       return { ok: false, reason: '仅项目管理员可创建成员' };
     }
@@ -407,7 +497,8 @@ export class SessionService {
       lockedUntil: null,
     };
     this.users.push(newUser);
-    this.persistUsers();
+    this.store.upsertUser(newUser);
+    this.syncSingleUserToRbac(newUser);
     return { ok: true, user: this.toView(newUser), tempPassword };
   }
 
@@ -417,11 +508,13 @@ export class SessionService {
     patch: {
       displayName?: string;
       jobTitle?: string;
+      department?: string;
+      tier?: 'PROJECT_ADMIN' | 'STAGE_SPECIALIST';
       ownedStageIds?: string[];
       status?: 'ACTIVE' | 'DISABLED';
     },
   ): { ok: boolean; user?: AuthUserView; reason?: string } {
-    const admin = this.users.find((u) => u.userId === adminUserId);
+    const admin = this.users.find((u) => u.userId === adminUserId && u.status === 'ACTIVE');
     if (!admin || admin.tier !== 'PROJECT_ADMIN') {
       return { ok: false, reason: '仅项目管理员可修改成员' };
     }
@@ -437,11 +530,25 @@ export class SessionService {
         return { ok: false, reason: '不能停用最后一个 ACTIVE 管理员' };
       }
     }
+    if (patch.tier === 'STAGE_SPECIALIST' && target.tier === 'PROJECT_ADMIN') {
+      const activeAdmins = this.users.filter(
+        (u) => u.tier === 'PROJECT_ADMIN' && u.status === 'ACTIVE' && u.userId !== targetUserId,
+      );
+      if (activeAdmins.length === 0) {
+        return { ok: false, reason: '不能降级最后一个 ACTIVE 管理员' };
+      }
+    }
     if (patch.displayName !== undefined) {
       target.displayName = patch.displayName;
     }
     if (patch.jobTitle !== undefined) {
       target.jobTitle = patch.jobTitle;
+    }
+    if (patch.department !== undefined) {
+      target.department = patch.department;
+    }
+    if (patch.tier !== undefined) {
+      target.tier = patch.tier === 'PROJECT_ADMIN' ? 'PROJECT_ADMIN' : 'STAGE_SPECIALIST';
     }
     if (patch.ownedStageIds !== undefined) {
       target.ownedStageIds = [...patch.ownedStageIds];
@@ -450,19 +557,16 @@ export class SessionService {
       target.status = patch.status;
       if (patch.status === 'DISABLED') {
         // 吊销全部会话
-        for (const [token, session] of this.sessions.entries()) {
-          if (session.userId === targetUserId) {
-            this.sessions.delete(token);
-          }
-        }
+        this.store.deleteSessionsByUser(targetUserId);
       }
     }
-    this.persistUsers();
+    this.store.upsertUser(target);
+    this.syncSingleUserToRbac(target);
     return { ok: true, user: this.toView(target) };
   }
 
   public resetPassword(adminUserId: string, targetUserId: string): { tempPassword: string } | null {
-    const admin = this.users.find((u) => u.userId === adminUserId);
+    const admin = this.users.find((u) => u.userId === adminUserId && u.status === 'ACTIVE');
     if (!admin || admin.tier !== 'PROJECT_ADMIN') {
       return null;
     }
@@ -473,13 +577,9 @@ export class SessionService {
     const tempPassword = crypto.randomBytes(6).toString('base64url');
     target.passwordHash = this.hashPassword(tempPassword);
     target.mustChangePassword = true;
-    this.persistUsers();
+    this.store.upsertUser(target);
     // 吊销全部会话
-    for (const [token, session] of this.sessions.entries()) {
-      if (session.userId === targetUserId) {
-        this.sessions.delete(token);
-      }
-    }
+    this.store.deleteSessionsByUser(targetUserId);
     return { tempPassword };
   }
 }

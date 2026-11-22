@@ -13,8 +13,9 @@ import { describe, it } from 'node:test';
 
 import { ProjectProposalContract } from '../src/domain/contracts.ts';
 import { DecisionVerdict, WorkflowStageId } from '../src/domain/enums.ts';
-import { UserHierarchyTier } from '../src/domain/rbac.ts';
+import { SystemPermissionCode, UserHierarchyTier } from '../src/domain/rbac.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
+import { SessionService } from '../src/server/auth/SessionService.ts';
 
 describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测试套件', () => {
   it('1. 所有环节员工均应共享完整工作流视图，但仅专长领域负责人或顶层管理员可签核对应阶段门禁', async () => {
@@ -168,6 +169,78 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
         WorkflowStageId.STAGE_2_PD,
       );
       assert.ok(stage2Comments.some((c) => c.content.includes('560px')));
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('4. SessionService 与 RbacGovernanceService 共享用户源，且严格禁止未知/未认证用户提权为管理员', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-sync-'));
+    try {
+      const orchestrator = new WorkflowOrchestratorFacade({ persistenceDir: tempDir });
+      const sessionSvc = new SessionService(
+        path.join(tempDir, 'users.json'),
+        orchestrator.rbacService,
+      );
+
+      // 1) 未认证或未知用户严格拦截，禁止回落 admin
+      assert.throws(() => {
+        orchestrator.rbacService.getUserStrict('UNAUTHENTICATED');
+      }, /RBAC 权限拦截/);
+      assert.throws(() => {
+        orchestrator.rbacService.assertCanApproveStageGate(
+          'UNAUTHENTICATED',
+          WorkflowStageId.STAGE_1_PM,
+        );
+      }, /RBAC 权限拦截/);
+      assert.throws(() => {
+        orchestrator.rbacService.assertIsProjectAdmin('unknown-user');
+      }, /RBAC 权限拦截/);
+      assert.throws(() => {
+        orchestrator.rbacService.assertHasPermission(
+          'user-da-01',
+          SystemPermissionCode.CREATE_PROPOSAL,
+        );
+      }, /RBAC 权限拦截/);
+
+      // 2) 新建专长员工 (usr_xxx) 同步进 RBAC：仅可签核其负责阶段，不可越权
+      const created = sessionSvc.createUser('user-admin-01', {
+        username: 'arch_new',
+        displayName: '林架构',
+        tier: 'STAGE_SPECIALIST',
+        specialistDomain: 'SYSTEM_ARCHITECTURE',
+        counterpartAgentRole: 'TECH_LEAD_AGENT',
+        ownedStageIds: [WorkflowStageId.STAGE_3A_TECH_SPEC],
+      });
+      assert.equal(created.ok, true);
+      const newUserId = created.user!.userId;
+
+      assert.doesNotThrow(() => {
+        orchestrator.rbacService.assertCanApproveStageGate(
+          newUserId,
+          WorkflowStageId.STAGE_3A_TECH_SPEC,
+        );
+      });
+      assert.throws(() => {
+        orchestrator.rbacService.assertCanApproveStageGate(newUserId, WorkflowStageId.STAGE_2_PD);
+      }, /RBAC 权限拦截/);
+      assert.throws(() => {
+        orchestrator.rbacService.assertIsProjectAdmin(newUserId);
+      }, /RBAC 最高权限拦截/);
+
+      // 3) 修改负责阶段实时生效；停用账号立即吊销 RBAC 权限
+      const updated = sessionSvc.updateUser('user-admin-01', newUserId, {
+        ownedStageIds: [WorkflowStageId.STAGE_2_PD],
+      });
+      assert.equal(updated.ok, true);
+      assert.doesNotThrow(() => {
+        orchestrator.rbacService.assertCanApproveStageGate(newUserId, WorkflowStageId.STAGE_2_PD);
+      });
+
+      sessionSvc.updateUser('user-admin-01', newUserId, { status: 'DISABLED' });
+      assert.throws(() => {
+        orchestrator.rbacService.assertCanApproveStageGate(newUserId, WorkflowStageId.STAGE_2_PD);
+      }, /已停用/);
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

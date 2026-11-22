@@ -8,10 +8,13 @@
  * - G2：RAG 记录失败时保留哈希伪向量（M7 兼容），并标记待重嵌。
  */
 
+import { ModelRoutingTier } from '../domain/enums.ts';
 import { ModelRouterGateway } from '../patterns/ModelRouterGateway.ts';
 
 export interface EmbeddingProvider {
   readonly providerName: string;
+  /** 向量空间对应的模型标识（用于 L2 缓存分桶隔离，防止切换 Embedding 模型后混检） */
+  readonly modelIdentifier?: string;
   /** 返回 L2 归一化与否均可——比较统一走 cosineSimilarity（内部再归一化）；null = 端点不可用 */
   embed(text: string): Promise<number[] | null>;
 }
@@ -23,6 +26,10 @@ export class GatewayEmbeddingProvider implements EmbeddingProvider {
 
   public constructor(gateway: ModelRouterGateway) {
     this.gateway = gateway;
+  }
+
+  public get modelIdentifier(): string {
+    return this.gateway.resolveEndpoint(ModelRoutingTier.EMBEDDING).modelIdentifier;
   }
 
   public async embed(text: string): Promise<number[] | null> {
