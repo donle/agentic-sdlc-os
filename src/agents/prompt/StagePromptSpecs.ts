@@ -208,7 +208,7 @@ export const STAGE_PROMPT_SPECS: Partial<Record<WorkflowStageId, StagePromptSpec
 
 你是 Engineer Agent（AI 研发工程师）。`,
     taskInstruction:
-      '严格依据上游技术契约产出代码实现计划：绑定独立 Git Worktree 分支，列出每个修改文件（类名/设计模式/行数变更），并确认沙箱自测结果。若存在 humanDirective（修复/回退指令），实现必须响应它。',
+      '严格依据上游技术契约与沙箱文件列表产出代码实现计划：绑定独立 Git Worktree 分支，列出每个修改文件，并确认沙箱自测结果。若需新增/修改真实源码或单测（含响应 QA 修复或 humanDirective），可输出可选字段 filePatches: [{ filePath, content }]，系统将在核验通过前先将其写入沙箱 Worktree 并重跑 node:test 与安全扫描。',
     jsonSchemaHint: `输出 JSON 字段：
 {
   "summary": string,
@@ -217,7 +217,10 @@ export const STAGE_PROMPT_SPECS: Partial<Record<WorkflowStageId, StagePromptSpec
   "modifiedFiles": [                       // 每条核心需求至少 1 个文件
     { "filePath": string, "className": string, "designPattern": string, "linesChanged": number }
   ],
-  "selfTestPassed": boolean                // 与输入的沙箱自测结果一致
+  "selfTestPassed": boolean,               // 须与真实沙箱（含 filePatches 重跑）结果一致
+  "filePatches"?: [                        // 可选：真实写入 Worktree 的源码/单测补丁
+    { "filePath": string, "content": string }
+  ]
 }`,
     jsonSchema: {
       type: 'object',
@@ -240,6 +243,17 @@ export const STAGE_PROMPT_SPECS: Partial<Record<WorkflowStageId, StagePromptSpec
           },
         },
         selfTestPassed: { type: 'boolean' },
+        filePatches: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string' },
+              content: { type: 'string' },
+            },
+            required: ['filePath', 'content'],
+          },
+        },
         __intent: INTENT_SCHEMA_PROP,
       },
       required: [

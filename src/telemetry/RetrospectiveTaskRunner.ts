@@ -96,9 +96,19 @@ export class RetrospectiveTaskRunner {
    * 执行复盘指标检测并输出结构化成本控制诊断报告
    */
   public executeRetrospectiveCheck(): RetrospectiveEvaluationReport {
-    const cacheMetrics = this.cacheManager.getMetricsSnapshot();
-    const fulfillmentMetrics = this.fulfillmentTracker.getMetricsSnapshot();
+    return this.evaluateMetrics(
+      this.cacheManager.getMetricsSnapshot(),
+      this.fulfillmentTracker.getMetricsSnapshot(),
+    );
+  }
 
+  /**
+   * 基于给定的缓存与意图达成快照生成 SLA 诊断报告（供实时巡检与历史离线复盘共用）
+   */
+  public evaluateMetrics(
+    cacheMetrics: CacheTelemetrySnapshot,
+    fulfillmentMetrics: IntentFulfillmentMetricsSnapshot,
+  ): RetrospectiveEvaluationReport {
     const theoreticalTotalTokens =
       fulfillmentMetrics.totalTokensConsumed + cacheMetrics.savedTokensTotal;
     const costSavingsRatioPercent =

@@ -14,6 +14,7 @@ import { describe, it, afterEach } from 'node:test';
 import { ProjectProposalContract } from '../src/domain/contracts.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
 import type { OpenAiCompatibleChatResponse } from '../src/patterns/ModelRouterGateway.ts';
+import { createTestWorkspace, type TestIsolatedWorkspace } from './helpers/testIsolation.ts';
 
 // 与 ArtifactContractFactory 期望字段一一对应的各阶段 JSON（同 full-pipeline-llm.spec）
 const STAGE_JSON: Record<string, string> = {
@@ -121,6 +122,7 @@ function makeResponse(content: string): OpenAiCompatibleChatResponse {
 describe('步骤 4 — LLM 意图分析驱动的动态上下文需求', () => {
   let orchestrator: WorkflowOrchestratorFacade | null = null;
   let tempRepoDir: string | null = null;
+  let workspace: TestIsolatedWorkspace | null = null;
   const savedEnv: Record<string, string | undefined> = {};
 
   function saveEnv(keys: string[]): void {
@@ -133,6 +135,10 @@ describe('步骤 4 — LLM 意图分析驱动的动态上下文需求', () => {
     if (orchestrator) {
       orchestrator.modelRouter.setHttpTransport(null);
       orchestrator = null;
+    }
+    if (workspace) {
+      workspace.cleanup();
+      workspace = null;
     }
     for (const [key, value] of Object.entries(savedEnv)) {
       if (value === undefined) {
@@ -161,7 +167,12 @@ describe('步骤 4 — LLM 意图分析驱动的动态上下文需求', () => {
     process.env.GIT_REPO_PATH = tempRepoDir;
     process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
 
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('dyn-ctx-1-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
     const stageRequests: Array<{ system: string; user: string }> = [];
 
     orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
@@ -219,7 +230,12 @@ describe('步骤 4 — LLM 意图分析驱动的动态上下文需求', () => {
     delete process.env.LITELLM_ENABLE_LIVE_HTTP;
     delete process.env.GIT_REPO_PATH;
 
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('dyn-ctx-2-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
     let plannerCalls = 0;
     let stageCalls = 0;
     orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {

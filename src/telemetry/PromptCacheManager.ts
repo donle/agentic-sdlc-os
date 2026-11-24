@@ -47,6 +47,18 @@ export interface CacheLookupOptions {
   readonly stageId?: WorkflowStageId;
 }
 
+export interface PersistedCacheTelemetrySnapshot {
+  readonly totalLookups: number;
+  readonly l1ExactHits: number;
+  readonly l2SemanticHits: number;
+  readonly cacheMisses: number;
+  readonly savedTokensTotal: number;
+  readonly savedCostUsdTotal: number;
+  readonly embeddingUnavailableLookups?: number;
+  readonly qualityUpgradeBypasses?: number;
+  readonly crossSpaceSkips?: number;
+}
+
 export class CacheTelemetrySnapshot {
   public readonly totalLookups: number;
   public readonly l1ExactHits: number;
@@ -322,6 +334,30 @@ export class PromptCacheManager {
   /** L2 当前条目数（观测/测试用） */
   public getL2EntryCount(): number {
     return this.l2SemanticEntries.length;
+  }
+
+  /** P1-2：从持久化快照恢复累计缓存遥测计数（供重启后复盘报表延续统计） */
+  public restoreTelemetryCounters(metrics: Partial<PersistedCacheTelemetrySnapshot>): void {
+    const pickNonNegInt = (val: unknown, fallback: number): number =>
+      typeof val === 'number' && Number.isFinite(val) && val >= 0 ? Math.floor(val) : fallback;
+    const pickNonNegFloat = (val: unknown, fallback: number): number =>
+      typeof val === 'number' && Number.isFinite(val) && val >= 0 ? val : fallback;
+
+    this.totalLookups = pickNonNegInt(metrics.totalLookups, this.totalLookups);
+    this.l1ExactHits = pickNonNegInt(metrics.l1ExactHits, this.l1ExactHits);
+    this.l2SemanticHits = pickNonNegInt(metrics.l2SemanticHits, this.l2SemanticHits);
+    this.cacheMisses = pickNonNegInt(metrics.cacheMisses, this.cacheMisses);
+    this.savedTokensTotal = pickNonNegInt(metrics.savedTokensTotal, this.savedTokensTotal);
+    this.savedCostUsdTotal = pickNonNegFloat(metrics.savedCostUsdTotal, this.savedCostUsdTotal);
+    this.embeddingUnavailableLookups = pickNonNegInt(
+      metrics.embeddingUnavailableLookups,
+      this.embeddingUnavailableLookups,
+    );
+    this.qualityUpgradeBypasses = pickNonNegInt(
+      metrics.qualityUpgradeBypasses,
+      this.qualityUpgradeBypasses,
+    );
+    this.crossSpaceSkips = pickNonNegInt(metrics.crossSpaceSkips, this.crossSpaceSkips);
   }
 
   public getMetricsSnapshot(): CacheTelemetrySnapshot {

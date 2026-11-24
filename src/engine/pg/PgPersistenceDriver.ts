@@ -6,7 +6,7 @@
  * 无 DATABASE_URL 时自动回落到 JSON 文件模式（D-2 全局决策：可降级）。
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -15,12 +15,20 @@ import type { WorkflowStageId } from '../../domain/enums.ts';
 import { HumanDecisionRecord, NegotiationTurnRecord } from '../../domain/models.ts';
 import type { NegativeExperienceVectorRecord } from '../NegativeExperienceRagEngine.ts';
 import type {
+  PersistedCacheTelemetry,
+  PersistedGovernanceConfig,
   PersistedLedgerSnapshot,
   PersistedRunRecord,
   PersistenceDriver,
 } from '../PersistenceRepository.ts';
 
 export type PgSqlExecutor = (sql: string, options?: { readOnly?: boolean }) => string;
+export type PgAsyncSqlExecutor = (sql: string, options?: { readOnly?: boolean }) => Promise<string>;
+
+export interface PgPersistenceDriverOptions {
+  readonly asyncSqlExecutor?: PgAsyncSqlExecutor;
+  readonly pinnedVectorDim?: number;
+}
 
 function escapeSql(val: unknown): string {
   return String(val ?? '')
@@ -77,9 +85,46 @@ function parsePgEmbedding(raw: unknown): number[] {
 }
 
 /**
- * AUDIT-8：PostgreSQL 16 + pgvector 统一全量 UPSERT SQL 构建器（PersistenceRepository 与 PgPersistenceDriver 共用单一事实源）
+ * P1-2：PG 写入前可选向量维度对齐（未显式配置 PG_RAG_VECTOR_DIM / pinnedDim 时原样保留，兼容变长 vector 列同时存储 1024 与 1536 维）
  */
-export function buildPgUpsertSql(snapshot: PersistedLedgerSnapshot): string {
+export function normalizeEmbeddingForPg(
+  embedding: ReadonlyArray<number>,
+  pinnedDim?: number,
+): ReadonlyArray<number> {
+  const envDim = Number(process.env.PG_RAG_VECTOR_DIM);
+  const targetDim =
+    pinnedDim !== undefined && Number.isFinite(pinnedDim) && pinnedDim > 0
+      ? Math.floor(pinnedDim)
+      : Number.isFinite(envDim) && envDim > 0
+        ? Math.floor(envDim)
+        : 0;
+  if (targetDim <= 0 || embedding.length === targetDim) {
+    return embedding;
+  }
+  const resized = new Array<number>(targetDim).fill(0);
+  const copyLen = Math.min(embedding.length, targetDim);
+  for (let i = 0; i < copyLen; i += 1) {
+    resized[i] = embedding[i];
+  }
+  let normSq = 0;
+  for (const val of resized) {
+    normSq += val * val;
+  }
+  const norm = Math.sqrt(normSq);
+  if (norm === 0) {
+    resized[0] = 1;
+    return resized;
+  }
+  return resized.map((v) => Number((v / norm).toFixed(6)));
+}
+
+/**
+ * AUDIT-8 / P1-2：PostgreSQL 16 + pgvector 统一全量 UPSERT SQL 构建器（PersistenceRepository 与 PgPersistenceDriver 共用单一事实源）
+ */
+export function buildPgUpsertSql(
+  snapshot: PersistedLedgerSnapshot,
+  options?: { pinnedVectorDim?: number },
+): string {
   const lines: string[] = [
     '-- Auto-generated PostgreSQL 16 + pgvector state synchronization script',
     'BEGIN;',
@@ -99,8 +144,11 @@ export function buildPgUpsertSql(snapshot: PersistedLedgerSnapshot): string {
     );
     const tokenBudget = safeInt(run.tokenBudget, 120000);
     const tokenUsed = safeInt(run.tokensUsedTotal, 0);
+    const createdByUserIdSql = run.createdByUserId
+      ? `(SELECT id FROM users WHERE id = '${escapeSql(run.createdByUserId)}')`
+      : 'NULL';
     lines.push(
-      `INSERT INTO workflow_runs (id, title, workflow_template_name, workflow_snapshot_yaml, active_branch_id, token_budget, token_used, status, created_by, created_at) VALUES ('${escapeSql(run.runId)}', '${escapeSql(run.title)}', '${escapeSql(run.workflowTemplateId)}', '${runMetaJson}'::jsonb, '${escapeSql(run.activeBranchId)}', ${tokenBudget}, ${tokenUsed}, '${escapeSql(run.status)}', '${escapeSql(run.initiatorActor)}', '${escapeSql(safeTimestampIso(run.createdAtIso))}') ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, workflow_template_name = EXCLUDED.workflow_template_name, workflow_snapshot_yaml = EXCLUDED.workflow_snapshot_yaml, active_branch_id = EXCLUDED.active_branch_id, token_budget = EXCLUDED.token_budget, token_used = EXCLUDED.token_used, status = EXCLUDED.status;`,
+      `INSERT INTO workflow_runs (id, title, workflow_template_name, workflow_snapshot_yaml, active_branch_id, token_budget, token_used, status, created_by, created_at, created_by_user_id) VALUES ('${escapeSql(run.runId)}', '${escapeSql(run.title)}', '${escapeSql(run.workflowTemplateId)}', '${runMetaJson}'::jsonb, '${escapeSql(run.activeBranchId)}', ${tokenBudget}, ${tokenUsed}, '${escapeSql(run.status)}', '${escapeSql(run.initiatorActor)}', '${escapeSql(safeTimestampIso(run.createdAtIso))}', ${createdByUserIdSql}) ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, workflow_template_name = EXCLUDED.workflow_template_name, workflow_snapshot_yaml = EXCLUDED.workflow_snapshot_yaml, active_branch_id = EXCLUDED.active_branch_id, token_budget = EXCLUDED.token_budget, token_used = EXCLUDED.token_used, status = EXCLUDED.status, created_by_user_id = COALESCE(EXCLUDED.created_by_user_id, workflow_runs.created_by_user_id);`,
     );
   }
 
@@ -179,15 +227,21 @@ export function buildPgUpsertSql(snapshot: PersistedLedgerSnapshot): string {
   }
 
   for (const dec of snapshot.humanDecisions) {
+    const reviewerUserIdSql = dec.reviewerUserId
+      ? `(SELECT id FROM users WHERE id = '${escapeSql(dec.reviewerUserId)}')`
+      : 'NULL';
     lines.push(
-      `INSERT INTO human_decisions (id, run_id, snap_id, reviewer_id, decision_type, comment, created_at) VALUES ('${escapeSql(dec.decisionId)}', '${escapeSql(dec.runId)}', '${escapeSql(dec.snapshotId)}', '${escapeSql(dec.reviewerActor)}', '${escapeSql(dec.verdict)}', '${escapeSql(dec.comment)}', '${escapeSql(safeTimestampIso(dec.createdAtIso))}') ON CONFLICT (id) DO NOTHING;`,
+      `INSERT INTO human_decisions (id, run_id, snap_id, reviewer_id, decision_type, comment, created_at, reviewer_user_id) VALUES ('${escapeSql(dec.decisionId)}', '${escapeSql(dec.runId)}', '${escapeSql(dec.snapshotId)}', '${escapeSql(dec.reviewerActor)}', '${escapeSql(dec.verdict)}', '${escapeSql(dec.comment)}', '${escapeSql(safeTimestampIso(dec.createdAtIso))}', ${reviewerUserIdSql}) ON CONFLICT (id) DO NOTHING;`,
     );
   }
 
   for (const rag of snapshot.negativeExperienceRecords) {
-    const vectorLiteral = `[${rag.embedding.join(',')}]`;
+    const normalizedVec = normalizeEmbeddingForPg(rag.embedding, options?.pinnedVectorDim);
+    const vectorLiteral = `[${normalizedVec.join(',')}]`;
+    const embeddingDim = normalizedVec.length;
+    const embeddingSource = escapeSql(rag.embeddingSource ?? 'HASH_FALLBACK');
     lines.push(
-      `INSERT INTO rejected_history_rag (id, stage_id, desensitized_lesson, embedding, created_at) VALUES ('${escapeSql(rag.recordId)}', '${escapeSql(rag.stageId)}', '${escapeSql(rag.desensitizedLesson)}', '${vectorLiteral}'::vector, '${escapeSql(safeTimestampIso(rag.createdAtIso))}') ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding;`,
+      `INSERT INTO rejected_history_rag (id, stage_id, desensitized_lesson, embedding, created_at, embedding_dim, embedding_source) VALUES ('${escapeSql(rag.recordId)}', '${escapeSql(rag.stageId)}', '${escapeSql(rag.desensitizedLesson)}', '${vectorLiteral}'::vector, '${escapeSql(safeTimestampIso(rag.createdAtIso))}', ${embeddingDim}, '${embeddingSource}') ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding, embedding_dim = EXCLUDED.embedding_dim, embedding_source = EXCLUDED.embedding_source;`,
     );
   }
 
@@ -210,9 +264,241 @@ export function buildPgUpsertSql(snapshot: PersistedLedgerSnapshot): string {
     );
   }
 
+  for (const notif of snapshot.notifications ?? []) {
+    const notifId = escapeSql(String(notif.notificationId ?? ''));
+    if (!notifId) {
+      continue;
+    }
+    const runId = escapeSql(String(notif.runId ?? ''));
+    const branchId = escapeSql(String(notif.branchId ?? ''));
+    const stageId = escapeSql(String(notif.stageId ?? 'STAGE_1_PM'));
+    const senderRole = escapeSql(String(notif.senderRole ?? 'SUPERVISOR_AGENT'));
+    const category = escapeSql(String(notif.category ?? 'STAGE_PROGRESS'));
+    const title = escapeSql(String(notif.title ?? ''));
+    const message = escapeSql(String(notif.message ?? ''));
+    const relatedSnapshotId = escapeSql(String(notif.relatedSnapshotId ?? ''));
+    const requiresHumanAction = notif.requiresHumanAction ? 'TRUE' : 'FALSE';
+    const resolved = notif.resolved ? 'TRUE' : 'FALSE';
+    const actionOptionsJson = escapeSql(
+      JSON.stringify(Array.isArray(notif.actionOptions) ? notif.actionOptions : []),
+    );
+    const createdAtIso = escapeSql(safeTimestampIso(notif.createdAtIso));
+
+    lines.push(
+      `INSERT INTO notifications (id, run_id, branch_id, stage_id, sender_role, category, title, message, related_snapshot_id, requires_human_action, resolved, action_options, created_at) VALUES ('${notifId}', '${runId}', '${branchId}', '${stageId}', '${senderRole}', '${category}', '${title}', '${message}', '${relatedSnapshotId}', ${requiresHumanAction}, ${resolved}, '${actionOptionsJson}'::jsonb, '${createdAtIso}') ON CONFLICT (id) DO UPDATE SET resolved = EXCLUDED.resolved;`,
+    );
+  }
+
+  for (const evt of snapshot.liveEvents ?? []) {
+    const evtId = escapeSql(String(evt.eventId ?? ''));
+    if (!evtId) {
+      continue;
+    }
+    const runId = escapeSql(String(evt.runId ?? ''));
+    const branchId = escapeSql(String(evt.branchId ?? ''));
+    const stageId = escapeSql(String(evt.stageId ?? 'STAGE_0_INITIATION'));
+    const agentRole = escapeSql(String(evt.agentRole ?? 'SUPERVISOR_AGENT'));
+    const lifecycleState = escapeSql(String(evt.lifecycleState ?? 'IDLE'));
+    const headline = escapeSql(String(evt.headline ?? ''));
+    const detailPayloadJson = escapeSql(
+      JSON.stringify(
+        evt.detailPayload && typeof evt.detailPayload === 'object' ? evt.detailPayload : {},
+      ),
+    );
+    const createdAtIso = escapeSql(safeTimestampIso(evt.timestampIso));
+
+    lines.push(
+      `INSERT INTO live_events (id, run_id, branch_id, stage_id, agent_role, lifecycle_state, headline, detail_payload, created_at) VALUES ('${evtId}', '${runId}', '${branchId}', '${stageId}', '${agentRole}', '${lifecycleState}', '${headline}', '${detailPayloadJson}'::jsonb, '${createdAtIso}') ON CONFLICT (id) DO NOTHING;`,
+    );
+  }
+
+  for (const entry of snapshot.auditEntries ?? []) {
+    const entryId = escapeSql(String(entry.entryId ?? ''));
+    if (!entryId) {
+      continue;
+    }
+    const runId = escapeSql(String(entry.runId ?? ''));
+    const branchId = escapeSql(String(entry.branchId ?? ''));
+    const stageId = escapeSql(String(entry.stageId ?? 'STAGE_0_INITIATION'));
+    const actor = escapeSql(String(entry.actor ?? ''));
+    const actionType = escapeSql(String(entry.actionType ?? ''));
+    const summary = escapeSql(String(entry.summary ?? ''));
+    const metadataJson = escapeSql(
+      JSON.stringify(entry.metadata && typeof entry.metadata === 'object' ? entry.metadata : {}),
+    );
+    const createdAtIso = escapeSql(safeTimestampIso(entry.timestampIso));
+
+    lines.push(
+      `INSERT INTO audit_entries (id, run_id, branch_id, stage_id, actor, action_type, summary, metadata, created_at) VALUES ('${entryId}', '${runId}', '${branchId}', '${stageId}', '${actor}', '${actionType}', '${summary}', '${metadataJson}'::jsonb, '${createdAtIso}') ON CONFLICT (id) DO NOTHING;`,
+    );
+  }
+
+  if (snapshot.governanceConfig) {
+    const govJson = escapeSql(JSON.stringify(snapshot.governanceConfig));
+    lines.push(
+      `INSERT INTO system_runtime_state (state_key, payload, updated_at) VALUES ('governance_config', '${govJson}'::jsonb, NOW()) ON CONFLICT (state_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();`,
+    );
+  }
+  if (snapshot.cacheTelemetry) {
+    const cacheJson = escapeSql(JSON.stringify(snapshot.cacheTelemetry));
+    lines.push(
+      `INSERT INTO system_runtime_state (state_key, payload, updated_at) VALUES ('cache_telemetry', '${cacheJson}'::jsonb, NOW()) ON CONFLICT (state_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();`,
+    );
+  }
+  if (snapshot.intentTraces && snapshot.intentTraces.length > 0) {
+    const tracesJson = escapeSql(JSON.stringify({ traces: snapshot.intentTraces }));
+    lines.push(
+      `INSERT INTO system_runtime_state (state_key, payload, updated_at) VALUES ('intent_traces', '${tracesJson}'::jsonb, NOW()) ON CONFLICT (state_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();`,
+    );
+  }
+
   lines.push('COMMIT;');
   return lines.join('\n');
 }
+
+const FULL_LOAD_QUERY_EXTENDED = `
+SELECT json_build_object(
+  'runs', COALESCE((
+    SELECT json_agg(json_build_object(
+      'id', r.id,
+      'title', r.title,
+      'workflow_template_name', r.workflow_template_name,
+      'workflow_snapshot_yaml', r.workflow_snapshot_yaml,
+      'active_branch_id', r.active_branch_id,
+      'token_budget', r.token_budget,
+      'token_used', r.token_used,
+      'status', r.status,
+      'created_by', r.created_by,
+      'created_by_user_id', r.created_by_user_id,
+      'created_at', r.created_at
+    ) ORDER BY r.created_at ASC)
+    FROM workflow_runs r
+  ), '[]'::json),
+  'snapshots', COALESCE((
+    SELECT json_agg(json_build_object(
+      'id', s.id,
+      'run_id', s.run_id,
+      'parent_snap_id', s.parent_snap_id,
+      'branch_id', s.branch_id,
+      'stage_id', s.stage_id,
+      'role_agent', s.role_agent,
+      'model_used', s.model_used,
+      'artifact_json', s.artifact_json,
+      'risk_score', s.risk_score,
+      'state', s.state,
+      'created_at', s.created_at
+    ) ORDER BY s.created_at ASC)
+    FROM stage_snapshots s
+  ), '[]'::json),
+  'negotiation_logs', COALESCE((
+    SELECT json_agg(json_build_object(
+      'id', n.id,
+      'run_id', n.run_id,
+      'branch_id', n.branch_id,
+      'from_stage', n.from_stage,
+      'to_stage', n.to_stage,
+      'turn_index', n.turn_index,
+      'message_structured', n.message_structured,
+      'scope_diff', n.scope_diff,
+      'is_escalated', n.is_escalated,
+      'created_at', n.created_at
+    ) ORDER BY n.created_at ASC, n.turn_index ASC)
+    FROM negotiation_logs n
+  ), '[]'::json),
+  'human_decisions', COALESCE((
+    SELECT json_agg(json_build_object(
+      'id', h.id,
+      'run_id', h.run_id,
+      'snap_id', h.snap_id,
+      'reviewer_id', h.reviewer_id,
+      'reviewer_user_id', h.reviewer_user_id,
+      'decision_type', h.decision_type,
+      'comment', h.comment,
+      'created_at', h.created_at
+    ) ORDER BY h.created_at ASC)
+    FROM human_decisions h
+  ), '[]'::json),
+  'rejected_history_rag', COALESCE((
+    SELECT json_agg(json_build_object(
+      'id', g.id,
+      'stage_id', g.stage_id,
+      'desensitized_lesson', g.desensitized_lesson,
+      'embedding', g.embedding::text,
+      'embedding_source', g.embedding_source,
+      'created_at', g.created_at
+    ) ORDER BY g.created_at ASC)
+    FROM rejected_history_rag g
+  ), '[]'::json),
+  'team_comments', COALESCE((
+    SELECT json_agg(json_build_object(
+      'id', c.id,
+      'run_id', c.run_id,
+      'stage_id', c.stage_id,
+      'author_user_id', c.author_user_id,
+      'author_name', c.author_name,
+      'author_job_title', c.author_job_title,
+      'author_badge', c.author_badge,
+      'content', c.content,
+      'category', c.category,
+      'created_at', c.created_at
+    ) ORDER BY c.created_at ASC)
+    FROM team_comments c
+  ), '[]'::json),
+  'notifications', COALESCE((
+    SELECT json_agg(json_build_object(
+      'id', n.id,
+      'run_id', n.run_id,
+      'branch_id', n.branch_id,
+      'stage_id', n.stage_id,
+      'sender_role', n.sender_role,
+      'category', n.category,
+      'title', n.title,
+      'message', n.message,
+      'related_snapshot_id', n.related_snapshot_id,
+      'requires_human_action', n.requires_human_action,
+      'resolved', n.resolved,
+      'action_options', n.action_options,
+      'created_at', n.created_at
+    ) ORDER BY n.created_at ASC)
+    FROM notifications n
+  ), '[]'::json),
+  'live_events', COALESCE((
+    SELECT json_agg(json_build_object(
+      'id', e.id,
+      'run_id', e.run_id,
+      'branch_id', e.branch_id,
+      'stage_id', e.stage_id,
+      'agent_role', e.agent_role,
+      'lifecycle_state', e.lifecycle_state,
+      'headline', e.headline,
+      'detail_payload', e.detail_payload,
+      'created_at', e.created_at
+    ) ORDER BY e.created_at ASC)
+    FROM live_events e
+  ), '[]'::json),
+  'audit_entries', COALESCE((
+    SELECT json_agg(json_build_object(
+      'id', a.id,
+      'run_id', a.run_id,
+      'branch_id', a.branch_id,
+      'stage_id', a.stage_id,
+      'actor', a.actor,
+      'action_type', a.action_type,
+      'summary', a.summary,
+      'metadata', a.metadata,
+      'created_at', a.created_at
+    ) ORDER BY a.created_at ASC)
+    FROM audit_entries a
+  ), '[]'::json),
+  'system_runtime_state', COALESCE((
+    SELECT json_agg(json_build_object(
+      'state_key', st.state_key,
+      'payload', st.payload
+    ))
+    FROM system_runtime_state st
+  ), '[]'::json)
+)::text;
+`.trim();
 
 const FULL_LOAD_QUERY_WITH_COMMENTS = `
 SELECT json_build_object(
@@ -322,20 +608,32 @@ const FULL_LOAD_QUERY_CORE = FULL_LOAD_QUERY_WITH_COMMENTS.replace(
   '',
 );
 
-/** psql CLI 方式执行 SQL 脚本（避免引入 pg 原生依赖，保持单机轻量） */
+/** psql CLI 方式执行 SQL 脚本（避免引入 pg 原生依赖，保持单机轻量；P1-2 写入路径改为非阻塞合并异步队列） */
 export class PgPersistenceDriver implements PersistenceDriver {
   private readonly databaseUrl: string;
   private readonly sqlExecutor: PgSqlExecutor;
+  private readonly asyncWriteExecutor: PgAsyncSqlExecutor | null;
+  private readonly pinnedVectorDim?: number;
+  private pendingSyncSql: string | null = null;
+  private writeDrainPromise: Promise<void> | null = null;
 
-  public constructor(databaseUrl?: string, sqlExecutor?: PgSqlExecutor) {
+  public constructor(
+    databaseUrl?: string,
+    sqlExecutor?: PgSqlExecutor,
+    options?: PgPersistenceDriverOptions,
+  ) {
     this.databaseUrl = databaseUrl ?? process.env.DATABASE_URL ?? '';
-    if (!this.databaseUrl && !sqlExecutor) {
+    if (!this.databaseUrl && !sqlExecutor && !options?.asyncSqlExecutor) {
       throw new Error('PgPersistenceDriver 需要 DATABASE_URL 环境变量');
     }
+    this.pinnedVectorDim = options?.pinnedVectorDim;
     this.sqlExecutor =
       sqlExecutor ??
-      ((sql: string, options?: { readOnly?: boolean }): string => {
-        if (options?.readOnly) {
+      ((sql: string, execOptions?: { readOnly?: boolean }): string => {
+        if (!this.databaseUrl) {
+          return '';
+        }
+        if (execOptions?.readOnly) {
           return execFileSync(
             'psql',
             [this.databaseUrl, '-v', 'ON_ERROR_STOP=1', '-t', '-A', '-c', sql],
@@ -356,14 +654,111 @@ export class PgPersistenceDriver implements PersistenceDriver {
           fs.rmSync(tmpFile, { force: true });
         }
       });
+
+    if (options?.asyncSqlExecutor) {
+      this.asyncWriteExecutor = options.asyncSqlExecutor;
+    } else if (!sqlExecutor) {
+      this.asyncWriteExecutor = (
+        sql: string,
+        execOptions?: { readOnly?: boolean },
+      ): Promise<string> => this.execPsqlAsync(sql, Boolean(execOptions?.readOnly));
+    } else {
+      this.asyncWriteExecutor = null;
+    }
+  }
+
+  private execPsqlAsync(sql: string, readOnly: boolean): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (readOnly) {
+        execFile(
+          'psql',
+          [this.databaseUrl, '-v', 'ON_ERROR_STOP=1', '-t', '-A', '-c', sql],
+          { timeout: 30000, encoding: 'utf-8' },
+          (err, stdout) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+            resolve(stdout);
+          },
+        );
+        return;
+      }
+      const tmpFile = path.join(
+        os.tmpdir(),
+        `d2-pg-sync-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.sql`,
+      );
+      fs.writeFile(tmpFile, sql, 'utf-8', (writeErr) => {
+        if (writeErr) {
+          reject(writeErr);
+          return;
+        }
+        execFile(
+          'psql',
+          [this.databaseUrl, '-v', 'ON_ERROR_STOP=1', '-f', tmpFile],
+          { timeout: 30000, encoding: 'utf-8' },
+          (execErr, stdout) => {
+            fs.rm(tmpFile, { force: true }, () => {
+              if (execErr) {
+                reject(execErr);
+                return;
+              }
+              resolve(stdout);
+            });
+          },
+        );
+      });
+    });
+  }
+
+  private enqueueCoalescedWrite(sql: string): void {
+    this.pendingSyncSql = sql;
+    if (this.writeDrainPromise) {
+      return;
+    }
+    this.writeDrainPromise = this.drainWriteQueue();
+  }
+
+  private async drainWriteQueue(): Promise<void> {
+    try {
+      while (this.pendingSyncSql !== null) {
+        const nextSql = this.pendingSyncSql;
+        this.pendingSyncSql = null;
+        try {
+          await this.asyncWriteExecutor!(nextSql, { readOnly: false });
+        } catch (err) {
+          console.warn(
+            `[D2] PG 异步同步失败（数据保留在 JSON 兜底）: ${err instanceof Error ? err.message.slice(0, 200) : err}`,
+          );
+        }
+      }
+    } finally {
+      this.writeDrainPromise = null;
+    }
+  }
+
+  /** P1-2：等待挂起的异步 PG 状态同步排空（优雅关停/测试断言用） */
+  public async flushPendingWrites(): Promise<void> {
+    while (this.writeDrainPromise !== null || this.pendingSyncSql !== null) {
+      if (this.writeDrainPromise) {
+        await this.writeDrainPromise;
+      } else if (this.pendingSyncSql !== null) {
+        this.writeDrainPromise = this.drainWriteQueue();
+        await this.writeDrainPromise;
+      }
+    }
   }
 
   public generateUpsertSql(snapshot: PersistedLedgerSnapshot): string {
-    return buildPgUpsertSql(snapshot);
+    return buildPgUpsertSql(snapshot, { pinnedVectorDim: this.pinnedVectorDim });
   }
 
   public saveFullState(snapshot: PersistedLedgerSnapshot): void {
     const sql = this.generateUpsertSql(snapshot);
+    if (this.asyncWriteExecutor) {
+      this.enqueueCoalescedWrite(sql);
+      return;
+    }
     try {
       this.sqlExecutor(sql, { readOnly: false });
     } catch (err) {
@@ -373,24 +768,42 @@ export class PgPersistenceDriver implements PersistenceDriver {
     }
   }
 
-  /** AUDIT-8：从 PostgreSQL 完整回读运行实例、快照、协商日志、人工裁决、RAG 与团队评论 */
+  /** AUDIT-8 / P1-2：从 PostgreSQL 完整回读运行实例、快照、协商日志、人工裁决、RAG、团队评论、通知、事件流、审计与运行时配置 */
   public loadFullState(): PersistedLedgerSnapshot | null {
     let rawOutput: string;
     try {
-      rawOutput = this.sqlExecutor(FULL_LOAD_QUERY_WITH_COMMENTS, { readOnly: true });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('team_comments')) {
+      rawOutput = this.sqlExecutor(FULL_LOAD_QUERY_EXTENDED, { readOnly: true });
+    } catch (extErr) {
+      const extMsg = extErr instanceof Error ? extErr.message : String(extErr);
+      const canFallbackToComments =
+        extMsg.includes('notifications') ||
+        extMsg.includes('live_events') ||
+        extMsg.includes('audit_entries') ||
+        extMsg.includes('system_runtime_state') ||
+        extMsg.includes('created_by_user_id') ||
+        extMsg.includes('reviewer_user_id') ||
+        extMsg.includes('embedding_source');
+      if (canFallbackToComments) {
         try {
-          rawOutput = this.sqlExecutor(FULL_LOAD_QUERY_CORE, { readOnly: true });
-        } catch (fallbackErr) {
-          console.warn(
-            `[D2] PG 读取失败（回落 JSON 兜底）: ${fallbackErr instanceof Error ? fallbackErr.message.slice(0, 200) : fallbackErr}`,
-          );
-          return null;
+          rawOutput = this.sqlExecutor(FULL_LOAD_QUERY_WITH_COMMENTS, { readOnly: true });
+        } catch (commentsErr) {
+          const msg = commentsErr instanceof Error ? commentsErr.message : String(commentsErr);
+          if (msg.includes('team_comments')) {
+            try {
+              rawOutput = this.sqlExecutor(FULL_LOAD_QUERY_CORE, { readOnly: true });
+            } catch (fallbackErr) {
+              console.warn(
+                `[D2] PG 读取失败（回落 JSON 兜底）: ${fallbackErr instanceof Error ? fallbackErr.message.slice(0, 200) : fallbackErr}`,
+              );
+              return null;
+            }
+          } else {
+            console.warn(`[D2] PG 读取失败（回落 JSON 兜底）: ${msg.slice(0, 200)}`);
+            return null;
+          }
         }
       } else {
-        console.warn(`[D2] PG 读取失败（回落 JSON 兜底）: ${msg.slice(0, 200)}`);
+        console.warn(`[D2] PG 读取失败（回落 JSON 兜底）: ${extMsg.slice(0, 200)}`);
         return null;
       }
     }
@@ -428,6 +841,7 @@ export class PgPersistenceDriver implements PersistenceDriver {
         activeBranchId,
         status: String(row.status ?? 'RUNNING'),
         initiatorActor: String(row.created_by ?? ''),
+        ...(row.created_by_user_id ? { createdByUserId: String(row.created_by_user_id) } : {}),
         createdAtIso: safeTimestampIso(row.created_at),
         proposal:
           yamlMeta.proposal && typeof yamlMeta.proposal === 'object'
@@ -538,6 +952,7 @@ export class PgPersistenceDriver implements PersistenceDriver {
         branchId: linkedSnap?.branchId ?? 'branch-v1-main',
         stageId: linkedSnap?.stageId ?? 'STAGE_1_PM',
         reviewerActor: String(row.reviewer_id ?? ''),
+        reviewerUserId: row.reviewer_user_id ? String(row.reviewer_user_id) : undefined,
         verdict: String(row.decision_type ?? 'APPROVE'),
         comment: String(row.comment ?? ''),
         createdAtIso: safeTimestampIso(row.created_at),
@@ -553,6 +968,11 @@ export class PgPersistenceDriver implements PersistenceDriver {
       desensitizedLesson: String(row.desensitized_lesson ?? ''),
       embedding: parsePgEmbedding(row.embedding),
       createdAtIso: safeTimestampIso(row.created_at),
+      ...(row.embedding_source
+        ? {
+            embeddingSource: String(row.embedding_source) as 'HASH_FALLBACK' | 'REAL_EMBEDDING',
+          }
+        : {}),
     }));
 
     const rawComments = Array.isArray(parsed.team_comments)
@@ -571,6 +991,80 @@ export class PgPersistenceDriver implements PersistenceDriver {
       createdAtIso: safeTimestampIso(row.created_at),
     }));
 
+    const rawNotifications = Array.isArray(parsed.notifications)
+      ? (parsed.notifications as Record<string, unknown>[])
+      : [];
+    const notifications: Record<string, unknown>[] = rawNotifications.map((row) => ({
+      notificationId: String(row.id ?? ''),
+      runId: String(row.run_id ?? ''),
+      branchId: String(row.branch_id ?? ''),
+      stageId: String(row.stage_id ?? 'STAGE_1_PM'),
+      senderRole: String(row.sender_role ?? 'SUPERVISOR_AGENT'),
+      category: String(row.category ?? 'STAGE_PROGRESS'),
+      title: String(row.title ?? ''),
+      message: String(row.message ?? ''),
+      relatedSnapshotId: String(row.related_snapshot_id ?? ''),
+      requiresHumanAction: Boolean(row.requires_human_action),
+      resolved: Boolean(row.resolved),
+      actionOptions: Array.isArray(row.action_options) ? row.action_options : [],
+      createdAtIso: safeTimestampIso(row.created_at),
+    }));
+
+    const rawLiveEvents = Array.isArray(parsed.live_events)
+      ? (parsed.live_events as Record<string, unknown>[])
+      : [];
+    const liveEvents: Record<string, unknown>[] = rawLiveEvents.map((row) => ({
+      eventId: String(row.id ?? ''),
+      runId: String(row.run_id ?? ''),
+      branchId: String(row.branch_id ?? ''),
+      stageId: String(row.stage_id ?? 'STAGE_0_INITIATION'),
+      agentRole: String(row.agent_role ?? 'SUPERVISOR_AGENT'),
+      lifecycleState: String(row.lifecycle_state ?? 'IDLE'),
+      headline: String(row.headline ?? ''),
+      detailPayload:
+        row.detail_payload && typeof row.detail_payload === 'object' ? row.detail_payload : {},
+      timestampIso: safeTimestampIso(row.created_at),
+    }));
+
+    const rawAuditEntries = Array.isArray(parsed.audit_entries)
+      ? (parsed.audit_entries as Record<string, unknown>[])
+      : [];
+    const auditEntries: Record<string, unknown>[] = rawAuditEntries.map((row) => ({
+      entryId: String(row.id ?? ''),
+      runId: String(row.run_id ?? ''),
+      branchId: String(row.branch_id ?? ''),
+      stageId: String(row.stage_id ?? 'STAGE_0_INITIATION'),
+      actor: String(row.actor ?? ''),
+      actionType: String(row.action_type ?? ''),
+      summary: String(row.summary ?? ''),
+      metadata: row.metadata && typeof row.metadata === 'object' ? row.metadata : {},
+      timestampIso: safeTimestampIso(row.created_at),
+    }));
+
+    const rawRuntimeState = Array.isArray(parsed.system_runtime_state)
+      ? (parsed.system_runtime_state as Record<string, unknown>[])
+      : [];
+    let governanceConfig: PersistedGovernanceConfig | undefined;
+    let cacheTelemetry: PersistedCacheTelemetry | undefined;
+    let intentTraces: Record<string, unknown>[] | undefined;
+    for (const row of rawRuntimeState) {
+      const stateKey = String(row.state_key ?? '');
+      const statePayload =
+        row.payload && typeof row.payload === 'object'
+          ? (row.payload as Record<string, unknown>)
+          : null;
+      if (!statePayload) {
+        continue;
+      }
+      if (stateKey === 'governance_config') {
+        governanceConfig = statePayload as unknown as PersistedGovernanceConfig;
+      } else if (stateKey === 'cache_telemetry') {
+        cacheTelemetry = statePayload as unknown as PersistedCacheTelemetry;
+      } else if (stateKey === 'intent_traces' && Array.isArray(statePayload.traces)) {
+        intentTraces = statePayload.traces as Record<string, unknown>[];
+      }
+    }
+
     return {
       schemaVersion: '1.1.0',
       lastSyncedAtIso: new Date().toISOString(),
@@ -580,6 +1074,12 @@ export class PgPersistenceDriver implements PersistenceDriver {
       humanDecisions,
       negativeExperienceRecords,
       ...(teamComments.length > 0 ? { teamComments } : {}),
+      ...(notifications.length > 0 ? { notifications } : {}),
+      ...(liveEvents.length > 0 ? { liveEvents } : {}),
+      ...(auditEntries.length > 0 ? { auditEntries } : {}),
+      ...(governanceConfig ? { governanceConfig } : {}),
+      ...(cacheTelemetry ? { cacheTelemetry } : {}),
+      ...(intentTraces && intentTraces.length > 0 ? { intentTraces } : {}),
     };
   }
 
@@ -594,11 +1094,12 @@ export class PgPersistenceDriver implements PersistenceDriver {
 export function selectPersistenceDriver(
   databaseUrl?: string,
   sqlExecutor?: PgSqlExecutor,
+  options?: PgPersistenceDriverOptions,
 ): PersistenceDriver | null {
   const url = databaseUrl ?? process.env.DATABASE_URL ?? '';
   if (url) {
     try {
-      return new PgPersistenceDriver(url, sqlExecutor);
+      return new PgPersistenceDriver(url, sqlExecutor, options);
     } catch {
       console.warn('[D2] DATABASE_URL 存在但 PG 驱动初始化失败，回落 JSON 模式');
     }

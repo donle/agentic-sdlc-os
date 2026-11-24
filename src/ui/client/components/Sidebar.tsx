@@ -4,6 +4,7 @@
  */
 
 import type { DashboardStateDto } from '../types.ts';
+import { AgentAvatar } from './AgentAvatar.tsx';
 
 export type RouteKey =
   | 'projects'
@@ -133,17 +134,38 @@ export function Sidebar({
       </div>
 
       <div className={`user-identity-card ${user?.isProjectAdmin ? 'admin-tier' : ''}`}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div
+          style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}
+        >
+          <AgentAvatar
+            roleOrStage={user?.counterpartAgentRole ?? 'SUPERVISOR_AGENT'}
+            size="md"
+            mood="working"
+            showMoodBadge
+          />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, lineHeight: 1.25 }}>
+              {user?.displayName ?? ''}
+            </div>
+            <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 2 }}>
+              {user ? `${user.jobTitle} · ${user.department}` : ''}
+            </div>
+          </div>
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginTop: 4,
+          }}
+        >
           <span className={`pill ${user?.isProjectAdmin ? 'pill-purple' : 'pill-blue'}`}>
             {user?.avatarBadge ?? 'USER'}
           </span>
           <span className={`pill ${user?.isProjectAdmin ? 'pill-purple' : 'pill-cyan'}`}>
             {user?.isProjectAdmin ? '项目最高管理员' : '环节专业负责人'}
           </span>
-        </div>
-        <div style={{ fontSize: 14, fontWeight: 700, marginTop: 2 }}>{user?.displayName ?? ''}</div>
-        <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
-          {user ? `${user.jobTitle} · ${user.department}` : ''}
         </div>
         <div
           style={{
@@ -171,15 +193,9 @@ export function Sidebar({
               onClick={() => onRouteChange(item.route)}
             >
               <span className="nav-item-left">
-                <svg
-                  className="nav-icon"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                >
+                <span className="nav-icon" aria-hidden="true">
                   {item.icon}
-                </svg>
+                </span>
                 <span>{item.label}</span>
               </span>
               {item.route === 'gate-center' ? (

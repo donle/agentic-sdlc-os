@@ -17,6 +17,7 @@ import { RbacGovernanceService } from '../src/engine/RbacGovernanceService.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
 import { ProjectProposalContract } from '../src/domain/contracts.ts';
 import { WorkflowStageId } from '../src/domain/enums.ts';
+import { createTestWorkspace } from './helpers/testIsolation.ts';
 
 describe('J2 — AgentRegistry 注册表', () => {
   it('1. 注册自定义节点：口径扩展（枚举 ∪ 自定义）、同键覆盖幂等、核心枚举禁止覆盖', () => {
@@ -167,11 +168,14 @@ describe('J2 — DSL 声明新节点', () => {
 describe('J2 — Facade 编排检查点（自定义节点跳过推进）', () => {
   it('6. 流水线经过自定义节点：广播检查点通知后继续推进直至完成', async () => {
     const tempYamlPath = path.join(os.tmpdir(), `agentic-j2-${Date.now()}.yaml`);
+    const ws = createTestWorkspace('pluggable-j2-');
     fs.writeFileSync(tempYamlPath, CUSTOM_YAML, 'utf-8');
     try {
       const orchestrator = new WorkflowOrchestratorFacade({
         dslConfigPath: tempYamlPath,
         maxNegotiationTurns: 3,
+        persistenceDir: ws.persistenceDir,
+        sandboxRootDir: ws.sandboxRootDir,
       });
       const runState = await orchestrator.startProposalWorkflow({
         proposal: new ProjectProposalContract({
@@ -192,6 +196,7 @@ describe('J2 — Facade 编排检查点（自定义节点跳过推进）', () =>
       assert.equal(checkpointNotice.requiresHumanAction, false, '检查点通知不要求人工操作');
     } finally {
       fs.rmSync(tempYamlPath, { force: true });
+      ws.cleanup();
     }
   });
 });

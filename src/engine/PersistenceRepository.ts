@@ -12,10 +12,19 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { HumanDecisionRecord, NegotiationTurnRecord } from '../domain/models.ts';
+import type { PersistedCacheTelemetrySnapshot } from '../telemetry/PromptCacheManager.ts';
 import type { WorkflowRunState } from './DagWorkflowStateEngine.ts';
 import type { AuditTrailEntry } from './ImmutableAuditLedger.ts';
 import type { NegativeExperienceVectorRecord } from './NegativeExperienceRagEngine.ts';
 import { buildPgUpsertSql, selectPersistenceDriver } from './pg/PgPersistenceDriver.ts';
+
+export interface PersistedGovernanceConfig {
+  readonly maxNegotiationTurns: number;
+  readonly highRiskScoreThreshold: number;
+  readonly allowSpecialistCrossStageRollback: boolean;
+}
+
+export type PersistedCacheTelemetry = PersistedCacheTelemetrySnapshot;
 
 export interface PersistedRunRecord {
   readonly runId: string;
@@ -24,6 +33,7 @@ export interface PersistedRunRecord {
   readonly activeBranchId: string;
   readonly status: string;
   readonly initiatorActor: string;
+  readonly createdByUserId?: string;
   readonly createdAtIso: string;
   /** D1：完整重建运行状态机所需字段 */
   readonly proposal: Record<string, unknown>;
@@ -61,6 +71,10 @@ export interface PersistedLedgerSnapshot {
   readonly teamComments?: ReadonlyArray<Record<string, unknown>>;
   /** AUDIT-9：审计时间线条目兜底快照（WAL 缺失时亦可恢复） */
   readonly auditEntries?: ReadonlyArray<Record<string, unknown>>;
+  /** P1-2：动态治理参数、缓存遥测与意图达成复盘追踪 */
+  readonly governanceConfig?: PersistedGovernanceConfig;
+  readonly cacheTelemetry?: PersistedCacheTelemetry;
+  readonly intentTraces?: ReadonlyArray<Record<string, unknown>>;
 }
 
 export class PersistenceRepository {
@@ -146,6 +160,9 @@ export class PersistenceRepository {
     notifications?: ReadonlyArray<Record<string, unknown>>;
     teamComments?: ReadonlyArray<Record<string, unknown>>;
     auditEntries?: ReadonlyArray<Record<string, unknown>>;
+    governanceConfig?: PersistedGovernanceConfig;
+    cacheTelemetry?: PersistedCacheTelemetry;
+    intentTraces?: ReadonlyArray<Record<string, unknown>>;
   }): PersistedLedgerSnapshot {
     this.ensureStorageDirectory();
     this.lastSyncedAtIso = new Date().toISOString();
@@ -162,6 +179,7 @@ export class PersistenceRepository {
         activeBranchId: r.getActiveBranchId(),
         status: r.getStatus(),
         initiatorActor: r.initiatorActor,
+        ...(r.createdByUserId ? { createdByUserId: r.createdByUserId } : {}),
         createdAtIso: r.createdAtIso,
         proposal: r.proposal.toSerializableRecord(),
         stagePipeline: [...r.getStagePipeline()],
@@ -187,6 +205,9 @@ export class PersistenceRepository {
       notifications: [...(params.notifications ?? [])],
       teamComments: [...(params.teamComments ?? [])],
       ...(params.auditEntries ? { auditEntries: [...params.auditEntries] } : {}),
+      ...(params.governanceConfig ? { governanceConfig: { ...params.governanceConfig } } : {}),
+      ...(params.cacheTelemetry ? { cacheTelemetry: { ...params.cacheTelemetry } } : {}),
+      ...(params.intentTraces ? { intentTraces: [...params.intentTraces] } : {}),
     };
 
     fs.writeFileSync(this.snapshotFilePath, JSON.stringify(payload, null, 2), 'utf-8');
@@ -226,6 +247,15 @@ export class PersistenceRepository {
             : {}),
           ...((pgSnapshot.auditEntries ?? jsonFallback?.auditEntries)
             ? { auditEntries: pgSnapshot.auditEntries ?? jsonFallback?.auditEntries }
+            : {}),
+          ...((pgSnapshot.governanceConfig ?? jsonFallback?.governanceConfig)
+            ? { governanceConfig: pgSnapshot.governanceConfig ?? jsonFallback?.governanceConfig }
+            : {}),
+          ...((pgSnapshot.cacheTelemetry ?? jsonFallback?.cacheTelemetry)
+            ? { cacheTelemetry: pgSnapshot.cacheTelemetry ?? jsonFallback?.cacheTelemetry }
+            : {}),
+          ...((pgSnapshot.intentTraces ?? jsonFallback?.intentTraces)
+            ? { intentTraces: pgSnapshot.intentTraces ?? jsonFallback?.intentTraces }
             : {}),
         };
       }

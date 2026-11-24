@@ -63,6 +63,16 @@ describe('Block 5 — Web 管控台 HTTP 服务、SSE 实时流推送与 YAML �
       const jsRes = await fetchText(`${baseUrl}/dist/main.js`);
       assert.equal(jsRes.status, 200);
       assert.ok(String(jsRes.headers['content-type']).includes('application/javascript'));
+      assert.ok(jsRes.body.length > 10000, '/dist/main.js 必须是打包后的 React 应用产物');
+      assert.ok(
+        jsRes.body.includes('createRoot') || jsRes.body.includes('react-dom'),
+        '/dist/main.js 必须包含 React 19 运行时入口',
+      );
+      assert.equal(
+        jsRes.body.includes('WorkbenchViewController'),
+        false,
+        '/dist/main.js 不得再包含已废弃的旧版 DOM 控制器',
+      );
 
       // 2. 验证 SSE /api/events/stream 连接建立即推送首帧 state_updated 事件
       const firstSseFrame = await new Promise<string>((resolve, reject) => {

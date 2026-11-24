@@ -1,19 +1,18 @@
 /**
  * @file AgentFlowCanvas.tsx
- * @description Agent 协同流程图（SVG 声明式渲染）：阶段节点按快照状态着色，
- * 业务事件徽标（🕘回退更新 / ↩️被驳回 / ⚡缓存复用）、PM↔PD 协商弧线、
- * 总管分叉徽标与步骤查看器联动高亮。节点可点击就地打开阶段操作台。
+ * @description 拟人化 Agent 协同流程图（v3 插图角色 + 动态数据包流动 + 对话气泡 + 总管雷达连线）：
+ * 保留 L1/L2 视角密度分层与 stageOrder 自适应宽度，让每个岗位节点以真实角色形象与动画状态呈现在流程脊柱上。
  */
 
-import type { FlowNegotiationHint, FlowNodeInput } from '../types.ts';
+import { moodFromState, personaFor } from '../lib/agentPersona.ts';
 import { SVG_STAGE_LABELS } from '../lib/display.ts';
+import type { PerspectiveState } from '../lib/perspective.ts';
+import type { FlowNegotiationHint, FlowNodeInput } from '../types.ts';
 
-const VIEW_WIDTH = 1080;
-const VIEW_HEIGHT = 284;
-const NODE_WIDTH = 152;
-const NODE_HEIGHT = 78;
-const ROW_Y = 168;
-const GAP = (VIEW_WIDTH - 40 - 6 * NODE_WIDTH) / 5;
+const ROW_Y = 172;
+const VIEW_HEIGHT = 332;
+const NODE_HEIGHT = 104;
+const AVATAR_R = 20;
 
 const STATE_BADGE_TEXT: Record<string, string> = {
   APPROVED: '✓ 已通过签核',
@@ -23,54 +22,144 @@ const STATE_BADGE_TEXT: Record<string, string> = {
   SUPERSEDED: '🕘 历史旧版',
 };
 
+function shortSpeechForNode(input: FlowNodeInput, stepFocus: boolean): string | null {
+  const snap = input.activeBranchSnapshot;
+  if (input.hasPendingGateNotification || snap?.state === 'PENDING_HUMAN_GATE') {
+    return '🙋 请您拍板!';
+  }
+  if (snap?.state === 'REJECTED') {
+    return '↩️ 待重做调整';
+  }
+  if (stepFocus && snap) {
+    const mood = moodFromState(snap.state);
+    if (mood === 'celebrating') {
+      return snap.cacheHit ? '✨ 复用秒过!' : '🎉 交付就绪';
+    }
+    return '⚡ 当前聚焦';
+  }
+  return null;
+}
+
 function StageNode({
   input,
   x,
   y,
+  nodeWidth,
   stepFocus,
+  isL1Summary,
+  clipId,
   onNodeClick,
 }: {
   input: FlowNodeInput;
   x: number;
   y: number;
+  nodeWidth: number;
   stepFocus: boolean;
+  isL1Summary: boolean;
+  clipId: string;
   onNodeClick: (stageId: string) => void;
 }) {
   const label = SVG_STAGE_LABELS[input.stageId] ?? {
-    stepTag: input.stageId,
+    stepTag: input.stageId.replace('STAGE_', ''),
     shortLabel: input.stageId,
     emoji: '🤖',
   };
+  const persona = personaFor(input.stageId);
   const snap = input.activeBranchSnapshot;
   const stateClass = snap ? `state-${snap.state.toLowerCase()}` : 'state-idle';
-  const badgeText = snap ? (STATE_BADGE_TEXT[snap.state] ?? snap.state) : '◌ 待启动';
-  const centerX = x + NODE_WIDTH / 2;
+  const rawBadgeText = snap ? (STATE_BADGE_TEXT[snap.state] ?? snap.state) : '◌ 待启动';
+  const badgeText = isL1Summary && snap ? `L1 · ${rawBadgeText}` : rawBadgeText;
+  const centerX = x + nodeWidth / 2;
+  const avatarCy = y + 28;
+  const speech = shortSpeechForNode(input, stepFocus);
 
   return (
     <g
-      className={`flow-node ${stateClass} ${input.hasPendingGateNotification ? 'gate-hovering' : ''} ${stepFocus ? 'node-step-focus' : ''}`}
+      className={`flow-node ${stateClass} ${isL1Summary ? 'node-l1-summary' : ''} ${input.hasPendingGateNotification ? 'gate-hovering' : ''} ${stepFocus ? 'node-step-focus' : ''}`}
       data-stage-id={input.stageId}
+      data-density={isL1Summary ? 'L1' : 'L2'}
       onClick={() => onNodeClick(input.stageId)}
     >
-      <rect className="flow-node-box" x={x} y={y} rx={13} width={NODE_WIDTH} height={NODE_HEIGHT} />
-      <rect className="flow-step-pill" x={x + 10} y={y + 9} rx={7} width={52} height={17} />
-      <text className="flow-step-pill-text" x={x + 36} y={y + 21} textAnchor="middle">
+      {/* 节点上方拟人对话小气泡 */}
+      {speech ? (
+        <g className="flow-speech-bubble">
+          <rect
+            className="flow-speech-bubble-box"
+            x={centerX - 48}
+            y={y - 31}
+            rx={10}
+            width={96}
+            height={22}
+            style={{ stroke: persona.accentColor }}
+          />
+          <polygon
+            className="flow-speech-bubble-tail"
+            points={`${centerX - 5},${y - 10} ${centerX + 5},${y - 10} ${centerX},${y - 4}`}
+          />
+          <text className="flow-speech-bubble-text" x={centerX} y={y - 16} textAnchor="middle">
+            {speech}
+          </text>
+        </g>
+      ) : null}
+
+      <rect className="flow-node-box" x={x} y={y} rx={15} width={nodeWidth} height={NODE_HEIGHT} />
+
+      {/* 左上角步骤徽标 */}
+      <rect className="flow-step-pill" x={x + 8} y={y + 8} rx={6} width={48} height={16} />
+      <text className="flow-step-pill-text" x={x + 32} y={y + 19} textAnchor="middle">
         {label.stepTag}
       </text>
-      <text className="flow-node-emoji" x={x + NODE_WIDTH - 18} y={y + 22} textAnchor="middle">
-        {label.emoji}
-      </text>
-      <text className="flow-node-title" x={centerX} y={y + 45} textAnchor="middle">
+
+      {/* 右上角角色人物专长缩写 */}
+      {!isL1Summary ? (
+        <text
+          className="flow-node-person-tag"
+          x={x + nodeWidth - 10}
+          y={y + 19}
+          textAnchor="end"
+          style={{ fill: persona.accentColor }}
+        >
+          {persona.personName}
+        </text>
+      ) : null}
+
+      {/* 拟人插图圆形头像 */}
+      <g
+        className={`flow-node-avatar-group ${stepFocus || input.hasPendingGateNotification ? 'avatar-bobbing' : ''}`}
+      >
+        <circle
+          cx={centerX}
+          cy={avatarCy}
+          r={AVATAR_R + 3}
+          fill={persona.softBg}
+          stroke={persona.accentColor}
+          strokeWidth={snap ? 2 : 1.2}
+          strokeDasharray={snap ? undefined : '3 2'}
+        />
+        <image
+          href={persona.avatarSrc}
+          x={centerX - AVATAR_R}
+          y={avatarCy - AVATAR_R}
+          width={AVATAR_R * 2}
+          height={AVATAR_R * 2}
+          clipPath={`url(#${clipId})`}
+          preserveAspectRatio="xMidYMid slice"
+          opacity={snap?.state === 'SUPERSEDED' ? 0.55 : 1}
+        />
+      </g>
+
+      <text className="flow-node-title" x={centerX} y={y + 68} textAnchor="middle">
         {label.shortLabel}
       </text>
-      <text className="flow-node-status" x={centerX} y={y + 63} textAnchor="middle">
+      <text className="flow-node-status" x={centerX} y={y + 87} textAnchor="middle">
         {badgeText}
       </text>
-      {snap?.cacheHit ? (
+
+      {snap?.cacheHit && !isL1Summary ? (
         <text
           className="flow-cache-badge"
-          x={x + NODE_WIDTH - 14}
-          y={y + NODE_HEIGHT + 12}
+          x={x + nodeWidth - 14}
+          y={y + NODE_HEIGHT + 15}
           textAnchor="middle"
         >
           ⚡缓存复用
@@ -79,18 +168,18 @@ function StageNode({
       {input.supersededVersionCount > 0 ? (
         <text
           className="flow-superseded-badge"
-          x={x + 14}
-          y={y + NODE_HEIGHT + 12}
+          x={x + 22}
+          y={y + NODE_HEIGHT + 15}
           textAnchor="middle"
         >
-          🕘 回退更新 x{input.supersededVersionCount}
+          🕘 回退 x{input.supersededVersionCount}
         </text>
       ) : null}
       {input.rejectedCount > 0 ? (
         <text
           className="flow-rejected-badge"
           x={centerX}
-          y={y + NODE_HEIGHT + 24}
+          y={y + NODE_HEIGHT + 28}
           textAnchor="middle"
         >
           ↩️ 被驳回 x{input.rejectedCount}
@@ -108,6 +197,7 @@ export function AgentFlowCanvas({
   stepFocusStageId,
   activeBranchId,
   branchCount,
+  perspective,
   onNodeClick,
 }: {
   stageOrder: ReadonlyArray<string>;
@@ -117,20 +207,54 @@ export function AgentFlowCanvas({
   stepFocusStageId: string | null;
   activeBranchId: string;
   branchCount: number;
+  perspective?: PerspectiveState;
   onNodeClick: (stageId: string) => void;
 }) {
-  const pmX = 20 + NODE_WIDTH / 2;
-  const pdX = 20 + (NODE_WIDTH + GAP) + NODE_WIDTH / 2;
-  const arcY = ROW_Y - 26;
+  const count = Math.max(1, stageOrder.length);
+  const nodeWidth = count <= 4 ? 204 : count <= 6 ? 156 : 138;
+  const gap = count > 1 ? 30 : 0;
+  const sidePad = 24;
+  const viewWidth = Math.max(960, sidePad * 2 + count * nodeWidth + (count - 1) * gap);
+
+  const supervisorPersona = personaFor('SUPERVISOR_AGENT');
+
+  const pmIndex = stageOrder.indexOf('STAGE_1_PM');
+  const pdIndex = stageOrder.indexOf('STAGE_2_PD');
+  const pmX =
+    pmIndex >= 0 ? sidePad + pmIndex * (nodeWidth + gap) + nodeWidth / 2 : sidePad + nodeWidth / 2;
+  const pdX =
+    pdIndex >= 0
+      ? sidePad + pdIndex * (nodeWidth + gap) + nodeWidth / 2
+      : sidePad + nodeWidth + gap + nodeWidth / 2;
+  const arcY = ROW_Y - 52;
   const negotiationVisible =
     negotiation !== null &&
+    pmIndex >= 0 &&
+    pdIndex >= 0 &&
     inputs.some((i) => i.stageId === 'STAGE_1_PM' && i.activeBranchSnapshot);
+
+  // 总管雷达连接目标：优先连向待人工确认节点或当前聚焦节点
+  const targetStageIndex = (() => {
+    const pendingIdx = stageOrder.findIndex((sid) =>
+      inputs.some((i) => i.stageId === sid && i.hasPendingGateNotification),
+    );
+    if (pendingIdx >= 0) {
+      return pendingIdx;
+    }
+    const focusIdx = stepFocusStageId ? stageOrder.indexOf(stepFocusStageId) : -1;
+    return focusIdx;
+  })();
+
+  const targetNodeX =
+    targetStageIndex >= 0
+      ? sidePad + targetStageIndex * (nodeWidth + gap) + nodeWidth / 2
+      : viewWidth / 2;
 
   return (
     <div className="agent-flow-canvas-wrap">
       <svg
         className="agent-flow-svg"
-        viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`}
+        viewBox={`0 0 ${viewWidth} ${VIEW_HEIGHT}`}
         preserveAspectRatio="xMidYMid meet"
         role="img"
         aria-label="Agent 协同流程画布"
@@ -139,43 +263,87 @@ export function AgentFlowCanvas({
           <marker id="flowArrow" markerWidth={8} markerHeight={8} refX={7} refY={4} orient="auto">
             <path d="M0,0 L8,4 L0,8 Z" />
           </marker>
+          <clipPath id="clip-supervisor">
+            <circle cx={viewWidth / 2 - 110} cy={47} r={20} />
+          </clipPath>
+          {stageOrder.map((stageId, index) => {
+            const x = sidePad + index * (nodeWidth + gap);
+            const cx = x + nodeWidth / 2;
+            const cy = ROW_Y + 28;
+            return (
+              <clipPath key={stageId} id={`clip-stage-${index}`}>
+                <circle cx={cx} cy={cy} r={AVATAR_R} />
+              </clipPath>
+            );
+          })}
         </defs>
 
+        {/* 总管 Agent · 调度塔台 */}
         <g className={`flow-supervisor ${hasRollbackFork ? 'supervisor-engaged' : ''}`}>
+          <path
+            className="flow-supervisor-tether"
+            d={`M ${viewWidth / 2} 78 Q ${viewWidth / 2} 118, ${targetNodeX} ${ROW_Y - 12}`}
+            fill="none"
+          />
+          {targetStageIndex >= 0 ? (
+            <circle className="flow-supervisor-pulse-orb" r={4}>
+              <animateMotion
+                dur="2.2s"
+                repeatCount="indefinite"
+                path={`M ${viewWidth / 2} 78 Q ${viewWidth / 2} 118, ${targetNodeX} ${ROW_Y - 12}`}
+              />
+            </circle>
+          ) : null}
+
           <rect
             className="flow-supervisor-box"
-            x={(VIEW_WIDTH - 260) / 2}
-            y={18}
-            rx={14}
-            width={260}
-            height={58}
+            x={(viewWidth - 300) / 2}
+            y={14}
+            rx={16}
+            width={300}
+            height={64}
           />
-          <text className="flow-supervisor-title" x={VIEW_WIDTH / 2} y={43} textAnchor="middle">
-            🧭 总管 Agent · PMO 调度官
-          </text>
-          <text className="flow-supervisor-subtitle" x={VIEW_WIDTH / 2} y={62} textAnchor="middle">
-            监听全链路 · 冲突接管 · 对话式 DAG 回退
-          </text>
-          <line
-            className="flow-supervisor-tether"
-            x1={VIEW_WIDTH / 2}
-            y1={76}
-            x2={VIEW_WIDTH / 2}
-            y2={ROW_Y - 6}
+          <circle
+            cx={viewWidth / 2 - 110}
+            cy={47}
+            r={23}
+            fill={supervisorPersona.softBg}
+            stroke={supervisorPersona.accentColor}
+            strokeWidth={2}
           />
+          <image
+            href={supervisorPersona.avatarSrc}
+            x={viewWidth / 2 - 130}
+            y={27}
+            width={40}
+            height={40}
+            clipPath="url(#clip-supervisor)"
+            preserveAspectRatio="xMidYMid slice"
+          />
+          <text className="flow-supervisor-title" x={viewWidth / 2 + 16} y={40} textAnchor="middle">
+            {supervisorPersona.personName} · 总管调度官
+          </text>
+          <text
+            className="flow-supervisor-subtitle"
+            x={viewWidth / 2 + 16}
+            y={59}
+            textAnchor="middle"
+          >
+            监听全链路 · 冲突仲裁 · DAG 分叉回退
+          </text>
           <g className="flow-fork-badge" style={{ display: hasRollbackFork ? '' : 'none' }}>
             <rect
               className="flow-fork-badge-box"
-              x={VIEW_WIDTH / 2 + 140}
-              y={28}
+              x={viewWidth / 2 + 162}
+              y={31}
               rx={9}
               width={118}
               height={26}
             />
             <text
               className="flow-fork-badge-text"
-              x={VIEW_WIDTH / 2 + 199}
-              y={45}
+              x={viewWidth / 2 + 221}
+              y={48}
               textAnchor="middle"
             >
               ⎇ 已分叉回退
@@ -183,21 +351,45 @@ export function AgentFlowCanvas({
           </g>
         </g>
 
+        {/* 各岗位 Agent 工作站节点 + 动态交接传送粒子 */}
         {stageOrder.map((stageId, index) => {
-          const x = 20 + index * (NODE_WIDTH + GAP);
+          const x = sidePad + index * (nodeWidth + gap);
           const input = inputs.find((i) => i.stageId === stageId);
-          const reached = Boolean(inputs[index + 1]?.activeBranchSnapshot);
+          const prevInput = index > 0 ? inputs[index - 1] : undefined;
+          const reached = Boolean(input?.activeBranchSnapshot);
+          const prevDone = Boolean(prevInput?.activeBranchSnapshot);
+          const isL1Summary = perspective ? perspective.getStageDensity(stageId) === 'L1' : false;
+          const edgeStartX = x - gap;
+          const edgeEndX = x;
+          const edgeY = ROW_Y + NODE_HEIGHT / 2;
+          const edgePersona = index > 0 ? personaFor(stageOrder[index - 1]) : null;
+
           return (
             <g key={stageId}>
               {index > 0 ? (
-                <line
-                  className={`flow-edge ${reached ? 'flow-edge-active' : ''}`}
-                  x1={x - GAP}
-                  y1={ROW_Y + NODE_HEIGHT / 2}
-                  x2={x}
-                  y2={ROW_Y + NODE_HEIGHT / 2}
-                  markerEnd="url(#flowArrow)"
-                />
+                <g>
+                  <line
+                    className={`flow-edge ${reached || prevDone ? 'flow-edge-active' : ''}`}
+                    x1={edgeStartX}
+                    y1={edgeY}
+                    x2={edgeEndX}
+                    y2={edgeY}
+                    markerEnd="url(#flowArrow)"
+                  />
+                  {reached || prevDone ? (
+                    <circle
+                      className="flow-packet-orb"
+                      r={4.2}
+                      fill={edgePersona?.accentColor ?? '#2f54eb'}
+                    >
+                      <animateMotion
+                        dur="1.7s"
+                        repeatCount="indefinite"
+                        path={`M ${edgeStartX + 2} ${edgeY} L ${edgeEndX - 4} ${edgeY}`}
+                      />
+                    </circle>
+                  ) : null}
+                </g>
               ) : null}
               <StageNode
                 input={
@@ -211,26 +403,37 @@ export function AgentFlowCanvas({
                 }
                 x={x}
                 y={ROW_Y}
+                nodeWidth={nodeWidth}
                 stepFocus={stageId === stepFocusStageId}
+                isL1Summary={isL1Summary}
+                clipId={`clip-stage-${index}`}
                 onNodeClick={onNodeClick}
               />
             </g>
           );
         })}
 
+        {/* PM ↔ PD 跨岗位协商弧线与动态信使光点 */}
         {negotiationVisible && negotiation ? (
           <g className={`flow-negotiation ${negotiation.escalated ? 'negotiation-escalated' : ''}`}>
             <path
               className="flow-negotiation-path"
-              d={`M ${pmX} ${ROW_Y - 4} C ${pmX} ${arcY}, ${pdX} ${arcY}, ${pdX} ${ROW_Y - 4}`}
+              d={`M ${pmX} ${ROW_Y - 6} C ${pmX} ${arcY}, ${pdX} ${arcY}, ${pdX} ${ROW_Y - 6}`}
               markerEnd="url(#flowArrow)"
             />
+            <circle r={4} className="flow-negotiation-orb">
+              <animateMotion
+                dur="1.4s"
+                repeatCount="indefinite"
+                path={`M ${pmX} ${ROW_Y - 6} C ${pmX} ${arcY}, ${pdX} ${arcY}, ${pdX} ${ROW_Y - 6}`}
+              />
+            </circle>
             <rect
               className="flow-negotiation-label-box"
-              x={(pmX + pdX) / 2 - 100}
-              y={arcY - 15}
-              rx={8}
-              width={200}
+              x={(pmX + pdX) / 2 - 110}
+              y={arcY - 14}
+              rx={9}
+              width={220}
               height={24}
             />
             <text
@@ -240,16 +443,17 @@ export function AgentFlowCanvas({
               textAnchor="middle"
             >
               {negotiation.escalated
-                ? `⛔ 协商超限熔断 (${negotiation.turnIndex}/${negotiation.maxTurnsAllowed} 轮) → 总管接管`
-                : `⇄ PM ↔ PD 受限协商 第 ${negotiation.turnIndex}/${negotiation.maxTurnsAllowed} 轮`}
+                ? `⛔ 协商熔断 (${negotiation.turnIndex}/${negotiation.maxTurnsAllowed} 轮) → 总管接管`
+                : `💬 陈工 ↔ 林工 协商第 ${negotiation.turnIndex}/${negotiation.maxTurnsAllowed} 轮`}
             </text>
           </g>
         ) : null}
       </svg>
       <div className="flow-canvas-hint">
-        💬 协商讨论 · ↩️ 被驳回 · 🕘 回退更新 · ⎇ 分支分叉 · ⚡ 缓存复用 ——
-        全部真实记录在流程图对应位置（当前分支 {activeBranchId}
-        {hasRollbackFork ? ` · 共 ${branchCount} 个分支` : ''}）
+        🎭 岗位角色在岗协同中 · 流动光点表示契约交接 ·
+        {hasRollbackFork
+          ? ` 项目已产生 ${branchCount} 条版本分支，当前正在查看【${activeBranchId}】`
+          : ' 点击任意岗位角色卡片打开交付审阅台'}
       </div>
     </div>
   );

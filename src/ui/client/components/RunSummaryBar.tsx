@@ -4,7 +4,9 @@
  */
 
 import type { DashboardStateDto } from '../types.ts';
+import { moodFromState, personaFor } from '../lib/agentPersona.ts';
 import { stageMeta } from '../lib/display.ts';
+import { AgentAvatar } from './AgentAvatar.tsx';
 
 export function RunSummaryBar({
   state,
@@ -42,9 +44,30 @@ export function RunSummaryBar({
     statusPill = <span className="pill pill-blue">{run.status}</span>;
   }
 
+  const stages = state?.stagePipelineOrder ?? [];
+  const activeSnaps = (run.snapshots ?? []).filter(
+    (s) => s.branchId === run.activeBranchId && s.state !== 'SUPERSEDED',
+  );
+
   return (
     <section className="run-summary-bar compact" id="runSummaryBar">
       <div className="run-line">
+        <div className="run-squad-avatars" aria-label="项目协同 Agent 团队">
+          <AgentAvatar roleOrStage="SUPERVISOR_AGENT" size="xs" mood="idle" />
+          {stages.map((sid) => {
+            const snap = activeSnaps.find((s) => s.stageId === sid);
+            const p = personaFor(sid);
+            return (
+              <AgentAvatar
+                key={sid}
+                roleOrStage={sid}
+                size="xs"
+                mood={snap ? moodFromState(snap.state) : 'idle'}
+                title={`${p.personName} (${p.codename})`}
+              />
+            );
+          })}
+        </div>
         <h2>{run.title}</h2>
         {statusPill}
         <span className="pill pill-blue">⎇ {run.activeBranchId}</span>

@@ -157,6 +157,15 @@ export class ProductManagerAgent extends AbstractWorkerAgent<PrdArtifactContract
       userStories,
       trackingPlanEvents,
       nonFunctionalConstraints,
+      agentRationale: `PM 基于原始提案的 ${allReqIds.length} 项诉求拆解可量化验收标准，并与前置埋点方案强绑定，结合 ${context.historicalRejectionLessons.length} 条历史驳回教训约束交付边界。`,
+      keyDecisions: [
+        {
+          decision: `为 ${userStories.length} 条 User Stories 前置挂载 ${trackingPlanEvents.length} 项标准归因埋点事件`,
+          rationale:
+            '在需求阶段前置对齐埋点字段（run_id/branch_id/actor_role/latency_ms），避免上线后数据盲区与返工',
+          tradeoffs: ['PRD 编写期增加埋点属性确认动作', '换取 Stage 5 DA 自动核验与零后期返工'],
+        },
+      ],
     });
   }
 }

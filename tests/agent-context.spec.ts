@@ -5,11 +5,17 @@
  */
 
 import * as assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, it } from 'node:test';
 
+import { DependencyVersionsProvider } from '../src/agents/context/DependencyVersionsProvider.ts';
 import { UpstreamCompressor } from '../src/agents/context/UpstreamCompressor.ts';
 import { ToolRegistry } from '../src/agents/context/ToolRegistry.ts';
 import { ContextBudgetTrimmer } from '../src/agents/context/ContextBudgetTrimmer.ts';
+import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
+import type { OpenAiCompatibleChatResponse } from '../src/patterns/ModelRouterGateway.ts';
 import { estimateTokens } from '../src/agents/context/types.ts';
 import type {
   ContextNeed,
@@ -260,5 +266,161 @@ describe('Agent 外部知识介入 — ContextBudgetTrimmer', () => {
     assert.equal(estimateTokens('需求确认'), 4);
     assert.equal(estimateTokens('abcdefgh'), 2);
     assert.equal(estimateTokens('需求require'), 2 + Math.ceil(7 / 4));
+  });
+
+  it('12. P1-3：DependencyVersionsProvider 读取真实 package.json 依赖清单并在缺失时安全降级', async () => {
+    const provider = new DependencyVersionsProvider(process.cwd());
+    assert.equal(
+      provider.canResolve({ type: 'dependency_versions', required: true, maxTokens: 500 }),
+      true,
+    );
+    const res = await provider.resolve(makeQuery(), {
+      type: 'dependency_versions',
+      required: true,
+      maxTokens: 500,
+    });
+    assert.equal(res.isReal, true);
+    assert.equal(res.source, 'local:package.json');
+    assert.ok(res.content.includes('typescript') || res.content.includes('react'));
+
+    const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p13-dep-empty-'));
+    try {
+      const missingProvider = new DependencyVersionsProvider(emptyDir);
+      const fallbackRes = await missingProvider.resolve(makeQuery(), {
+        type: 'dependency_versions',
+        required: true,
+        maxTokens: 500,
+      });
+      assert.equal(fallbackRes.isReal, false);
+      assert.equal(fallbackRes.source, 'local:package.json:missing');
+    } finally {
+      fs.rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+
+  it('13. P1-3：Facade 将 TrimmedContext 真实注入 Agent Prompt（非未裁剪 runCache），且 clearRunCache(runId) 按 run 隔离清理', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p13-trim-'));
+    const prevLive = process.env.LITELLM_ENABLE_LIVE_HTTP;
+    const facade = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: path.join(tmpDir, 'persist'),
+      sandboxRootDir: path.join(tmpDir, 'sandbox'),
+    });
+    try {
+      const registry = facade.getContextRegistry();
+      assert.ok(registry);
+      // 为 STAGE_3A_TECH_SPEC 三个需求注入大体积模拟数据（2000 + 1500 + 1000 = 4500 tokens > 4000 预算）
+      registry.register({
+        name: 'heavy-test-context',
+        canResolve: (need) =>
+          need.type === 'code_structure' ||
+          need.type === 'db_schema' ||
+          need.type === 'api_inventory',
+        resolve: async (_q, need) => {
+          const content =
+            need.type === 'code_structure'
+              ? '码'.repeat(2000)
+              : need.type === 'db_schema'
+                ? '库'.repeat(1500)
+                : 'X'.repeat(4000);
+          return {
+            type: need.type,
+            content,
+            tokenEstimate: estimateTokens(content),
+            source: 'heavy-test',
+            isReal: true,
+          };
+        },
+      });
+
+      // 预写入另一运行 RUN-OTHER 的缓存条目以验证 clearRunCache(runId) 不误删其他并发 run
+      await registry.resolve(
+        [{ type: 'dependency_versions', required: true, maxTokens: 500 }],
+        makeQuery('RUN-OTHER'),
+      );
+      assert.ok(registry.getCacheEntryCount('RUN-OTHER') > 0);
+
+      let capturedTechLeadPrompt = '';
+      process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
+      facade.modelRouter.setHttpTransport(async (_url, payload) => {
+        const sys = payload.messages?.[0]?.content ?? '';
+        const usr = payload.messages?.[1]?.content ?? '';
+        const wrap = (obj: Record<string, unknown>): OpenAiCompatibleChatResponse => ({
+          id: 'chatcmpl-trim',
+          model: 'mock',
+          choices: [{ message: { role: 'assistant', content: JSON.stringify(obj) } }],
+          usage: { prompt_tokens: 50, completion_tokens: 50, total_tokens: 100 },
+        });
+        if (sys.includes('PM Agent')) {
+          return wrap({
+            summary: 'PRD',
+            coreRequirementIds: ['R1', 'R2'],
+            userStories: [
+              { reqId: 'R1', story: 's1', acceptanceCriteria: ['ac1'] },
+              { reqId: 'R2', story: 's2', acceptanceCriteria: ['ac2'] },
+            ],
+            trackingPlanEvents: [
+              { eventName: 'e1', triggerCondition: 'c1', properties: ['p'] },
+              { eventName: 'e2', triggerCondition: 'c2', properties: ['p'] },
+            ],
+            nonFunctionalConstraints: ['nf1', 'nf2'],
+          });
+        }
+        if (sys.includes('PD Agent')) {
+          return wrap({
+            summary: 'PD',
+            coreRequirementIds: ['R1', 'R2'],
+            componentMappings: [
+              { reqId: 'R1', designSystemComponent: 'Box', interactionStates: ['default'] },
+              { reqId: 'R2', designSystemComponent: 'Table', interactionStates: ['default'] },
+            ],
+            accessibilityChecklist: ['WCAG AA'],
+            designChallengeNote: null,
+          });
+        }
+        if (sys.includes('Tech Lead Agent')) {
+          capturedTechLeadPrompt = usr;
+          return wrap({
+            summary: 'Tech',
+            coreRequirementIds: ['R1', 'R2'],
+            apiContracts: [
+              { method: 'GET', endpoint: '/api/r1', requestSchema: '{}', responseSchema: '{}' },
+            ],
+            databaseDdlStatements: ['ALTER TABLE items ADD COLUMN x INT'],
+            declaredRiskLevel: 'HIGH',
+            architecturePatternsUsed: ['Facade', 'Repository'],
+          });
+        }
+        return wrap({ needs: [] });
+      });
+
+      const runState = await facade.startProposalWorkflow({
+        proposal: makeProposal(),
+        initiatorActor: '预算裁剪验证',
+      });
+
+      assert.ok(capturedTechLeadPrompt.includes('contextBudgetSummary'), 'Prompt 应含裁剪预算摘要');
+      assert.ok(
+        capturedTechLeadPrompt.includes('…[截断]'),
+        'optional api_inventory 应被裁剪后注入',
+      );
+      assert.equal(
+        capturedTechLeadPrompt.includes('X'.repeat(4000)),
+        false,
+        '禁止将未裁剪的 runCache 原始超长文本直接塞进 Prompt',
+      );
+      // 保留另一并发 run 缓存不被清理
+      registry.clearRunCache(runState.runId);
+      assert.equal(registry.getCacheEntryCount(runState.runId), 0);
+      assert.ok(registry.getCacheEntryCount('RUN-OTHER') > 0);
+    } finally {
+      facade.modelRouter.setHttpTransport(null);
+      if (prevLive === undefined) {
+        delete process.env.LITELLM_ENABLE_LIVE_HTTP;
+      } else {
+        process.env.LITELLM_ENABLE_LIVE_HTTP = prevLive;
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

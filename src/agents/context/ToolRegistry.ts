@@ -121,6 +121,20 @@ export class ToolCallLoopGuard {
     this.budgetBlockedCalls = 0;
     this.truncatedResults = 0;
   }
+
+  /** P1-3：按 runId 前缀隔离清理防死循环状态，避免并行 run 互相误清 */
+  public clearScopePrefix(prefix: string): void {
+    for (const key of [...this.stageCallCounts.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.stageCallCounts.delete(key);
+      }
+    }
+    for (const key of [...this.dedupResults.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.dedupResults.delete(key);
+      }
+    }
+  }
 }
 
 export class ToolRegistry {
@@ -234,9 +248,34 @@ export class ToolRegistry {
     return this.runCache.get(cacheKey) ?? null;
   }
 
-  /** 清空 run 级缓存（新提案/新分支时调用） */
-  public clearRunCache(): void {
-    this.runCache.clear();
-    this.loopGuard.reset();
+  /** 清空 run 级缓存（传入 runId 时仅清理该 runId 前缀，避免影响并发执行中的其他 run） */
+  public clearRunCache(runId?: string): void {
+    if (!runId) {
+      this.runCache.clear();
+      this.loopGuard.reset();
+      return;
+    }
+    const prefix = `${runId}:`;
+    for (const key of [...this.runCache.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.runCache.delete(key);
+      }
+    }
+    this.loopGuard.clearScopePrefix(prefix);
+  }
+
+  /** P1-3：当前 runCache 条目数（可选按 runId 统计，供终态清理测试与可观测性使用） */
+  public getCacheEntryCount(runId?: string): number {
+    if (!runId) {
+      return this.runCache.size;
+    }
+    const prefix = `${runId}:`;
+    let count = 0;
+    for (const key of this.runCache.keys()) {
+      if (key.startsWith(prefix)) {
+        count += 1;
+      }
+    }
+    return count;
   }
 }

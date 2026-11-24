@@ -140,6 +140,18 @@ export class ProductDesignerAgent extends AbstractWorkerAgent<UiDesignArtifactCo
         '所有人工门禁裁决按钮支持键盘快捷键与二次确认防误触',
       ],
       designChallengeNote: challengeNote,
+      agentRationale:
+        challengeNote ??
+        `PD 将 ${componentMappings.length} 条需求映射至企业标准 Meridian 设计系统，统一以结构化键值与交互状态机代替自由文本描述。`,
+      keyDecisions: [
+        {
+          decision: `主容器选定为 ${preferredContainer}`,
+          rationale: context.humanFeedbackDirective
+            ? `响应人工回退指令「${context.humanFeedbackDirective}」，在紧凑视口下保持操作区与上下文零遮挡`
+            : '优先复用标准组件库容器并完备覆盖 loading/empty/error/diff 四态',
+          tradeoffs: ['受限于标准设计系统组件网格', '可实现零定制样式冲突并保证 WCAG AA 可访问性'],
+        },
+      ],
     });
   }
 }

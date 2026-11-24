@@ -275,6 +275,53 @@ export class GitWorktreeSandboxManager {
     };
   }
 
+  /**
+   * P1-3：将 LLM 生成的代码或单测补丁安全落盘到指定 Worktree 分支目录（强制前缀穿越校验与 .git 防护）
+   */
+  public applyFilePatches(params: {
+    runId: string;
+    branchId: string;
+    patches: ReadonlyArray<{ filePath: string; content: string }>;
+  }): {
+    appliedFiles: string[];
+    rejectedFiles: Array<{ filePath: string; reason: string }>;
+  } {
+    const workspacePath = this.resolveWorkspacePath(params.runId, params.branchId);
+    fs.mkdirSync(workspacePath, { recursive: true });
+    const workspacePrefix = workspacePath.endsWith(path.sep)
+      ? workspacePath
+      : workspacePath + path.sep;
+
+    const appliedFiles: string[] = [];
+    const rejectedFiles: Array<{ filePath: string; reason: string }> = [];
+
+    for (const patch of params.patches) {
+      const rawPath = String(patch.filePath ?? '').trim();
+      if (!rawPath) {
+        rejectedFiles.push({ filePath: rawPath, reason: '补丁路径不能为空' });
+        continue;
+      }
+      if (path.isAbsolute(rawPath) || /^[a-zA-Z]:/.test(rawPath)) {
+        rejectedFiles.push({ filePath: rawPath, reason: '禁止绝对路径补丁' });
+        continue;
+      }
+      if (/(^|[\\/])\.git([\\/]|$)/.test(rawPath)) {
+        rejectedFiles.push({ filePath: rawPath, reason: '禁止写入 .git 目录' });
+        continue;
+      }
+      const resolvedTarget = path.resolve(workspacePath, rawPath);
+      if (!resolvedTarget.startsWith(workspacePrefix)) {
+        rejectedFiles.push({ filePath: rawPath, reason: '路径越界逃逸沙箱工作区' });
+        continue;
+      }
+      fs.mkdirSync(path.dirname(resolvedTarget), { recursive: true });
+      fs.writeFileSync(resolvedTarget, patch.content, 'utf-8');
+      appliedFiles.push(path.relative(workspacePath, resolvedTarget).replace(/\\/g, '/'));
+    }
+
+    return { appliedFiles, rejectedFiles };
+  }
+
   /** E1：真实模式下的 worktree/分支清理（模拟模式为纯目录，交由 I3 归档策略） */
   public cleanupWorktree(runId: string, branchId: string): void {
     const branchName = this.realBranchByWorkspace.get(this.resolveWorkspacePath(runId, branchId));
@@ -286,12 +333,15 @@ export class GitWorktreeSandboxManager {
   /**
    * I3：worktree 保留策略——保留最近 N 个 run 的沙箱目录（默认 10，env `SANDBOX_WORKTREE_RETENTION` 可调），
    * 更旧的连分支清理（真实模式先 git worktree remove）后删除。
-   * `protectRunIds`（活跃/刚终态的 run）无论多旧都不清除。
+   * `protectRunIds`（活跃/刚终态的 run）无论多旧都不清除；自动排除 `docker-results/` 与隐藏目录。
    */
   public enforceWorktreeRetention(params?: {
     keepLastN?: number;
     protectRunIds?: ReadonlyArray<string>;
   }): { removedRunIds: string[]; retainedRunIds: string[] } {
+    if (!fs.existsSync(this.sandboxRootDir)) {
+      return { removedRunIds: [], retainedRunIds: [] };
+    }
     const configured = Number(process.env.SANDBOX_WORKTREE_RETENTION ?? 10);
     const keepLastN = Math.max(
       1,
@@ -301,7 +351,7 @@ export class GitWorktreeSandboxManager {
 
     const runDirEntries = fs
       .readdirSync(this.sandboxRootDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
+      .filter((e) => e.isDirectory() && e.name !== 'docker-results' && !e.name.startsWith('.'))
       .map((e) => ({
         name: e.name,
         mtimeMs: fs.statSync(path.join(this.sandboxRootDir, e.name)).mtimeMs,
@@ -364,8 +414,44 @@ export class GitWorktreeSandboxManager {
     return raw.replace(/^ref:\s*refs\/heads\//, '');
   }
 
+  private collectFilesMatching(
+    rootDir: string,
+    predicate: (fileName: string) => boolean,
+  ): string[] {
+    if (!fs.existsSync(rootDir)) {
+      return [];
+    }
+    const collected: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith('.') || entry.name === 'node_modules') {
+          continue;
+        }
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else if (entry.isFile() && predicate(entry.name)) {
+          collected.push(path.resolve(full));
+        }
+      }
+    };
+    walk(rootDir);
+    return collected;
+  }
+
+  private scanSourceFileSecurity(absModulePath: string, findings: string[]): void {
+    const content = fs.readFileSync(absModulePath, 'utf-8');
+    if (/\beval\s*\(/.test(content) || /\bnew\s+Function\s*\(/.test(content)) {
+      findings.push(`检测到高危动态代码执行调用: ${absModulePath}`);
+    }
+    if (/\bsk-[a-zA-Z0-9]{16,}\b/.test(content)) {
+      findings.push(`检测到硬编码 API 密钥泄露: ${absModulePath}`);
+    }
+  }
+
   /**
    * E2：对沙箱真实执行 node:test 套件并解析计数/覆盖率 + 静态安全扫描
+   * （P1-3：同步递归扫描 worktree 下全部 `src/` 源码与 `tests/*.spec.ts`，覆写补丁真实生效）
    */
   public executeSandboxVerification(params: {
     runId: string;
@@ -375,33 +461,49 @@ export class GitWorktreeSandboxManager {
   }): SandboxVerificationResult {
     const workspacePath = this.resolveWorkspacePath(params.runId, params.branchId);
     const securityFindings: string[] = [];
-    let filesVerifiedCount = 0;
-    const testFilesToRun: string[] = [];
+    const scannedSourceFiles = new Set<string>();
+    const discoveredTestFiles = new Set<string>();
 
     for (const reqId of params.requirementIds) {
       const pascalName = GitWorktreeSandboxManager.toPascalCase(reqId);
       const className = `${pascalName}DomainService`;
-      const absModulePath = path.join(
+      const absModulePath = path.resolve(
         workspacePath,
         `src/modules/${reqId.toLowerCase()}/${className}.ts`,
       );
-      const absTestPath = path.join(workspacePath, `tests/${reqId.toLowerCase()}.sandbox.spec.ts`);
+      const absTestPath = path.resolve(
+        workspacePath,
+        `tests/${reqId.toLowerCase()}.sandbox.spec.ts`,
+      );
 
-      if (fs.existsSync(absModulePath)) {
-        filesVerifiedCount += 1;
-        const content = fs.readFileSync(absModulePath, 'utf-8');
-        if (/\beval\s*\(/.test(content) || /\bnew\s+Function\s*\(/.test(content)) {
-          securityFindings.push(`检测到高危动态代码执行调用: ${absModulePath}`);
-        }
-        if (/\bsk-[a-zA-Z0-9]{16,}\b/.test(content)) {
-          securityFindings.push(`检测到硬编码 API 密钥泄露: ${absModulePath}`);
-        }
+      if (fs.existsSync(absModulePath) && fs.statSync(absModulePath).isFile()) {
+        scannedSourceFiles.add(absModulePath);
       }
-      if (fs.existsSync(absTestPath)) {
-        filesVerifiedCount += 1;
-        testFilesToRun.push(absTestPath);
+      if (fs.existsSync(absTestPath) && fs.statSync(absTestPath).isFile()) {
+        discoveredTestFiles.add(absTestPath);
       }
     }
+
+    for (const srcFile of this.collectFilesMatching(
+      path.join(workspacePath, 'src'),
+      (name) => name.endsWith('.ts') || name.endsWith('.js') || name.endsWith('.mjs'),
+    )) {
+      scannedSourceFiles.add(srcFile);
+    }
+    for (const testFile of this.collectFilesMatching(
+      path.join(workspacePath, 'tests'),
+      (name) =>
+        name.endsWith('.spec.ts') || name.endsWith('.spec.js') || name.endsWith('.spec.mjs'),
+    )) {
+      discoveredTestFiles.add(testFile);
+    }
+
+    for (const absModulePath of scannedSourceFiles) {
+      this.scanSourceFileSecurity(absModulePath, securityFindings);
+    }
+
+    const testFilesToRun = [...discoveredTestFiles].sort();
+    const filesVerifiedCount = scannedSourceFiles.size + testFilesToRun.length;
 
     const suites: ParsedSuite[] = [];
     let subprocessExecuted = false;

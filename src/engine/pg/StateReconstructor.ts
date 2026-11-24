@@ -21,8 +21,17 @@ import { WorkflowDomainEvent } from '../../patterns/EventBus.ts';
 import type { BoundedNegotiationMediator } from '../../agents/BoundedNegotiationMediator.ts';
 import type { DagWorkflowStateEngine } from '../DagWorkflowStateEngine.ts';
 import { AuditTrailEntry, type ImmutableAuditLedger } from '../ImmutableAuditLedger.ts';
-import type { PersistedLedgerSnapshot, PersistedRunRecord } from '../PersistenceRepository.ts';
+import type {
+  PersistedGovernanceConfig,
+  PersistedLedgerSnapshot,
+  PersistedRunRecord,
+} from '../PersistenceRepository.ts';
 import type { WorkflowEventBus } from '../../patterns/EventBus.ts';
+import {
+  IntentExecutionTraceRecord,
+  type IntentFulfillmentTracker,
+} from '../../telemetry/IntentFulfillmentTracker.ts';
+import type { PromptCacheManager } from '../../telemetry/PromptCacheManager.ts';
 
 export interface RestoreTargets {
   stateEngine: DagWorkflowStateEngine;
@@ -30,6 +39,9 @@ export interface RestoreTargets {
   mediator: BoundedNegotiationMediator;
   eventBus: WorkflowEventBus;
   restoreTeamComment?: (comment: StageTeamCommentRecord) => void;
+  cacheManager?: PromptCacheManager;
+  fulfillmentTracker?: IntentFulfillmentTracker;
+  restoreGovernanceConfig?: (config: PersistedGovernanceConfig) => void;
 }
 
 export class StateReconstructor {
@@ -96,6 +108,34 @@ export class StateReconstructor {
       }
     }
 
+    if (snapshot.governanceConfig && this.targets.restoreGovernanceConfig) {
+      try {
+        this.targets.restoreGovernanceConfig(snapshot.governanceConfig);
+      } catch (err) {
+        warnings.push(`治理配置恢复跳过: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    if (snapshot.cacheTelemetry && this.targets.cacheManager) {
+      try {
+        this.targets.cacheManager.restoreTelemetryCounters(snapshot.cacheTelemetry);
+      } catch (err) {
+        warnings.push(`缓存遥测恢复跳过: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    if (snapshot.intentTraces && this.targets.fulfillmentTracker) {
+      for (const rawTrace of snapshot.intentTraces) {
+        try {
+          this.targets.fulfillmentTracker.restoreTrace(
+            IntentExecutionTraceRecord.fromJSON(rawTrace),
+          );
+        } catch (err) {
+          warnings.push(`意图追踪恢复跳过: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+    }
+
     for (const runRec of snapshot.runs ?? []) {
       try {
         runIds.push(this.restoreRun(runRec, snapshot, warnings));
@@ -116,6 +156,7 @@ export class StateReconstructor {
       runId: runRec.runId,
       proposal,
       initiatorActor: runRec.initiatorActor,
+      createdByUserId: runRec.createdByUserId,
       stagePipeline: runRec.stagePipeline as WorkflowStageId[],
       workflowTemplateId: runRec.workflowTemplateId,
       scenarioHints: (runRec.scenarioHints ?? {}) as ScenarioHints,

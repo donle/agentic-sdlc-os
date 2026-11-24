@@ -40,8 +40,24 @@ import {
 } from '../domain/models.ts';
 import { WorkflowEventBus } from '../patterns/EventBus.ts';
 import { ModelRouterGateway } from '../patterns/ModelRouterGateway.ts';
+import type { WorkflowOrchestratorFacade } from '../engine/WorkflowOrchestratorFacade.ts';
 import { AgentRegistry } from './AgentRegistry.ts';
 import { JsonExtractor } from './prompt/JsonExtractor.ts';
+import {
+  getRunOverview,
+  overrideGate,
+  rollbackAndFork,
+  summarizeConflict,
+  SUPERVISOR_TOOL_SCHEMAS,
+} from './supervisorTools.ts';
+
+function summarizeProposalOption(raw: string, fallback: string): string {
+  const clean = raw.trim();
+  if (!clean) {
+    return fallback;
+  }
+  return clean.length > 48 ? `${clean.slice(0, 48)}…` : clean;
+}
 
 /**
  * 命令模式顶层接口 (Command Interface)
@@ -104,12 +120,12 @@ export class EscalateConflictToHumanCommand implements ISupervisorCommand<AgentU
       actionOptions: [
         {
           actionKey: 'CHOOSE_OPTION_A',
-          label: '拍板采用方案 A（标准组件降级，零工期延误）',
+          label: `拍板采用：${summarizeProposalOption(this.deadlockedTurn.optionAProposal, '方案 A')}`,
           verdict: DecisionVerdict.ARBITRATE_OPTION_A,
         },
         {
           actionKey: 'CHOOSE_OPTION_B',
-          label: '拍板采用方案 B（扩展定制组件，工期 +2 人日）',
+          label: `拍板采用：${summarizeProposalOption(this.deadlockedTurn.optionBProposal, '方案 B')}`,
           verdict: DecisionVerdict.ARBITRATE_OPTION_B,
         },
         {
@@ -157,6 +173,15 @@ export class SupervisorAgent {
   ): Promise<ParsedRollbackDirective> {
     const text = userDialogue.trim();
     if (explicitTargetStageId) {
+      if (
+        allowedStages &&
+        allowedStages.length > 0 &&
+        !allowedStages.includes(explicitTargetStageId)
+      ) {
+        throw new Error(
+          `目标阶段 [${explicitTargetStageId}] 不在当前工作流允许的阶段范围内（允许：${allowedStages.join(', ')}）`,
+        );
+      }
       return new ParsedRollbackDirective({
         targetStageId: explicitTargetStageId,
         targetAgentRole: this.mapStageToRole(explicitTargetStageId),
@@ -349,6 +374,81 @@ export class SupervisorAgent {
 
     this.eventBus.publishNotification(notification);
     return notification;
+  }
+
+  /** P1-3：返回总管 Agent 四工具 schema（供 LLM function-calling 与 HTTP 端点探测） */
+  public getToolSchemas(): typeof SUPERVISOR_TOOL_SCHEMAS {
+    return SUPERVISOR_TOOL_SCHEMAS;
+  }
+
+  /** P1-3：统一分派并执行 C2 四工具契约函数 */
+  public async executeTool(
+    facade: WorkflowOrchestratorFacade,
+    toolName: 'get_run_overview' | 'summarize_conflict' | 'override_gate' | 'rollback_and_fork',
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const runId = String(params.runId ?? '').trim();
+    if (!runId) {
+      throw new Error(`总管工具 [${toolName}] 缺少必填参数 runId`);
+    }
+    switch (toolName) {
+      case 'get_run_overview':
+        return getRunOverview(facade, runId);
+      case 'summarize_conflict': {
+        const negotiationId = String(params.negotiationId ?? '').trim();
+        if (!negotiationId) {
+          throw new Error('summarize_conflict 缺少必填参数 negotiationId');
+        }
+        return summarizeConflict(facade, runId, negotiationId);
+      }
+      case 'override_gate': {
+        const snapshotId = String(params.snapshotId ?? '').trim();
+        if (!snapshotId) {
+          throw new Error('override_gate 缺少必填参数 snapshotId');
+        }
+        const verdict = String(params.verdict ?? DecisionVerdict.APPROVE) as DecisionVerdict;
+        const reviewerActor = String(params.reviewerActor ?? '王总管 (Supervisor Tool)');
+        const reason = String(params.reason ?? params.comment ?? '总管工具人工门禁覆写');
+        const actorUserId =
+          typeof params.actorUserId === 'string' && params.actorUserId.trim().length > 0
+            ? params.actorUserId.trim()
+            : undefined;
+        const impersonatedByLabel =
+          typeof params.impersonatedByLabel === 'string' ? params.impersonatedByLabel : undefined;
+        return await overrideGate(facade, {
+          runId,
+          snapshotId,
+          reviewerActor,
+          actorUserId,
+          verdict,
+          reason,
+          impersonatedByLabel,
+        });
+      }
+      case 'rollback_and_fork': {
+        const directive = String(params.directive ?? params.dialogueInstruction ?? '').trim();
+        if (!directive) {
+          throw new Error('rollback_and_fork 缺少必填参数 directive');
+        }
+        const actorUserId =
+          typeof params.actorUserId === 'string' && params.actorUserId.trim().length > 0
+            ? params.actorUserId.trim()
+            : undefined;
+        const targetStageId =
+          typeof params.targetStageId === 'string' && params.targetStageId.trim().length > 0
+            ? params.targetStageId.trim()
+            : undefined;
+        const impersonatedByLabel =
+          typeof params.impersonatedByLabel === 'string' ? params.impersonatedByLabel : undefined;
+        return await rollbackAndFork(facade, {
+          runId,
+          directive,
+          actorUserId,
+          targetStageId,
+          impersonatedByLabel,
+        });
+      }
+    }
   }
 
   private mapStageToRole(stageId: WorkflowStageId): AgentRole {

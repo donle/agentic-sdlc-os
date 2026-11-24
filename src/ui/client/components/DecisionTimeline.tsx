@@ -5,6 +5,7 @@
 
 import type { HumanDecisionDto } from '../types.ts';
 import { formatRelativeTime, stageMeta, verdictVisual } from '../lib/display.ts';
+import { AgentAvatar } from './AgentAvatar.tsx';
 
 export function DecisionTimeline({ decisions }: { decisions: ReadonlyArray<HumanDecisionDto> }) {
   if (decisions.length === 0) {
@@ -33,9 +34,18 @@ export function DecisionTimeline({ decisions }: { decisions: ReadonlyArray<Human
             const visual = verdictVisual(decision.verdict);
             return (
               <div className={`decision-row ${visual.className}`} key={decision.decisionId}>
-                <div className="decision-icon">{visual.icon}</div>
+                <AgentAvatar
+                  roleOrStage={
+                    decision.verdict === 'SUPERVISOR_ROLLBACK'
+                      ? 'SUPERVISOR_AGENT'
+                      : decision.stageId
+                  }
+                  size="sm"
+                  mood={decision.verdict === 'REJECT' ? 'alert' : 'celebrating'}
+                />
                 <div className="decision-body">
                   <div className="decision-head">
+                    <span>{visual.icon}</span>
                     <strong>{visual.label}</strong>
                     <span className="decision-actor">{decision.reviewerActor}</span>
                     <span className="decision-time">

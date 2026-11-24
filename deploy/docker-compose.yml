@@ -1,4 +1,4 @@
-version: "3.9"
+version: '3.9'
 
 # 单机私有化一键部署编排 (Single-Node On-Premise Stack)
 services:
@@ -7,17 +7,36 @@ services:
       context: ..
     container_name: agentic-sdlc-workbench
     ports:
-      - "4300:4300"
+      - '4300:4300'
     environment:
       - NODE_ENV=production
       - PORT=4300
-      - DATABASE_URL=postgresql://sdlc_admin:sdlc_secret@postgres-pgvector:5432/agentic_sdlc
-      - LITELLM_GATEWAY_URL=http://litellm-router:4000
-      - LITELLM_ENABLE_LIVE_HTTP=true
+      - DATABASE_URL=${DATABASE_URL:-postgresql://sdlc_admin:sdlc_secret@postgres-pgvector:5432/agentic_sdlc}
+      - LOCAL_PERSISTENCE_DIR=/var/lib/agentic-sdlc/runtime-data
       - SANDBOX_WORKTREE_ROOT=/var/lib/agentic-sdlc/worktrees
+      - SANDBOX_RUNTIME=${SANDBOX_RUNTIME:-host}
+      - LITELLM_GATEWAY_URL=${LITELLM_GATEWAY_URL:-http://litellm-router:4000}
+      - LITELLM_API_KEY=${LITELLM_API_KEY:-sk-local-onpremise-placeholder}
+      - LITELLM_ENABLE_LIVE_HTTP=true
+      - OLLAMA_API_BASE=${OLLAMA_API_BASE:-http://host.docker.internal:11434}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3-local}
+      - RAG_VECTOR_DIM=${RAG_VECTOR_DIM:-1024}
+      - AUTH_REQUIRED=${AUTH_REQUIRED:-true}
+      - COOKIE_SECURE=${COOKIE_SECURE:-false}
+    volumes:
+      - runtime_data:/var/lib/agentic-sdlc/runtime-data
+      - sandbox_worktrees:/var/lib/agentic-sdlc/worktrees
     depends_on:
-      - postgres-pgvector
-      - litellm-router
+      postgres-pgvector:
+        condition: service_healthy
+      litellm-router:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:4300/api/health >/dev/null 2>&1 || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     restart: unless-stopped
 
   postgres-pgvector:
@@ -25,23 +44,46 @@ services:
     container_name: agentic-sdlc-pgvector
     environment:
       - POSTGRES_USER=sdlc_admin
-      - POSTGRES_PASSWORD=sdlc_secret
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-sdlc_secret}
       - POSTGRES_DB=agentic_sdlc
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./init-pgvector-schema.sql:/docker-entrypoint-initdb.d/01-init-pgvector-schema.sql:ro
     ports:
-      - "5432:5432"
+      - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U sdlc_admin -d agentic_sdlc']
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   litellm-router:
     image: ghcr.io/berriai/litellm:main-stable
     container_name: agentic-sdlc-litellm
     ports:
-      - "4000:4000"
+      - '4000:4000'
+    command: ['--config', '/app/config.yaml', '--port', '4000']
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml:ro
     environment:
-      - OLLAMA_API_BASE=http://host.docker.internal:11434
+      - LITELLM_API_KEY=${LITELLM_API_KEY:-sk-local-onpremise-placeholder}
+      - OLLAMA_API_BASE=${OLLAMA_API_BASE:-http://host.docker.internal:11434}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'python3 -c ''import urllib.request; urllib.request.urlopen("http://127.0.0.1:4000/health/liveliness", timeout=3)''',
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
 volumes:
   pgdata:
+  runtime_data:
+  sandbox_worktrees:

@@ -494,6 +494,124 @@
 
 ---
 
+## 第十五轮实现（总修复编排 Step 1 / P0-3：`act-as` 可逆切换与 `"via <admin>"` 业务归属，2026-11-24）
+
+- **`P0-3` 可逆 `act-as` 与替身归属追踪**：
+  - `src/server/auth/UserStore.ts`：`LoginAuditEntry['reason']` 新增 `'EXIT_ACT_AS'`。
+  - `src/server/auth/SessionService.ts`：改造 `actAs()` 按 `session.impersonatedBy ?? session.userId` 识别真实管理员并支持连续切换或切回自身（销毁旧替身会话），新增 `exitActAs()` 退出替身恢复管理员并记 `'EXIT_ACT_AS'` 审计。
+  - `src/engine/WorkflowOrchestratorFacade.ts`：`addTeamComment`、`retryAbortedStage`、`submitHumanGateDecision`（含 `REJECT` 委托回退）与 `invokeSupervisorConversationalRollback` 支持 `impersonatedByLabel` 参数并安全追加 `(via <admin>)` 归属。
+  - `src/server/WorkbenchServer.ts`：`ResolvedAuthContext` 新增 `impersonatedBy`；修复 `AUTH_REQUIRED=true` 下目标用户 `mustChangePassword` 误拦截替身管理员的问题；`POST /api/auth/act-as` 放行管理员替身会话并新增 `POST /api/auth/exit-act-as`；在立项、签核、熔断重试、总管回退、评论与 RAG 录入路由透传归属标签（详见 [`P0_3_ACT_AS_AND_AUDIT_ATTRIBUTION.md`](./P0_3_ACT_AS_AND_AUDIT_ATTRIBUTION.md)）。
+- **验收测试**：`tests/session-service.spec.ts` 新增 Test 9b（单元）与 HTTP Test 3（共 25/25 通过），全库 **171 项测试 / 48 套件（167 通过 / 4 既有跳过 / 0 失败）**。
+
+---
+
+## 第十六轮实现（总修复编排 Step 2 / P0-4 并发互斥锁与 Agent 隔离 & Step 4 / P0-6 复盘时序与真实历史评估，2026-11-24）
+
+- **`P0-4` 同 `runId` 并发互斥锁与共享 Agent 状态隔离**：
+  - `src/engine/WorkflowOrchestratorFacade.ts`：新增按 `runId` 隔离的 Promise 链式锁 `withRunLock()`，并将内部流转逻辑拆分为 `*Unlocked` 避免 `REJECT`/重试等内部委托死锁；`submitHumanGateDecisionUnlocked()` 新增 `SnapshotLifecycleState.PENDING_HUMAN_GATE` 状态守卫禁止重复裁决。
+  - `src/agents/AbstractWorkerAgent.ts`、`src/agents/SoftwareEngineerAgent.ts`、`src/agents/QualityAssuranceAgent.ts`：抽取 `buildPreparedContextKey()` 与 `saveBoundedPreparedState()`，将单实例 `lastPreparedSandbox` / `lastPreparedVerification` 替换为上限 64 的有界 `Map`，确保并发多 `runId` 防谎报校验互不覆盖（详见 [`P0_4_CONCURRENCY_LOCK_AND_AGENT_ISOLATION.md`](./P0_4_CONCURRENCY_LOCK_AND_AGENT_ISOLATION.md)）。
+- **`P0-6` 复盘脚本 `await` 修复与真实历史只读评估**：
+  - `src/telemetry/RetrospectiveTaskRunner.ts`：抽出 `evaluateMetrics()` 供实时与离线历史复盘复用。
+  - `src/retrospective/runRetrospective.ts`：补齐全部 6 处漏写 `await` 并按分叉阶段顺序推进，默认基准改用 `os.tmpdir()` 临时隔离目录并自动清理（不污染 `.runtime-data/`）；新增 `evaluatePersistedHistory()` 只读评估真实持久化运行；主入口改用 `pathToFileURL` 并支持 `--benchmark` / `--history-only`（详见 [`P0_6_RETROSPECTIVE_RUNNER_FIX.md`](./P0_6_RETROSPECTIVE_RUNNER_FIX.md)）。
+- **验收测试**：`tests/concurrency-and-cache.spec.ts` 新增 Test 3–5（12/12 通过）、新增 `tests/retrospective-runner.spec.ts`（4/4 通过）、`tests/architecture.spec.ts`（4/4 通过）及 `npm run retrospective:eval -- --benchmark` 达标通过；全库 **178 项测试 / 50 套件 / 29 个测试文件（174 通过 / 4 既有跳过 / 0 失败）**。
+
+---
+
+## 第十七轮实现（总修复编排 Step 3 / P0-5：`WorkbenchServer` HTTP 安全加固与默认模式收敛，2026-11-24）
+
+- **`P0-5` HTTP 安全加固与权限收口（`src/server/WorkbenchServer.ts`）**：
+  - `readJsonBody()` 增加默认 1 MB 请求体大小上限（`413`）与 15s 超时保护（`408`），异常退出统一解绑监听与定时器。
+  - 新增 `buildSecurityHeaders()`（全响应 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: same-origin`，HTML 附带 `Content-Security-Policy`）与 `buildSessionCookie()`（`COOKIE_SECURE=true`/`x-forwarded-proto: https`/TLS socket 自动附加 `; Secure`）。
+  - 新增 `enforceRateLimit()` 滑动窗口限流（`/api/auth/login` 与高开销端点 `/api/proposals`、`/api/sandbox/verify`、`/api/admin/model-baseline` 超限返回 `429` + `Retry-After`）。
+  - `/styles/*.css`、`/kit/*.css`、`/dist/*.js` 与 `/api/sandbox/file` 的路径前缀校验补全 `+ path.sep` 与 `isFile()` 校验，防御同前缀兄弟目录越权。
+  - 将 `mustChangePassword=true` 强制改密拦截提升至全模式统一生效，并移除 `GET /api/workflows/templates`、`GET /api/sandbox/file`、`POST /api/rag/query` 对 `authSource === 'none'` 的 RBAC 跳过（详见 [`P0_5_HTTP_SECURITY_HARDENING.md`](./P0_5_HTTP_SECURITY_HARDENING.md)）。
+- **验收测试**：新增 `tests/http-security-hardening.spec.ts`（5 项全通过），回归 `tests/server-sse-api.spec.ts` 与 `tests/session-service.spec.ts` 全绿；全库 **183 项测试 / 51 套件 / 30 个测试文件（179 通过 / 4 既有跳过 / 0 失败）**。
+
+---
+
+## 第十八轮实现（总修复编排 Step 5 / P0-1：恢复前端 React 构建链路与清理 `src/ui/dist/`，2026-11-24）
+
+- **`P0-1` 前端依赖恢复与 React 19 打包闭环**：
+  - 安装还原 `react@19.3.1`、`react-dom@19.3.1`、`@types/react`、`@types/react-dom`；运行 `npm run typecheck:frontend`、`npm run lint:frontend` 与 `npm run build:ui` 全过，重新生成 391,662 B React 19 `src/ui/dist/main.js`。
+  - 清理 `src/ui/dist/` 遗留的 4 个 2026-11-22 旧版非 React 静态产物（`StageDisplayFormatter.js`、`WorkbenchApiClient.js`、`WorkbenchViewController.js`、`types.js`），并在 `tests/server-sse-api.spec.ts` 补齐 React 运行时产物断言（详见 [`P0_1_FRONTEND_REACT_BUILD_RESTORE.md`](./P0_1_FRONTEND_REACT_BUILD_RESTORE.md)）。
+- **验收测试**：`npm run check`（双端 `typecheck` + 双端 `lint` + `format:check` + 全量 `test`）全绿，**183 项测试 / 51 套件 / 30 个测试文件（179 通过 / 4 既有跳过 / 0 失败）**。
+
+---
+
+## 第十九轮实现（总修复编排 Step 6 / P0-2：前端 F1/F2 登录鉴权与用户管理 UI，2026-11-24）
+
+- **`P0-2` 全链路前端鉴权、强制改密与 F2 成员管理界面（Wave 1 全部 P0 项清零）**：
+  - `src/ui/client/types.ts` & `src/ui/client/WorkbenchApiClient.ts`：新增 `AuthUserDto`/`AuthMeDto`/`LoginAuditEntryDto` 及 `ApiHttpError`；切换为 `credentials: 'same-origin'` 会话驱动，封装 `/api/auth/login|logout|me|change-password|act-as|exit-act-as` 与 `/api/admin/users*`/`login-audit`，注册 401/403 全局拦截回调并支持 Node 测试 `cookieJar`。
+  - `src/ui/client/components/LoginView.tsx` & `ChangePasswordModal.tsx` & `Topbar.tsx` & `App.tsx` & `src/ui/styles/workbench.css`：实现启动会话探测（`authenticated` / `demo_mode` / `unauthenticated`）、登录页与锁定提示、首次/重置强制改密弹窗、管理员 `act-as` 警示条与一键 `exit-act-as`。
+  - `src/ui/client/views/AdminGovernanceView.tsx`：接入 F2 成员创建（展示临时口令）、阶段权限编辑、启停切换、重置口令与安全登录审计表格（详见 [`P0_2_FRONTEND_AUTH_AND_USER_ADMIN_UI.md`](./P0_2_FRONTEND_AUTH_AND_USER_ADMIN_UI.md)）。
+- **验收测试**：新增 `tests/frontend-api-client.spec.ts` 在 `AUTH_REQUIRED=true` 真实 HTTP 端口下验证 Cookie 认证、强改密、替身往返与 F2 CRUD；`npm run build:ui && npm run check` 全绿，全库 **184 项测试 / 52 套件 / 31 个测试文件（180 通过 / 4 既有跳过 / 0 失败）**。
+
+---
+
+## 第二十轮实现（总修复编排 Step 7 / P1-1：多 Run SSE 重连、增量消费与 5 视图交互缺陷修复，2026-11-24）
+
+- **`P1-1` 前端联调与视图缺陷清零**：
+  - `src/ui/client/WorkbenchApiClient.ts` & `src/ui/client/App.tsx`：SSE `useEffect` 加入 `activeRunId` 依赖与 cleanup `unsubscribe()`，消费 `run_event`/`user_notification` 增量帧；封装 `listWorkflowTemplates()`、`retryAbortedRun()`（含 `extraTokenBudget`），`submitDecision()` 透传 `notif.runId` 并识别熔断重试通知。
+  - `Topbar.tsx` / `SandboxExplorerView.tsx` / `AuditRagView.tsx` / `ProjectsHubView.tsx` / `Sidebar.tsx` / `workbench.css`：动态渲染 `roster`（含 DA 与新建成员）与模板列表、沙箱真实测试率反馈并回写 `dashboardState`、修复审计收起按钮条件、细分 `ABORTED*` 状态徽标并消除嵌套 `<svg>`（详见 [`P1_1_FRONTEND_SSE_AND_VIEW_FIXES.md`](./P1_1_FRONTEND_SSE_AND_VIEW_FIXES.md)）。
+- **验收测试**：`tests/frontend-api-client.spec.ts` 新增 P1-1 套件（2 项）验证模板列表、真实沙箱计数、预算熔断恢复及 `runId` SSE 增量事件与关闭清理；`npm run build:ui && npm run check` 全绿，全库 **186 项测试 / 53 套件 / 31 个测试文件（182 通过 / 4 既有跳过 / 0 失败）**。
+
+---
+
+## 第二十一轮实现（总修复编排 Step 8 / P1-2：PG/JSON 双模式持久化一致性与非阻塞优化，2026-11-24）
+
+- **`P1-2` 双模式持久化一致性、变长向量与非阻塞 `psql` 优化**：
+  - `deploy/init-pgvector-schema.sql` & `src/engine/NegativeExperienceRagEngine.ts`：新增 `notifications`、`live_events`、`audit_entries` 与 `system_runtime_state` 四张表（全库 14 表），`rejected_history_rag.embedding` 改为变长 `vector` 并记录 `embedding_dim`/`embedding_source`，RAG 引擎新增 `RAG_VECTOR_DIM` 配置与无碰撞 ID。
+  - `src/domain/models.ts` / `DagWorkflowStateEngine.ts` / `PromptCacheManager.ts` / `IntentFulfillmentTracker.ts` / `PersistenceRepository.ts` / `StateReconstructor.ts` / `WorkflowOrchestratorFacade.ts`：补全 `createdByUserId`/`reviewerUserId` 双轨关联，持久化并跨重启恢复治理配置（`governanceConfig`）、缓存遥测（`cacheTelemetry`）与意图追踪（`intentTraces`）。
+  - `src/engine/pg/PgPersistenceDriver.ts`：扩展全表 SQL UPSERT / 降级回读与 `normalizeEmbeddingForPg()`，默认 `psql` 路径引入非阻塞 `execFile` 异步合并写入队列（支持 `flushPendingWrites()`）。
+  - `src/server/auth/UserStore.ts` / `SessionService.ts` / `WorkbenchServer.ts`：`JsonUserStore` 同步落盘 `auth-sessions.json` 与 `auth-login-audit.jsonl`；`PgUserStore` 新增会话 TTL 缓存、`touchSession` 写节流、异步写队列及阴性墓碑瞬时驱逐；`WorkbenchServer` 采集 `ip`/`userAgent` 并通过单次 `validateWithMeta()` 校验消除双查 PG 阻塞（详见 [`P1_2_PERSISTENCE_CONSISTENCY_AND_ASYNC_PG.md`](./P1_2_PERSISTENCE_CONSISTENCY_AND_ASYNC_PG.md)）。
+- **验收测试**：`tests/pg-persistence-driver.spec.ts` 新增 Test 6–9（共 9 项全通过）、`tests/state-reconstructor.spec.ts` 新增 Test 6、`tests/session-service.spec.ts` 新增 HTTP Test 4；`npm run build:ui && npm run format && npm run check` 全绿，全库 **192 项测试 / 53 套件 / 31 个测试文件（188 通过 / 4 既有跳过 / 0 失败）**。
+
+---
+
+## 第二十二轮实现（总修复编排 Step 9 / P1-3：Agent 代码补丁闭环、预算裁剪注入、总管工具接线与零跳过收口，2026-11-24）
+
+- **`P1-3` Agent / 上下文 / 沙箱 / 总管深层闭环**：
+  - `src/sandbox/GitWorktreeSandboxManager.ts` & `src/sandbox/TestResultParser.ts`：新增 `applyFilePatches()` 路径安全写入，扩展 `executeSandboxVerification()` 递归扫描全量 `src/` 与 `tests/*.spec.ts`，修正 `enforceWorktreeRetention()` 排除 `docker-results/` 与隐藏目录，增强 `ETIMEDOUT`/`SIGTERM` 跨平台超时判定。
+  - `src/agents/prompt/StagePromptSpecs.ts` / `AbstractWorkerAgent.ts` / `SoftwareEngineerAgent.ts`：`STAGE_3B_ENGINEER` 支持可选 `filePatches`，`applyLlmPostProcessing()` 将 LLM 源码/测试补丁写入 Worktree 后重跑验证并联动 A2 自愈修复；`AgentExecutionInputContext` 新增 `trimmedExternalContext` 真实消费 `ContextBudgetTrimmer` 裁剪结果与 `contextBudgetSummary`。
+  - `src/agents/context/DependencyVersionsProvider.ts` & `ToolRegistry.ts`：新增 `dependency_versions` 真实 `package.json` Provider，实现 `clearRunCache(runId)` / `clearScopePrefix()` 按运行实例隔离释放。
+  - `src/agents/SupervisorAgent.ts` / `supervisorTools.ts` / `WorkbenchServer.ts`：`EscalateConflictToHumanCommand` 动态提取 `optionA/BProposal` 标签，`parseNaturalLanguageRollback()` 强制校验 `explicitTargetStageId` 白名单，通过 `executeTool()` 与 `GET/POST /api/supervisor/tools` 打通 C2 四工具（含 RBAC 与 SSE 广播）。
+  - `src/engine/WorkflowOrchestratorFacade.ts`：修复 `COMPLETED` 终态钩子不可达问题，同步触发 `enforceWorktreeRetention` 与 `clearRunCache(runId)`（详见 [`P1_3_AGENT_CONTEXT_AND_SANDBOX_LOOP.md`](./P1_3_AGENT_CONTEXT_AND_SANDBOX_LOOP.md)）。
+- **验收测试**：激活 `tests/a1-llm-integration.spec.ts` Test 2 & 5 与 `tests/test-result-parser.spec.ts` Test 3 & 5（消除全部 `it.skip`），新增 `tests/full-pipeline-llm.spec.ts` Test 7、`tests/agent-context.spec.ts` Test 12–13、`tests/data-retention.spec.ts` Test 6–7、`tests/supervisor-tools.spec.ts` Test 5–7；`npm run build:ui && npm run format && npm run check` 全绿，全库 **200 项测试 / 53 套件 / 31 个测试文件（200 通过 / 0 跳过 / 0 失败）**。
+
+---
+
+## 第二十三轮实现（总修复编排 Step 10 / P1-4：部署配置硬化、真实 TCP/OpenAI HTTP E2E 与实时浏览器走查，2026-11-24）
+
+- **`P1-4` 部署配置硬化与端到端实网/UI 验证体系**：
+  - `Dockerfile`：拆分为 `builder` 与 `runtime` 多阶段构建，`builder` 移除 `--ignore-scripts` 保障 `esbuild` 正常编译 UI；`runtime` 保留 `git` / `postgresql-client` / `wget`，以非 root `USER node` 运行、增加 `/api/health` `HEALTHCHECK` 并改为 `CMD ["npm", "run", "start:server"]`。
+  - `deploy/litellm_config.yaml` & `deploy/docker-compose.yml` & `deploy/.env.example`：新建 `litellm_config.yaml` 映射 4 个模型别名；Compose 增加 `postgres-pgvector`/`litellm-router` 健康检查、`service_healthy` 依赖与 `runtime_data`/`sandbox_worktrees` 持久卷；`.env.example` 全量补齐 30 个源码引用环境变量（零漂移校验通过）。
+  - `package.json` / `tsconfig.json` / `eslint.config.mjs` / `scripts/e2e-live-stack.ts`：新增 `start:server` 与 `e2e:live` CLI 工具（`--check-env`、`--compose-config`、`--pg-verify`、`--http-smoke`），纳入 TS/ESLint/Prettier 校验。
+  - `tests/live-http-e2e.spec.ts` & 真实浏览器 UI E2E：新增 5 项测试覆盖配置契约、零 env 漂移及真实 TCP HTTP `WorkbenchHttpServer` + 本地 TCP OpenAI 兼容服务端 + `AUTH_REQUIRED=true` 登录/强制改密/SSE/签核/总管工具/回退全链路；并在独立端口 `4399` 跑通真实浏览器登录、`admin/admin` → `AdminPass2026!` 改密、7 成员审计表与 Gate 裁决走查（注：当前宿主机无 `docker`/`psql`/`ollama`，真容器编排与 PG 实库回归需在目标机运行 `npm run e2e:live`；详见 [`P1_4_DEPLOY_AND_LIVE_E2E.md`](./P1_4_DEPLOY_AND_LIVE_E2E.md)）。
+- **验收测试**：`npm run build:ui && npm run format && npm run check` 全绿，全库 **205 项测试 / 54 套件 / 32 个测试文件（205 通过 / 0 跳过 / 0 失败）**；真实浏览器 UI E2E 全 5 项走查通过。
+
+---
+
+## 第二十四轮实现（总修复编排 Step 11 / P2-2 & UI v2：后端 G1–G4/G6 契约补齐与 Meridian UI Kit 全业务视图迁移，2026-11-24）
+
+- **`P2-2` 后端可解释性/事件分页/同侪协商与前端 Meridian UI v2 全量改造**：
+  - `src/domain/contracts.ts` / `models.ts` / `scenario.ts` / `ArtifactContractFactory.ts` / 6 阶段 Agent 子类：实现 G1（`agentRationale`/`keyDecisions`）与 G6（`structuredSummary: { headline, rationale, caveats }`）。
+  - `src/patterns/EventBus.ts` / `WorkflowOrchestratorFacade.ts` / `WorkbenchServer.ts` / `WorkbenchApiClient.ts`：实现 G2（门禁挂起/自动放行/签核/驳回广播含结构化 `detailPayload`）、G3（`GET /api/events/history` 阶段与时间筛选分页 + `fetchEventHistory`）与 G4（`enableExtendedPeerNegotiation` / DSL 声明启用 Stage 1 & 3a 真实协商）。
+  - `src/ui/client/**` & `src/ui/styles/workbench.css`：彻底移除 `stageContent.tsx` 中硬编码的 `ACTIONS_BY_STAGE` 与 `STAGE_DISCUSSIONS`；新增 `artifactParsers.ts`（G5）、`perspective.ts`（L1/L2/L3 视角状态机）与 `AgentDeliverableReview.tsx`（3 标签审阅 + A/B 方案对比卡 + 每卡独立裁决理由）；全部 7 个核心业务视图及 `DetailDrawer` / `AgentFlowCanvas` / `Topbar` 接入 `src/ui/kit/` 浅色默认令牌体系，并修复窄视口（759px）下 `.app-sidebar`/`.app-topbar` CSS 层叠遮挡缺陷（详见 [`P2_2_MERIDIAN_UI_V2_MIGRATION.md`](./P2_2_MERIDIAN_UI_V2_MIGRATION.md)）。
+- **验收测试**：新增 `tests/ui-v2-contracts.spec.ts`（6 项全通过）；`npm run build:ui && npm run format && npm run check` 全绿，全库 **211 项测试 / 55 套件 / 33 个测试文件（211 通过 / 0 跳过 / 0 失败）**；实机 Chrome 验证 Desktop 与 759×996 窄视口交互全部通过。
+
+---
+
+## 第二十五轮实现（总修复编排 Step 12 / P2-3：测试隔离卫生与仓库残留清理，2026-11-24）
+
+- **`P2-3` 测试隔离卫生改造与零工作区污染守卫**：
+  - `tests/helpers/testIsolation.ts`（新建）：封装 `createTestWorkspace()` 与 `withTestWorkspace()`，统一在 `os.tmpdir()` 下创建隔离 `persistenceDir` + `sandboxRootDir` 并在 `finally` 递归销毁。
+  - 全仓 13 个未完全隔离测试文件改造（`a4-intent-and-baseline`、`agent-quality-efficiency`、`architecture`、`concurrency-and-cache`、`dsl-loader`、`dynamic-context-needs`、`full-pipeline-llm`、`persistence-rag`、`pluggable-nodes`、`qa-repair-loop`、`rbac-governance`、`state-reconstructor`、`supervisor-tools`）：全部 `WorkflowOrchestratorFacade` 与 `WorkbenchHttpServer` 构造点显式传入隔离 `persistenceDir` 与 `sandboxRootDir` 并回收临时目录。
+  - `tests/test-isolation-hygiene.spec.ts`（新建，2 项）：实现全仓 `tests/*.spec.ts` 构造参数静态防回归审计与 `withTestWorkspace()` 正常/异常清理契约验证。
+  - 仓库根目录历史残留清理：删除 `9.9M` `.runtime-data/`（5 项含 9.47 MB WAL）与 `188K` `.sandbox-worktrees/`（10 个 `RUN-*` 目录）（详见 [`P2_3_TEST_ISOLATION_HYGIENE.md`](./P2_3_TEST_ISOLATION_HYGIENE.md)）。
+- **验收测试**：清理残留后运行 `npm run format && npm run check` 全绿，全库 **213 项测试 / 56 套件 / 34 个测试文件（213 通过 / 0 跳过 / 0 失败）**，且全量跑完后确认 `.runtime-data/` 与 `.sandbox-worktrees/` 均未被创建（`CLEAN_WORKSPACE_OK`）。
+
+---
+
 ## 待实现项（详见 `BACKEND_TODO.md` 第五章与 `BACKEND_TODO_DESIGN.md`）
 
 | 编号           | 优先级 | 设计/审计状态                                          | 预估工作量 |

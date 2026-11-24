@@ -1,18 +1,25 @@
 /**
  * @file App.tsx
- * @description 应用根组件：唯一状态源（DashboardState / 身份 / 路由 / 主题 / 抽屉 / 弹窗 / 提示条），
- * SSE 实时订阅（按登录身份重连），并向下分发统一动作封装。
+ * @description 应用根组件：唯一状态源（DashboardState / F1 认证会话 / 路由 / 主题 / 抽屉 / 弹窗 / 提示条），
+ * SSE 实时订阅，并向下分发统一动作封装。
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import type { DashboardStateDto, NotificationDto } from './types.ts';
-import { WorkbenchApiClient } from './WorkbenchApiClient.ts';
+import type {
+  AuthUserDto,
+  DashboardStateDto,
+  NotificationDto,
+  WorkflowTemplateItemDto,
+} from './types.ts';
+import { ApiHttpError, WorkbenchApiClient } from './WorkbenchApiClient.ts';
 import { Sidebar, type RouteKey } from './components/Sidebar.tsx';
 import { Topbar } from './components/Topbar.tsx';
 import { RunSummaryBar } from './components/RunSummaryBar.tsx';
 import { DetailDrawer, type DrawerContent } from './components/DetailDrawer.tsx';
 import { NewProposalModal } from './components/NewProposalModal.tsx';
 import { DecisionTimeline } from './components/DecisionTimeline.tsx';
+import { LoginView } from './components/LoginView.tsx';
+import { ChangePasswordModal } from './components/ChangePasswordModal.tsx';
 import { WorkspaceView } from './views/WorkspaceView.tsx';
 import { ProjectsHubView } from './views/ProjectsHubView.tsx';
 import { GateCenterView } from './views/GateCenterView.tsx';
@@ -22,8 +29,11 @@ import { AuditRagView } from './views/AuditRagView.tsx';
 import { AdminGovernanceView } from './views/AdminGovernanceView.tsx';
 import { ComponentGalleryView } from './views/ComponentGalleryView.tsx';
 import { stageMeta } from './lib/display.ts';
+import { derivePerspective } from './lib/perspective.ts';
 
 const apiClient = new WorkbenchApiClient();
+
+type AuthMode = 'loading' | 'authenticated' | 'unauthenticated' | 'demo_mode';
 
 const VALID_ROUTES: ReadonlyArray<RouteKey> = [
   'projects',
@@ -50,6 +60,15 @@ export function App() {
   const [drawer, setDrawer] = useState<DrawerContent | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [auditExpanded, setAuditExpanded] = useState(false);
+
+  // F1/P0-2 认证状态机
+  const [authMode, setAuthMode] = useState<AuthMode>('loading');
+  const [authUser, setAuthUser] = useState<AuthUserDto | null>(null);
+  const [impersonatingAdmin, setImpersonatingAdmin] = useState<AuthUserDto | null>(null);
+  const [mustChangePassword, setMustChangePassword] = useState(false);
+  const [passwordModalOpen, setPasswordModalOpen] = useState(false);
+  const [loginModalOpen, setLoginModalOpen] = useState(false);
+  const [templates, setTemplates] = useState<ReadonlyArray<WorkflowTemplateItemDto>>([]);
 
   const showBanner = useCallback((message: string, type: 'error' | 'success') => {
     setBanner({ message, type });
@@ -81,25 +100,148 @@ export function App() {
     [applyState, showBanner],
   );
 
-  // 初始化 + SSE 订阅（身份变化时重连）
-  const actorId = state?.rbacContext?.currentUser.userId;
+  // 注册全局 401 / 强制改密拦截器
+  useEffect(() => {
+    apiClient.setAuthCallbacks({
+      onUnauthorized: () => {
+        setAuthUser(null);
+        setImpersonatingAdmin(null);
+        setMustChangePassword(false);
+        setSseConnected(false);
+        setAuthMode('unauthenticated');
+      },
+      onMustChangePassword: () => {
+        setMustChangePassword(true);
+      },
+    });
+  }, []);
+
+  // 启动认证初始化：先探测 /api/auth/me，未登录则探测是否支持默认演示投影，否则切入 LoginView
   useEffect(() => {
     let cancelled = false;
-    void refreshState().then(() => {
-      if (cancelled) {
-        return;
+    const bootstrap = async () => {
+      try {
+        const me = await apiClient.fetchAuthMe();
+        if (cancelled) {
+          return;
+        }
+        setAuthUser(me.user);
+        setImpersonatingAdmin(me.impersonating);
+        setAuthMode('authenticated');
+        if (me.user.mustChangePassword && !me.impersonating) {
+          setMustChangePassword(true);
+          return;
+        }
+        setMustChangePassword(false);
+        const initial = await apiClient.fetchDashboardState();
+        if (!cancelled) {
+          applyState(initial);
+        }
+      } catch {
+        if (cancelled) {
+          return;
+        }
+        apiClient.setSessionAuthenticated(false);
+        try {
+          const fallbackState = await apiClient.fetchDashboardState();
+          if (!cancelled) {
+            setAuthMode('demo_mode');
+            applyState(fallbackState);
+          }
+        } catch (err) {
+          if (cancelled) {
+            return;
+          }
+          if (err instanceof ApiHttpError && err.mustChangePassword) {
+            setMustChangePassword(true);
+            setAuthMode('authenticated');
+          } else {
+            setAuthMode('unauthenticated');
+          }
+        }
       }
-      apiClient.subscribeRealtimeEventStream(
-        (nextState) => {
-          setState(nextState);
-        },
-        (connected) => setSseConnected(connected),
-      );
-    });
+    };
+    void bootstrap();
     return () => {
       cancelled = true;
     };
-  }, [refreshState, actorId]);
+  }, [applyState]);
+
+  // P1-1：SSE 订阅绑定当前 actorId 与 activeRunId，切项目/立项/身份切换自动关闭旧连接重连并消费增量帧
+  const actorId = state?.rbacContext?.currentUser.userId;
+  const activeRunId = state?.run?.runId;
+  useEffect(() => {
+    if (authMode === 'loading' || authMode === 'unauthenticated' || mustChangePassword) {
+      apiClient.closeRealtimeEventStream();
+      setSseConnected(false);
+      return;
+    }
+    const unsubscribe = apiClient.subscribeRealtimeEventStream(
+      (nextState) => {
+        setState(nextState);
+      },
+      (connected) => setSseConnected(connected),
+      activeRunId,
+      {
+        onRunEvent: (ev) => {
+          setState((prev) => {
+            if (!prev || (prev.run?.runId && prev.run.runId !== ev.runId)) {
+              return prev;
+            }
+            const existing = prev.liveInteractionStream ?? [];
+            if (existing.some((item) => item.eventId === ev.eventId)) {
+              return prev;
+            }
+            return {
+              ...prev,
+              liveInteractionStream: [ev, ...existing].slice(0, 40),
+            };
+          });
+        },
+        onUserNotification: (notif) => {
+          setState((prev) => {
+            if (!prev || (prev.run?.runId && prev.run.runId !== notif.runId)) {
+              return prev;
+            }
+            const existing = prev.notifications ?? [];
+            const idx = existing.findIndex((item) => item.notificationId === notif.notificationId);
+            const nextList =
+              idx >= 0
+                ? existing.map((item, i) => (i === idx ? notif : item))
+                : [notif, ...existing];
+            return {
+              ...prev,
+              notifications: nextList,
+            };
+          });
+        },
+      },
+    );
+    return () => {
+      unsubscribe();
+    };
+  }, [authMode, mustChangePassword, actorId, activeRunId]);
+
+  // P1-1：动态拉取后端可用 YAML 工作流模板列表
+  useEffect(() => {
+    if (authMode === 'loading' || authMode === 'unauthenticated' || mustChangePassword) {
+      return;
+    }
+    let cancelled = false;
+    void apiClient
+      .listWorkflowTemplates()
+      .then((res) => {
+        if (!cancelled) {
+          setTemplates(res.templates);
+        }
+      })
+      .catch(() => {
+        // 离线或无权限时保持现有选项兜底
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authMode, mustChangePassword, actorId]);
 
   useEffect(() => {
     const handler = () => setRoute(routeFromHash());
@@ -116,8 +258,95 @@ export function App() {
     window.location.hash = `#/${next}`;
   }, []);
 
+  const handleLoginSuccess = useCallback(
+    async (user: AuthUserDto) => {
+      setAuthUser(user);
+      setImpersonatingAdmin(null);
+      setAuthMode('authenticated');
+      setLoginModalOpen(false);
+      if (user.mustChangePassword) {
+        setMustChangePassword(true);
+        return;
+      }
+      setMustChangePassword(false);
+      try {
+        await refreshState();
+        showBanner(`欢迎回来，${user.displayName}`, 'success');
+      } catch (err) {
+        if (err instanceof ApiHttpError && err.mustChangePassword) {
+          setMustChangePassword(true);
+        } else {
+          showBanner(err instanceof Error ? err.message : '加载工作台失败', 'error');
+        }
+      }
+    },
+    [refreshState, showBanner],
+  );
+
+  const handleLogout = useCallback(async () => {
+    await apiClient.logout();
+    apiClient.closeRealtimeEventStream();
+    setAuthUser(null);
+    setImpersonatingAdmin(null);
+    setMustChangePassword(false);
+    setPasswordModalOpen(false);
+    setSseConnected(false);
+    try {
+      const demoState = await apiClient.fetchDashboardState();
+      setAuthMode('demo_mode');
+      applyState(demoState);
+    } catch {
+      setState(null);
+      setAuthMode('unauthenticated');
+    }
+  }, [applyState]);
+
+  const handlePasswordChanged = useCallback(async () => {
+    setMustChangePassword(false);
+    setPasswordModalOpen(false);
+    try {
+      const me = await apiClient.fetchAuthMe();
+      setAuthUser(me.user);
+      setImpersonatingAdmin(me.impersonating);
+      await refreshState();
+      showBanner('登录口令已更新（其他设备会话已自动注销）', 'success');
+    } catch (err) {
+      showBanner(err instanceof Error ? err.message : '刷新状态失败', 'error');
+    }
+  }, [refreshState, showBanner]);
+
+  const handleExitActAs = useCallback(async () => {
+    try {
+      const me = await apiClient.exitActAs();
+      setAuthUser(me.user);
+      setImpersonatingAdmin(me.impersonating);
+      await refreshState();
+      showBanner(`已退出代班视角，恢复管理员 [${me.user.displayName}]`, 'success');
+    } catch (err) {
+      showBanner(err instanceof Error ? err.message : '退出视角失败', 'error');
+    }
+  }, [refreshState, showBanner]);
+
   const switchActor = useCallback(
     async (userId: string) => {
+      if (authMode === 'authenticated') {
+        try {
+          const me = await apiClient.actAs(userId);
+          setAuthUser(me.user);
+          setImpersonatingAdmin(me.impersonating);
+          await refreshState();
+          showBanner(
+            me.impersonating
+              ? `已切换管理员代班视角为 ${me.user.displayName}`
+              : `已恢复管理员身份 ${me.user.displayName}`,
+            'success',
+          );
+        } catch (err) {
+          showBanner(err instanceof Error ? err.message : '管理员切换视角失败', 'error');
+        }
+        return;
+      }
+
       apiClient.setActiveActorUserId(userId);
       try {
         applyState(await apiClient.fetchDashboardState());
@@ -127,18 +356,32 @@ export function App() {
         showBanner(err instanceof Error ? err.message : '切换成员失败', 'error');
       }
     },
-    [applyState, showBanner],
+    [authMode, applyState, refreshState, showBanner],
   );
 
   const submitDecision = useCallback(
     (notif: NotificationDto, verdict: string, label: string, reason: string) => {
+      const cleanReason = reason.trim() || `人工确认：[${label}]`;
+      const isAbortedRetry =
+        notif.category === 'STAGE_CONTRACT_FAILED' ||
+        notif.category === 'TOKEN_BUDGET_EXCEEDED' ||
+        notif.relatedSnapshotId.startsWith('RETRY:');
+      if (isAbortedRetry) {
+        void act(
+          () =>
+            apiClient.retryAbortedRun({
+              runId: notif.runId,
+              snapshotId: notif.relatedSnapshotId,
+              comment: cleanReason,
+              extraTokenBudget: notif.category === 'TOKEN_BUDGET_EXCEEDED' ? 30000 : undefined,
+            }),
+          `已触发熔断重试恢复：${label}`,
+        );
+        return;
+      }
       void act(
         () =>
-          apiClient.submitGateDecision(
-            notif.relatedSnapshotId,
-            verdict,
-            reason.trim() || `人工确认：[${label}]`,
-          ),
+          apiClient.submitGateDecision(notif.relatedSnapshotId, verdict, cleanReason, notif.runId),
         `已完成步骤裁决：${label}${reason.trim() ? '（原因已记入审计账本）' : ''}`,
       );
     },
@@ -152,7 +395,34 @@ export function App() {
     [act],
   );
 
+  if (authMode === 'loading') {
+    return (
+      <div className="auth-screen">
+        <div className="auth-card">
+          <div className="auth-brand">
+            <span className="brand-badge">A</span>
+            <div>
+              <h1 className="auth-title">Agentic SDLC OS</h1>
+              <p className="auth-subtitle">正在校验会话与加载工作台…</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (authMode === 'unauthenticated' || loginModalOpen) {
+    return (
+      <LoginView
+        apiClient={apiClient}
+        onLoginSuccess={(user) => void handleLoginSuccess(user)}
+        onCancel={authMode === 'demo_mode' ? () => setLoginModalOpen(false) : undefined}
+      />
+    );
+  }
+
   const hasActiveRun = Boolean(state?.hasActiveRun && state.run);
+  const perspective = derivePerspective(state?.rbacContext);
 
   // 组件库总览页使用独立全宽外壳（不受旧版 .app-shell 栅格与 1024px 折叠影响）
   if (route === 'gallery') {
@@ -173,6 +443,11 @@ export function App() {
           state={state}
           theme={theme}
           sseConnected={sseConnected}
+          authMode={authMode}
+          authUser={authUser}
+          impersonatingAdmin={impersonatingAdmin}
+          templates={templates}
+          perspective={perspective}
           onActorChange={(userId) => void switchActor(userId)}
           onRunChange={(runId) => void act(() => apiClient.selectRun(runId))}
           onTemplateChange={(fileName) =>
@@ -183,7 +458,28 @@ export function App() {
           }
           onOpenNewProposal={() => setModalOpen(true)}
           onToggleTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          onOpenLogin={() => setLoginModalOpen(true)}
+          onOpenChangePassword={() => setPasswordModalOpen(true)}
+          onLogout={() => void handleLogout()}
+          onExitActAs={() => void handleExitActAs()}
         />
+
+        {impersonatingAdmin && authUser ? (
+          <div className="impersonation-banner">
+            <span>
+              👑 <strong>管理员替身视角</strong>：当前正以 <code>{authUser.displayName}</code>（@
+              {authUser.username}）身份操作，所有裁决与评论将审计归属为{' '}
+              <code>via {impersonatingAdmin.displayName}</code>
+            </span>
+            <button
+              type="button"
+              className="btn btn-warning"
+              onClick={() => void handleExitActAs()}
+            >
+              退出代班视角
+            </button>
+          </div>
+        ) : null}
 
         {banner ? (
           <div
@@ -231,6 +527,8 @@ export function App() {
                 {state ? (
                   <WorkspaceView
                     state={state}
+                    apiClient={apiClient}
+                    perspective={perspective}
                     submitDecision={submitDecision}
                     postComment={postComment}
                     openDrawer={setDrawer}
@@ -242,7 +540,15 @@ export function App() {
                 className={`view-section ${route === 'gate-center' ? 'active-view' : ''}`}
                 style={route === 'gate-center' ? undefined : { display: 'none' }}
               >
-                {state ? <GateCenterView state={state} onSubmitDecision={submitDecision} /> : null}
+                {state ? (
+                  <GateCenterView
+                    state={state}
+                    perspective={perspective}
+                    onSubmitDecision={submitDecision}
+                    onPostComment={postComment}
+                    onOpenDrawer={setDrawer}
+                  />
+                ) : null}
               </div>
 
               <div
@@ -266,7 +572,14 @@ export function App() {
                 className={`view-section ${route === 'sandbox-explorer' ? 'active-view' : ''}`}
                 style={route === 'sandbox-explorer' ? undefined : { display: 'none' }}
               >
-                {state ? <SandboxExplorerView state={state} apiClient={apiClient} /> : null}
+                {state ? (
+                  <SandboxExplorerView
+                    state={state}
+                    apiClient={apiClient}
+                    onApplyState={applyState}
+                    onBanner={showBanner}
+                  />
+                ) : null}
               </div>
 
               <div
@@ -293,6 +606,7 @@ export function App() {
                   <AdminGovernanceView
                     state={state}
                     apiClient={apiClient}
+                    authMode={authMode}
                     onActorChange={(userId) => void switchActor(userId)}
                     onRefreshState={refreshState}
                     onBanner={showBanner}
@@ -330,6 +644,16 @@ export function App() {
             },
           );
         }}
+      />
+
+      <ChangePasswordModal
+        open={mustChangePassword || passwordModalOpen}
+        forced={mustChangePassword}
+        username={authUser?.username}
+        apiClient={apiClient}
+        onSuccess={() => void handlePasswordChanged()}
+        onClose={() => setPasswordModalOpen(false)}
+        onLogout={() => void handleLogout()}
       />
 
       <DetailDrawer content={drawer} onClose={() => setDrawer(null)} />

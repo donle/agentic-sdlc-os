@@ -28,8 +28,10 @@ import { SoftwareEngineerAgent } from '../agents/SoftwareEngineerAgent.ts';
 import { EscalateConflictToHumanCommand, SupervisorAgent } from '../agents/SupervisorAgent.ts';
 import { TechLeadAgent } from '../agents/TechLeadAgent.ts';
 import {
+  PrdArtifactContract,
   ProjectProposalContract,
   QaVerificationArtifactContract,
+  TechSpecArtifactContract,
   UiDesignArtifactContract,
 } from '../domain/contracts.ts';
 import {
@@ -50,7 +52,7 @@ import {
   type TeamCommentCategory,
 } from '../domain/models.ts';
 import * as fs from 'node:fs';
-import { WorkflowEventBus } from '../patterns/EventBus.ts';
+import { WorkflowDomainEvent, WorkflowEventBus } from '../patterns/EventBus.ts';
 import { FalseConsensusGuard } from '../patterns/FalseConsensusGuard.ts';
 import { ModelEndpointDescriptor, ModelRouterGateway } from '../patterns/ModelRouterGateway.ts';
 import { RiskEvaluationContext, RiskEvaluationPipeline } from '../patterns/RiskEvaluationChain.ts';
@@ -65,10 +67,16 @@ import {
 } from '../telemetry/RetrospectiveTaskRunner.ts';
 import { DagWorkflowStateEngine, WorkflowRunState } from './DagWorkflowStateEngine.ts';
 import { ImmutableAuditLedger } from './ImmutableAuditLedger.ts';
-import { PersistenceRepository, type PersistenceDriver } from './PersistenceRepository.ts';
+import {
+  type PersistedGovernanceConfig,
+  PersistenceRepository,
+  type PersistenceDriver,
+} from './PersistenceRepository.ts';
 import { RbacGovernanceService } from './RbacGovernanceService.ts';
 import { WorkflowDslConfiguration, WorkflowDslLoader } from './WorkflowDslLoader.ts';
 import { StateReconstructor } from './pg/StateReconstructor.ts';
+import type { TrimmedContext } from '../agents/context/ContextBudgetTrimmer.ts';
+import { DependencyVersionsProvider } from '../agents/context/DependencyVersionsProvider.ts';
 import { ToolRegistry } from '../agents/context/ToolRegistry.ts';
 import { GitContextProvider } from '../agents/context/GitContextProvider.ts';
 import { McpContextProvider } from '../agents/context/McpContextProvider.ts';
@@ -78,6 +86,18 @@ import { ALL_CONTEXT_NEED_TYPES, STAGE_CONTEXT_NEEDS } from '../agents/context/t
 import type { ContextNeed } from '../agents/context/types.ts';
 
 import { MAX_AUTO_REPAIRS } from './repairLoop.ts';
+
+function appendImpersonationAttribution(actorLabel: string, impersonatedByLabel?: string): string {
+  const cleanAdmin = impersonatedByLabel?.trim();
+  if (!cleanAdmin) {
+    return actorLabel;
+  }
+  const tag = `(via ${cleanAdmin})`;
+  if (actorLabel.includes(tag)) {
+    return actorLabel;
+  }
+  return `${actorLabel} ${tag}`;
+}
 
 export class WorkflowOrchestratorFacade {
   public readonly eventBus: WorkflowEventBus;
@@ -99,6 +119,7 @@ export class WorkflowOrchestratorFacade {
   private contextRegistry: ToolRegistry | null = null;
   private readonly agentRegistry: Map<WorkflowStageId, AbstractWorkerAgent>;
   private readonly teamComments: StageTeamCommentRecord[];
+  private readonly runExecutionLocks = new Map<string, Promise<void>>();
 
   public constructor(params?: {
     maxNegotiationTurns?: number;
@@ -364,12 +385,17 @@ export class WorkflowOrchestratorFacade {
     ]);
     this.teamComments = [];
 
-    // C1：创建 ToolRegistry 并注册 ContextProvider（E1 用 GIT_REPO_PATH 时启用）
+    // C1：创建 ToolRegistry 并注册 ContextProvider（E1 用 GIT_REPO_PATH 时启用；P1-3 接入依赖版本 Provider）
     this.contextRegistry = new ToolRegistry(4000);
     const gitRepoPath = process.env.GIT_REPO_PATH ?? '';
     if (gitRepoPath && fs.existsSync(gitRepoPath)) {
       this.contextRegistry.register(new GitContextProvider(gitRepoPath));
     }
+    this.contextRegistry.register(
+      new DependencyVersionsProvider(
+        gitRepoPath && fs.existsSync(gitRepoPath) ? gitRepoPath : process.cwd(),
+      ),
+    );
     // 步骤 3：Figma(2)/数仓(5)——配置了 MCP URL 时走真实 MCP server，否则确定性 stub 补位（D-2）
     const figmaMcpUrl = process.env.FIGMA_MCP_URL ?? '';
     if (figmaMcpUrl) {
@@ -399,14 +425,19 @@ export class WorkflowOrchestratorFacade {
     content: string;
     category?: TeamCommentCategory;
     persist?: boolean;
+    impersonatedByLabel?: string;
   }): StageTeamCommentRecord {
     const user = this.rbacService.getUserOrDefault(params.actorUserId);
+    const attributedAuthorName = appendImpersonationAttribution(
+      user.displayName,
+      params.impersonatedByLabel,
+    );
     const comment = new StageTeamCommentRecord({
       commentId: `CMT-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       runId: params.runId,
       stageId: params.stageId,
       authorUserId: user.userId,
-      authorName: user.displayName,
+      authorName: attributedAuthorName,
       authorJobTitle: user.jobTitle,
       authorBadge: user.avatarBadge,
       content: params.content,
@@ -497,6 +528,7 @@ export class WorkflowOrchestratorFacade {
   public async startProposalWorkflow(params: {
     proposal: ProjectProposalContract;
     initiatorActor: string;
+    initiatorUserId?: string;
     scenarioHints?: ScenarioHints;
   }): Promise<WorkflowRunState> {
     const validation = params.proposal.validateContractIntegrity();
@@ -509,6 +541,7 @@ export class WorkflowOrchestratorFacade {
       runId,
       proposal: params.proposal,
       initiatorActor: params.initiatorActor,
+      createdByUserId: params.initiatorUserId,
       stagePipeline: this.dslConfig.getStageOrder(),
       workflowTemplateId: this.dslConfig.id,
       scenarioHints: params.scenarioHints,
@@ -517,8 +550,33 @@ export class WorkflowOrchestratorFacade {
 
     this.seedInitialTeamCommentsForRun(runState);
 
-    await this.continueExecutionUntilGateOrComplete(runId);
+    await this.withRunLock(runId, async () => {
+      await this.continueExecutionUntilGateOrCompleteUnlocked(runId);
+    });
     return runState;
+  }
+
+  /**
+   * P0-4：按 runId 隔离的异步互斥锁（Promise 链排队），确保同一运行实例的推进/签核/回退/重试串行执行，
+   * 避免并发请求交错篡改快照状态机；内部委托必须调用 *Unlocked 方法以免锁重入死锁。
+   */
+  private async withRunLock<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.runExecutionLocks.get(runId) ?? Promise.resolve();
+    let releaseCurrent!: () => void;
+    const currentGate = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+    const currentTail = previous.then(() => currentGate);
+    this.runExecutionLocks.set(runId, currentTail);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      releaseCurrent();
+      if (this.runExecutionLocks.get(runId) === currentTail) {
+        this.runExecutionLocks.delete(runId);
+      }
+    }
   }
 
   /**
@@ -574,12 +632,17 @@ export class WorkflowOrchestratorFacade {
     }
   }
 
+  public getContextRegistry(): ToolRegistry | null {
+    return this.contextRegistry;
+  }
+
   /**
-   * I3：run 终态钩子（COMPLETED / ABORTED / ABORTED_TOKEN_BUDGET）——
-   * 触发 worktree 保留策略（保留最近 N=10 个 run，env SANDBOX_WORKTREE_RETENTION 可调）；
+   * I3 / P1-3：run 终态钩子（COMPLETED / ABORTED / ABORTED_TOKEN_BUDGET）——
+   * 触发 worktree 保留策略（保留最近 N=10 个 run，env SANDBOX_WORKTREE_RETENTION 可调）并释放该 run 的上下文缓存；
    * 活跃（RUNNING/PAUSED）与刚终态的 run 受保护，绝不误删。失败不抛出（清理属于旁路）。
    */
   private onRunReachedTerminalState(runState: WorkflowRunState): void {
+    this.contextRegistry?.clearRunCache(runState.runId);
     try {
       const protectRunIds = this.stateEngine
         .getAllRuns()
@@ -603,13 +666,23 @@ export class WorkflowOrchestratorFacade {
    * 持续推进当前活跃分支的下一个阶段，直至触发高风险门禁/冲突熔断/预算或契约失败暂停。
    */
   public async continueExecutionUntilGateOrComplete(runId: string): Promise<WorkflowRunState> {
+    return await this.withRunLock(runId, () =>
+      this.continueExecutionUntilGateOrCompleteUnlocked(runId),
+    );
+  }
+
+  private async continueExecutionUntilGateOrCompleteUnlocked(
+    runId: string,
+  ): Promise<WorkflowRunState> {
     const runState = this.stateEngine.getRunOrThrow(runId);
+    let terminalHookFired = false;
 
     while (runState.getStatus() === 'RUNNING') {
       const currentStageId = runState.getCurrentStageId();
       if (currentStageId === null) {
         runState.setStatus('COMPLETED');
         this.onRunReachedTerminalState(runState);
+        terminalHookFired = true;
         break;
       }
 
@@ -649,6 +722,27 @@ export class WorkflowOrchestratorFacade {
       // 步骤 4：LLM 动态上下文需求推断（离线为空数组，零调用）
       const dynamicContextNeeds = await this.inferDynamicContextNeeds(runState, currentStageId);
 
+      // C1 + 步骤 4 + P1-3：预取并经 ContextBudgetTrimmer 裁剪后注入外部上下文
+      let trimmedExternalContext: TrimmedContext | null = null;
+      if (this.contextRegistry) {
+        const staticNeeds = STAGE_CONTEXT_NEEDS[currentStageId] ?? [];
+        const dynamicExtras = dynamicContextNeeds.filter(
+          (n) => !staticNeeds.some((s) => s.type === n.type),
+        );
+        trimmedExternalContext = await this.contextRegistry.resolve(
+          [...staticNeeds, ...dynamicExtras],
+          {
+            runId: runState.runId,
+            stageId: currentStageId,
+            proposal: runState.proposal,
+            upstreamSummaries: runState.getActiveBranchSnapshots().map((s) => ({
+              stageId: s.stageId,
+              summary: s.artifact.summary,
+            })),
+          },
+        );
+      }
+
       const inputContext = new AgentExecutionInputContext({
         runId: runState.runId,
         branchId: runState.getActiveBranchId(),
@@ -662,24 +756,8 @@ export class WorkflowOrchestratorFacade {
           runState.getTokenBudget() - runState.getTokensUsedTotal(),
         ),
         dynamicContextNeeds,
+        trimmedExternalContext,
       });
-
-      // C1 + 步骤 4：预取外部上下文（静态声明 + LLM 动态需求合并；离线时动态项为空）
-      if (this.contextRegistry) {
-        const staticNeeds = STAGE_CONTEXT_NEEDS[currentStageId] ?? [];
-        const dynamicExtras = dynamicContextNeeds.filter(
-          (n) => !staticNeeds.some((s) => s.type === n.type),
-        );
-        await this.contextRegistry.resolve([...staticNeeds, ...dynamicExtras], {
-          runId: runState.runId,
-          stageId: currentStageId,
-          proposal: runState.proposal,
-          upstreamSummaries: runState.getActiveBranchSnapshots().map((s) => ({
-            stageId: s.stageId,
-            summary: s.artifact.summary,
-          })),
-        });
-      }
 
       let executionOutcome: AgentExecutionOutcome;
       try {
@@ -847,6 +925,11 @@ export class WorkflowOrchestratorFacade {
 
       if (shouldBlockForHuman) {
         runState.setStatus('PAUSED_AT_HUMAN_GATE');
+        this.publishSnapshotGateEvent({
+          snapshot,
+          lifecycleState: SnapshotLifecycleState.PENDING_HUMAN_GATE,
+          headline: `步骤 [${currentStageId}] 暂停等待人工签核/拍板（风险分 ${snapshot.riskScore}/100 · ${snapshot.riskLevel}）`,
+        });
         if (
           riskVerdict.gateAction === GateActionType.BLOCK_FOR_CONFLICT_ARBITRATION &&
           deadlockedTurn !== null
@@ -877,17 +960,56 @@ export class WorkflowOrchestratorFacade {
           comment: `风险评分 ${snapshot.riskScore}/100 低于阻塞阈值，自动放行并留存快照审计痕迹`,
         }),
       );
+      this.publishSnapshotGateEvent({
+        snapshot,
+        lifecycleState: SnapshotLifecycleState.AUTO_APPROVED_LOW_RISK,
+        headline: `步骤 [${currentStageId}] 低风险自动放行（风险分 ${snapshot.riskScore}/100）`,
+      });
       this.supervisorAgent.notifyLowRiskAutoPassed(snapshot);
       runState.advanceToNextStage();
+    }
+
+    if (!terminalHookFired && runState.getStatus() === 'COMPLETED') {
+      this.onRunReachedTerminalState(runState);
     }
 
     this.syncPersistenceState();
     return runState;
   }
 
+  /** G2：统一发布门禁/签核生命周期事件及机器可读 detailPayload */
+  private publishSnapshotGateEvent(params: {
+    snapshot: StageSnapshotMemento;
+    lifecycleState: SnapshotLifecycleState;
+    headline: string;
+    extraPayload?: Record<string, unknown>;
+  }): void {
+    this.eventBus.publishEvent(
+      new WorkflowDomainEvent({
+        eventId: `EVT-GATE-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        runId: params.snapshot.runId,
+        branchId: params.snapshot.branchId,
+        stageId: params.snapshot.stageId,
+        agentRole: params.snapshot.agentRole,
+        lifecycleState: params.lifecycleState,
+        headline: params.headline,
+        detailPayload: {
+          snapshotId: params.snapshot.snapshotId,
+          riskScore: params.snapshot.riskScore,
+          riskLevel: params.snapshot.riskLevel,
+          gateAction: params.snapshot.gateAction,
+          droppedRequirementIds: [...params.snapshot.scopeDiffReport.droppedRequirementIds],
+          ...(params.extraPayload ?? {}),
+        },
+      }),
+    );
+  }
+
   /**
-   * B2：按阶段判定是否发起受限协商，并生成质询内容。
+   * B2 + G4：按阶段判定是否发起受限协商，并生成质询内容。
+   * - PM 阶段：启用扩展同侪协商或 DSL 声明时，由 DA 核验前置埋点契约
    * - PD 阶段：UI 设计质询 PM（交互可行性冲突）
+   * - Tech Spec 阶段：启用扩展同侪协商或 DSL 声明时，由 Engineer 复核接口/DDL 可实现性
    * - QA 阶段：验证失败质询 Engineer（修复闭环；超限后强制熔断上仲裁）
    */
   private evaluateStageNegotiation(
@@ -902,6 +1024,36 @@ export class WorkflowOrchestratorFacade {
     topic: string;
     forceDeadlock: boolean;
   } | null {
+    const extendedPeer = runState.scenarioHints?.enableExtendedPeerNegotiation === true;
+
+    if (
+      stageId === WorkflowStageId.STAGE_1_PM &&
+      (target !== null || extendedPeer) &&
+      artifact instanceof PrdArtifactContract
+    ) {
+      return {
+        challengerRole: AgentRole.DATA_ANALYST,
+        responderRole: AgentRole.PRODUCT_MANAGER,
+        challengePoint: `DA 复核前置埋点契约（共 ${artifact.trackingPlanEvents.length} 个事件），确认 run_id/branch_id/actor_role 属性对齐转化归因口径`,
+        topic: 'PRD_TRACKING_ALIGNMENT',
+        forceDeadlock: false,
+      };
+    }
+
+    if (
+      stageId === WorkflowStageId.STAGE_3A_TECH_SPEC &&
+      (target !== null || extendedPeer) &&
+      artifact instanceof TechSpecArtifactContract
+    ) {
+      return {
+        challengerRole: AgentRole.SOFTWARE_ENGINEER,
+        responderRole: AgentRole.TECH_LEAD,
+        challengePoint: `Engineer 复核架构契约（${artifact.apiContracts.length} 个 API / ${artifact.databaseDdlStatements.length} 条 DDL），确认隔离 Worktree 沙箱可无歧义编码落地`,
+        topic: 'TECH_SPEC_REVIEW',
+        forceDeadlock: false,
+      };
+    }
+
     if (target === null) {
       return null;
     }
@@ -949,6 +1101,25 @@ export class WorkflowOrchestratorFacade {
    */
   public restoreFromPersistence(): { restored: boolean; runIds: string[]; warnings: string[] } {
     const persisted = this.persistenceRepo.loadPersistedSnapshot();
+    const applyGovernanceConfig = (cfg: PersistedGovernanceConfig): void => {
+      if (typeof cfg.maxNegotiationTurns === 'number') {
+        this.negotiationMediator.setMaxNegotiationTurns(cfg.maxNegotiationTurns);
+      }
+      if (typeof cfg.highRiskScoreThreshold === 'number') {
+        this.riskPipeline.setHighRiskThreshold(cfg.highRiskScoreThreshold);
+      }
+      if (typeof cfg.allowSpecialistCrossStageRollback === 'boolean') {
+        this.rbacService.setAllowSpecialistCrossStageRollback(
+          cfg.allowSpecialistCrossStageRollback,
+        );
+      }
+    };
+    if (persisted?.governanceConfig && (!persisted.runs || persisted.runs.length === 0)) {
+      applyGovernanceConfig(persisted.governanceConfig);
+    }
+    if (persisted?.cacheTelemetry && (!persisted.runs || persisted.runs.length === 0)) {
+      this.cacheManager.restoreTelemetryCounters(persisted.cacheTelemetry);
+    }
     if (!persisted || (persisted.runs?.length ?? 0) === 0) {
       return { restored: false, runIds: [], warnings: ['无持久化数据'] };
     }
@@ -965,6 +1136,9 @@ export class WorkflowOrchestratorFacade {
       mediator: this.negotiationMediator,
       eventBus: this.eventBus,
       restoreTeamComment: (comment) => this.restoreTeamComment(comment),
+      cacheManager: this.cacheManager,
+      fulfillmentTracker: this.fulfillmentTracker,
+      restoreGovernanceConfig: applyGovernanceConfig,
     });
     const walEntries = this.persistenceRepo.readAuditWalEntries();
     const result = reconstructor.restore(persisted, walEntries);
@@ -1010,6 +1184,14 @@ export class WorkflowOrchestratorFacade {
         metadata: { ...e.metadata },
         timestampIso: e.timestampIso,
       })),
+      governanceConfig: {
+        maxNegotiationTurns: this.negotiationMediator.getMaxNegotiationTurns(),
+        highRiskScoreThreshold: this.riskPipeline.getHighRiskThreshold(),
+        allowSpecialistCrossStageRollback:
+          this.rbacService.isCrossStageRollbackAllowedForSpecialists(),
+      },
+      cacheTelemetry: this.cacheManager.getMetricsSnapshot(),
+      intentTraces: this.fulfillmentTracker.getTraces().map((t) => t.toSerializableRecord()),
     });
   }
 
@@ -1023,6 +1205,19 @@ export class WorkflowOrchestratorFacade {
     comment?: string;
     targetSnapshotOrRetryId?: string;
     extraTokenBudget?: number;
+    impersonatedByLabel?: string;
+  }): Promise<WorkflowRunState> {
+    return await this.withRunLock(params.runId, () => this.retryAbortedStageUnlocked(params));
+  }
+
+  private async retryAbortedStageUnlocked(params: {
+    runId: string;
+    reviewerActor: string;
+    actorUserId?: string;
+    comment?: string;
+    targetSnapshotOrRetryId?: string;
+    extraTokenBudget?: number;
+    impersonatedByLabel?: string;
   }): Promise<WorkflowRunState> {
     const runState = this.stateEngine.getRunOrThrow(params.runId);
     const status = runState.getStatus();
@@ -1042,6 +1237,10 @@ export class WorkflowOrchestratorFacade {
       );
       effectiveReviewerLabel = authResult.formattedActorLabel;
     }
+    effectiveReviewerLabel = appendImpersonationAttribution(
+      effectiveReviewerLabel,
+      params.impersonatedByLabel,
+    );
 
     if (status === 'ABORTED_TOKEN_BUDGET') {
       const topUp = params.extraTokenBudget ?? Math.max(20000, runState.getTokenBudget());
@@ -1067,6 +1266,7 @@ export class WorkflowOrchestratorFacade {
         branchId: runState.getActiveBranchId(),
         stageId: currentStageId,
         reviewerActor: effectiveReviewerLabel,
+        reviewerUserId: params.actorUserId,
         verdict: DecisionVerdict.APPROVE,
         comment: retryComment,
       }),
@@ -1079,11 +1279,12 @@ export class WorkflowOrchestratorFacade {
       content: `[熔断重试恢复] ${retryComment}`,
       category: 'APPROVAL_NOTE',
       persist: false,
+      impersonatedByLabel: params.impersonatedByLabel,
     });
 
     runState.setStatus('RUNNING');
     this.syncPersistenceState();
-    return await this.continueExecutionUntilGateOrComplete(params.runId);
+    return await this.continueExecutionUntilGateOrCompleteUnlocked(params.runId);
   }
 
   /**
@@ -1098,6 +1299,20 @@ export class WorkflowOrchestratorFacade {
     verdict: DecisionVerdict;
     comment: string;
     extraTokenBudget?: number;
+    impersonatedByLabel?: string;
+  }): Promise<WorkflowRunState> {
+    return await this.withRunLock(params.runId, () => this.submitHumanGateDecisionUnlocked(params));
+  }
+
+  private async submitHumanGateDecisionUnlocked(params: {
+    runId: string;
+    snapshotId: string;
+    reviewerActor: string;
+    actorUserId?: string;
+    verdict: DecisionVerdict;
+    comment: string;
+    extraTokenBudget?: number;
+    impersonatedByLabel?: string;
   }): Promise<WorkflowRunState> {
     const runState = this.stateEngine.getRunOrThrow(params.runId);
     const snapshot = runState.findSnapshotById(params.snapshotId);
@@ -1106,16 +1321,22 @@ export class WorkflowOrchestratorFacade {
       const status = runState.getStatus();
       const isAborted = status === 'ABORTED' || status === 'ABORTED_TOKEN_BUDGET';
       if (isRetryTarget && isAborted && params.verdict === DecisionVerdict.APPROVE) {
-        return await this.retryAbortedStage({
+        return await this.retryAbortedStageUnlocked({
           runId: params.runId,
           reviewerActor: params.reviewerActor,
           actorUserId: params.actorUserId,
           comment: params.comment,
           targetSnapshotOrRetryId: params.snapshotId,
           extraTokenBudget: params.extraTokenBudget,
+          impersonatedByLabel: params.impersonatedByLabel,
         });
       }
       throw new Error(`未找到待审核快照 [${params.snapshotId}]`);
+    }
+    if (snapshot.getState() !== SnapshotLifecycleState.PENDING_HUMAN_GATE) {
+      throw new Error(
+        `快照 [${params.snapshotId}] 当前状态为 [${snapshot.getState()}]，非待人工签核状态，禁止重复裁决`,
+      );
     }
 
     let effectiveReviewerLabel = params.reviewerActor;
@@ -1126,6 +1347,10 @@ export class WorkflowOrchestratorFacade {
       );
       effectiveReviewerLabel = authResult.formattedActorLabel;
     }
+    effectiveReviewerLabel = appendImpersonationAttribution(
+      effectiveReviewerLabel,
+      params.impersonatedByLabel,
+    );
 
     this.auditLedger.recordDecision(
       new HumanDecisionRecord({
@@ -1135,6 +1360,7 @@ export class WorkflowOrchestratorFacade {
         branchId: snapshot.branchId,
         stageId: snapshot.stageId,
         reviewerActor: effectiveReviewerLabel,
+        reviewerUserId: params.actorUserId,
         verdict: params.verdict,
         comment: params.comment,
       }),
@@ -1146,6 +1372,7 @@ export class WorkflowOrchestratorFacade {
       actorUserId: params.actorUserId ?? 'user-admin-01',
       content: `[步骤签核决定: ${params.verdict}] ${params.comment}`,
       category: params.verdict === DecisionVerdict.REJECT ? 'REVISION_REQUEST' : 'APPROVAL_NOTE',
+      impersonatedByLabel: params.impersonatedByLabel,
     });
 
     this.eventBus.resolveNotificationBySnapshotId(params.snapshotId);
@@ -1156,18 +1383,37 @@ export class WorkflowOrchestratorFacade {
       params.verdict === DecisionVerdict.ARBITRATE_OPTION_B
     ) {
       snapshot.transitionState(SnapshotLifecycleState.APPROVED);
+      this.publishSnapshotGateEvent({
+        snapshot,
+        lifecycleState: SnapshotLifecycleState.APPROVED,
+        headline: `[${effectiveReviewerLabel}] 已签核通过步骤 [${snapshot.stageId}]（${params.verdict}）`,
+        extraPayload: {
+          verdict: params.verdict,
+          reviewerActor: effectiveReviewerLabel,
+        },
+      });
       runState.advanceToNextStage();
-      return await this.continueExecutionUntilGateOrComplete(params.runId);
+      return await this.continueExecutionUntilGateOrCompleteUnlocked(params.runId);
     }
 
     // 若人工选择驳回（REJECT），自动委托总管 Agent 在当前阶段执行 Fork 回退重做
     snapshot.transitionState(SnapshotLifecycleState.REJECTED);
-    return this.invokeSupervisorConversationalRollback({
+    this.publishSnapshotGateEvent({
+      snapshot,
+      lifecycleState: SnapshotLifecycleState.REJECTED,
+      headline: `[${effectiveReviewerLabel}] 已驳回步骤 [${snapshot.stageId}] 触发重做`,
+      extraPayload: {
+        verdict: params.verdict,
+        reviewerActor: effectiveReviewerLabel,
+      },
+    });
+    return await this.invokeSupervisorConversationalRollbackUnlocked({
       runId: params.runId,
       humanActor: effectiveReviewerLabel,
       actorUserId: params.actorUserId,
       dialogueInstruction: `人工门禁驳回重做：${params.comment}`,
       explicitTargetStageId: snapshot.stageId,
+      impersonatedByLabel: params.impersonatedByLabel,
     });
   }
 
@@ -1180,6 +1426,20 @@ export class WorkflowOrchestratorFacade {
     actorUserId?: string;
     dialogueInstruction: string;
     explicitTargetStageId?: WorkflowStageId;
+    impersonatedByLabel?: string;
+  }): Promise<WorkflowRunState> {
+    return await this.withRunLock(params.runId, () =>
+      this.invokeSupervisorConversationalRollbackUnlocked(params),
+    );
+  }
+
+  private async invokeSupervisorConversationalRollbackUnlocked(params: {
+    runId: string;
+    humanActor: string;
+    actorUserId?: string;
+    dialogueInstruction: string;
+    explicitTargetStageId?: WorkflowStageId;
+    impersonatedByLabel?: string;
   }): Promise<WorkflowRunState> {
     const runState = this.stateEngine.getRunOrThrow(params.runId);
     const parsedDirective = await this.supervisorAgent.parseNaturalLanguageRollback(
@@ -1196,6 +1456,10 @@ export class WorkflowOrchestratorFacade {
       );
       effectiveActor = `${user.displayName} (${user.jobTitle})`;
     }
+    const attributedReviewerActor = appendImpersonationAttribution(
+      `${effectiveActor} (via SupervisorAgent)`,
+      params.impersonatedByLabel,
+    );
 
     const forkOutcome = runState.forkAndRollbackToStage(
       parsedDirective.targetStageId,
@@ -1209,7 +1473,8 @@ export class WorkflowOrchestratorFacade {
         snapshotId: forkOutcome.supersededSnapshotIds[0] ?? 'ROOT',
         branchId: forkOutcome.newBranchId,
         stageId: parsedDirective.targetStageId,
-        reviewerActor: `${effectiveActor} (via SupervisorAgent)`,
+        reviewerActor: attributedReviewerActor,
+        reviewerUserId: params.actorUserId,
         verdict: DecisionVerdict.SUPERVISOR_ROLLBACK,
         comment: `通过总管 Agent 对话回退至 [${parsedDirective.targetStageId} / ${parsedDirective.targetAgentRole}]，从旧分支 [${forkOutcome.previousBranchId}] 分叉创建新分支 [${forkOutcome.newBranchId}]，废弃旧快照 ${forkOutcome.supersededSnapshotIds.length} 个。指令：${parsedDirective.cleanInstruction}`,
       }),
@@ -1221,6 +1486,7 @@ export class WorkflowOrchestratorFacade {
       actorUserId: params.actorUserId ?? 'user-admin-01',
       content: `[总管调度回退至本步骤 -> 新分支 ${forkOutcome.newBranchId}] 团队修改指令：${parsedDirective.cleanInstruction}`,
       category: 'REVISION_REQUEST',
+      impersonatedByLabel: params.impersonatedByLabel,
     });
 
     this.eventBus.publishNotification(
@@ -1238,7 +1504,7 @@ export class WorkflowOrchestratorFacade {
       }),
     );
 
-    return await this.continueExecutionUntilGateOrComplete(params.runId);
+    return await this.continueExecutionUntilGateOrCompleteUnlocked(params.runId);
   }
 
   /**
@@ -1401,6 +1667,7 @@ export class WorkflowOrchestratorFacade {
         accessEvaluation: this.rbacService.evaluateStageAccess(currentUser.userId, n.stageId),
       })),
       liveInteractionStream: this.eventBus.getEventHistory(targetRun.runId).slice(-40).reverse(),
+      liveInteractionStreamTotal: this.eventBus.getEventHistory(targetRun.runId).length,
       negotiationLogs: this.negotiationMediator.getNegotiationHistory(targetRun.runId),
       humanDecisions: this.auditLedger.getHumanDecisions(targetRun.runId),
       teamComments: this.getTeamComments(targetRun.runId),

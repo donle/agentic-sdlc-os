@@ -36,14 +36,16 @@ import {
   RecognizedStageIntent,
 } from './AbstractWorkerAgent.ts';
 
+interface PreparedSandboxEntry {
+  readonly key: string;
+  readonly reqIds: ReadonlyArray<string>;
+  readonly provisionResult: SandboxProvisionResult;
+  readonly selfVerification: SandboxVerificationResult;
+}
+
 export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementationArtifactContract> {
   private readonly sandboxManager: GitWorktreeSandboxManager;
-  private lastPreparedSandbox: {
-    readonly key: string;
-    readonly reqIds: ReadonlyArray<string>;
-    readonly provisionResult: SandboxProvisionResult;
-    readonly selfVerification: SandboxVerificationResult;
-  } | null = null;
+  private readonly preparedSandboxes = new Map<string, PreparedSandboxEntry>();
 
   public constructor(deps: {
     eventBus: WorkflowEventBus;
@@ -72,15 +74,11 @@ export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementatio
     );
   }
 
-  private ensureSandboxProvisioned(context: AgentExecutionInputContext): {
-    readonly key: string;
-    readonly reqIds: ReadonlyArray<string>;
-    readonly provisionResult: SandboxProvisionResult;
-    readonly selfVerification: SandboxVerificationResult;
-  } {
-    const key = `${context.runId}::${context.branchId}::${context.humanFeedbackDirective ?? ''}`;
-    if (this.lastPreparedSandbox && this.lastPreparedSandbox.key === key) {
-      return this.lastPreparedSandbox;
+  private ensureSandboxProvisioned(context: AgentExecutionInputContext): PreparedSandboxEntry {
+    const key = this.buildPreparedContextKey(context);
+    const cached = this.preparedSandboxes.get(key);
+    if (cached) {
+      return cached;
     }
 
     const upstreamTech = context.upstreamArtifacts.get(WorkflowStageId.STAGE_3A_TECH_SPEC) as
@@ -108,8 +106,12 @@ export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementatio
       runSubprocessNodeTest: true,
     });
 
-    this.lastPreparedSandbox = { key, reqIds, provisionResult, selfVerification };
-    return this.lastPreparedSandbox;
+    return this.saveBoundedPreparedState(this.preparedSandboxes, key, {
+      key,
+      reqIds,
+      provisionResult,
+      selfVerification,
+    });
   }
 
   /**
@@ -140,15 +142,69 @@ export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementatio
     };
   }
 
+  protected override applyLlmPostProcessing(
+    _candidate: CodeImplementationArtifactContract,
+    rawCandidate: Record<string, unknown>,
+    context: AgentExecutionInputContext,
+  ): ReadonlyArray<string> {
+    if (!Array.isArray(rawCandidate.filePatches) || rawCandidate.filePatches.length === 0) {
+      return [];
+    }
+
+    const patches: Array<{ filePath: string; content: string }> = [];
+    for (const item of rawCandidate.filePatches) {
+      if (item && typeof item === 'object') {
+        const rec = item as Record<string, unknown>;
+        if (
+          typeof rec.filePath === 'string' &&
+          rec.filePath.trim().length > 0 &&
+          typeof rec.content === 'string'
+        ) {
+          patches.push({ filePath: rec.filePath.trim(), content: rec.content });
+        }
+      }
+    }
+    if (patches.length === 0) {
+      return [];
+    }
+
+    const prepared = this.ensureSandboxProvisioned(context);
+    const patchOutcome = this.sandboxManager.applyFilePatches({
+      runId: context.runId,
+      branchId: context.branchId,
+      patches,
+    });
+    if (patchOutcome.rejectedFiles.length > 0) {
+      return patchOutcome.rejectedFiles.map(
+        (r) => `filePatches 路径被沙箱安全策略拒绝 [${r.filePath}]: ${r.reason}`,
+      );
+    }
+
+    const reVerification = this.sandboxManager.executeSandboxVerification({
+      runId: context.runId,
+      branchId: context.branchId,
+      requirementIds: prepared.reqIds,
+      runSubprocessNodeTest: true,
+    });
+
+    this.saveBoundedPreparedState(this.preparedSandboxes, prepared.key, {
+      ...prepared,
+      selfVerification: reVerification,
+    });
+
+    return [];
+  }
+
   protected override validateStageSpecificConstraints(
     candidate: CodeImplementationArtifactContract,
     context: AgentExecutionInputContext,
   ): ReadonlyArray<string> {
-    const key = `${context.runId}::${context.branchId}::${context.humanFeedbackDirective ?? ''}`;
-    if (!this.lastPreparedSandbox || this.lastPreparedSandbox.key !== key) {
+    const key = this.buildPreparedContextKey(context);
+    const prepared = this.preparedSandboxes.get(key);
+    if (!prepared) {
       return [];
     }
-    const { selfVerification } = this.lastPreparedSandbox;
+    const { selfVerification } = prepared;
     const realPassed =
       selfVerification.failedTestCases === 0 && selfVerification.securityIssuesFound === 0;
     if (!realPassed && candidate.selfTestPassed) {
@@ -179,6 +235,14 @@ export class SoftwareEngineerAgent extends AbstractWorkerAgent<CodeImplementatio
       modifiedFiles,
       selfTestPassed:
         selfVerification.failedTestCases === 0 && selfVerification.securityIssuesFound === 0,
+      agentRationale: `Engineer 在隔离 Git Worktree 分支 [${provisionResult.gitWorktreeBranch}] 中按 3a 架构契约完成 ${modifiedFiles.length} 个文件落地，并执行真实子进程自测（${selfVerification.passedTestCases}/${selfVerification.totalTestCases} 通过，安全告警 ${selfVerification.securityIssuesFound} 项）。`,
+      keyDecisions: [
+        {
+          decision: `隔离分支 ${provisionResult.gitWorktreeBranch} + 增量面向对象模块实现`,
+          rationale: '将业务代码与主干工作区物理隔离，确保任何回退/返修不会污染既有分支快照',
+          tradeoffs: ['维护独立 Worktree 磁盘空间', '获得可独立编译/单测/回溯的代码沙箱'],
+        },
+      ],
     });
   }
 }

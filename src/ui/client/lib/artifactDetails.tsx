@@ -1,31 +1,42 @@
 /**
  * @file artifactDetails.tsx
- * @description 五类阶段交付物契约的结构化详情渲染（PRD / UI 设计 / 技术契约 / 代码实现 / QA 报告），
- * 未识别类型折叠为原始 JSON。长列表默认显示前 3 条，其余折叠展开。
+ * @description G5: 六类阶段交付物契约（含 DA 埋点归因报告与未识别类型 JSON 兜底）的结构化渲染组件。
  */
 
+import { useState, type ReactNode } from 'react';
+import {
+  Callout,
+  Card,
+  DataTable,
+  EmptyState,
+  Inline,
+  KeyValueList,
+  SectionLabel,
+  Stack,
+  StatusChip,
+  Text,
+} from '../../kit/index.ts';
 import type { SnapshotRecordDto } from '../types.ts';
-import { stateBadge } from './display.ts';
-import { useState } from 'react';
+import { parseStageArtifact } from './artifactParsers.ts';
 
 const LIST_LIMIT = 3;
 
-function FoldedList({ items, foldLabel }: { items: React.ReactNode[]; foldLabel: string }) {
+function FoldedList({ items, foldLabel }: { items: ReactNode[]; foldLabel: string }) {
   const [open, setOpen] = useState(false);
   if (items.length === 0) {
     return null;
   }
   if (items.length <= LIST_LIMIT) {
     return (
-      <>
+      <Stack gap="tight">
         {items.map((node, idx) => (
           <div key={idx}>{node}</div>
         ))}
-      </>
+      </Stack>
     );
   }
   return (
-    <>
+    <Stack gap="tight">
       {items.slice(0, LIST_LIMIT).map((node, idx) => (
         <div key={idx}>{node}</div>
       ))}
@@ -35,272 +46,346 @@ function FoldedList({ items, foldLabel }: { items: React.ReactNode[]; foldLabel:
           : `${foldLabel}（还有 ${items.length - LIST_LIMIT} 条，点击展开）▾`}
       </button>
       {open ? (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '10px 0' }}>
+        <Stack gap="tight">
           {items.slice(LIST_LIMIT).map((node, idx) => (
             <div key={idx}>{node}</div>
           ))}
-        </div>
+        </Stack>
       ) : null}
-    </>
+    </Stack>
   );
 }
 
-interface StoryDto {
-  readonly reqId: string;
-  readonly story: string;
-  readonly acceptanceCriteria: string[];
-}
-interface TrackingEventDto {
-  readonly eventName: string;
-  readonly triggerCondition: string;
-  readonly properties: string[];
-}
-interface ComponentMappingDto {
-  readonly reqId: string;
-  readonly designSystemComponent: string;
-  readonly interactionStates: string[];
-}
-interface ApiContractDto {
-  readonly method: string;
-  readonly endpoint: string;
-  readonly requestSchema: string;
-  readonly responseSchema: string;
-}
-interface ModifiedFileDto {
-  readonly filePath: string;
-  readonly className: string;
-  readonly designPattern: string;
-  readonly linesChanged: number;
-}
-interface TestSuiteDto {
-  readonly suiteName: string;
-  readonly totalCases: number;
-  readonly passedCases: number;
-  readonly coveragePercent: number;
-}
-
-/** 阶段交付物详情（完整内容进抽屉时渲染） */
 export function ArtifactDetails({ snap }: { snap: SnapshotRecordDto }) {
-  const details = snap.artifactDetails ?? {};
-  const type = snap.artifactType;
+  const parsed = parseStageArtifact(snap.artifactType, snap.artifactDetails);
 
-  if (type === 'PRD_ARTIFACT_CONTRACT') {
-    const stories = (details.userStories as StoryDto[] | undefined) ?? [];
-    const events = (details.trackingPlanEvents as TrackingEventDto[] | undefined) ?? [];
-    const constraints = (details.nonFunctionalConstraints as string[] | undefined) ?? [];
-    const storyCards = stories.map((s) => (
-      <div className="artifact-subcard" key={s.reqId}>
-        <div style={{ fontWeight: 700, color: '#60a5fa' }}>
-          [{s.reqId}] {s.story}
-        </div>
-        <ul style={{ marginTop: 6, paddingLeft: 18, color: 'var(--text-secondary)', fontSize: 12 }}>
-          {(s.acceptanceCriteria ?? []).map((ac, i) => (
+  const missingBanner =
+    parsed.missingFields.length > 0 ? (
+      <Callout tone="warn" title="部分结构化字段缺失（已启用前端容错展示）">
+        缺失字段：{parsed.missingFields.join(', ')}
+      </Callout>
+    ) : null;
+
+  const rationaleBlock =
+    parsed.agentRationale || parsed.keyDecisions.length > 0 ? (
+      <Stack gap="tight">
+        {parsed.agentRationale ? (
+          <Callout tone="info" title="Agent 自述与推理依据 (G1)">
+            {parsed.agentRationale}
+          </Callout>
+        ) : null}
+        {parsed.keyDecisions.length > 0 ? (
+          <>
+            <SectionLabel>关键权衡决策 ({parsed.keyDecisions.length})</SectionLabel>
+            {parsed.keyDecisions.map((kd, idx) => (
+              <Card key={idx} inset title={kd.decision} subtitle={kd.rationale}>
+                {kd.tradeoffs.length > 0 ? (
+                  <Inline wrap>
+                    {kd.tradeoffs.map((t, i) => (
+                      <StatusChip key={i} tone="neutral">
+                        {t}
+                      </StatusChip>
+                    ))}
+                  </Inline>
+                ) : null}
+              </Card>
+            ))}
+          </>
+        ) : null}
+      </Stack>
+    ) : null;
+
+  if (parsed.kind === 'PRD') {
+    const storyCards = parsed.userStories.map((s) => (
+      <Card key={s.reqId} inset title={`[${s.reqId}] ${s.story}`}>
+        <ul className="m-bullet-list">
+          {s.acceptanceCriteria.map((ac, i) => (
             <li key={i}>{ac}</li>
           ))}
         </ul>
-      </div>
+      </Card>
     ));
-    const eventCards = events.map((ev) => (
-      <div className="artifact-subcard" key={ev.eventName}>
-        <div>
-          <code style={{ color: '#34d399' }}>{ev.eventName}</code> — {ev.triggerCondition}
-        </div>
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
-          属性字段: {(ev.properties ?? []).join(', ')}
-        </div>
-      </div>
+    const eventCards = parsed.trackingPlanEvents.map((ev) => (
+      <Card
+        key={ev.eventName}
+        inset
+        title={<code>{ev.eventName}</code>}
+        subtitle={ev.triggerCondition}
+      >
+        <Text variant="xs" tone="tertiary">
+          属性字段：{ev.properties.join(', ')}
+        </Text>
+      </Card>
     ));
+
     return (
-      <div className="inspector-grid">
-        <div>
-          <h4 className="inspector-subtitle">
-            📋 结构化 User Stories &amp; 验收标准 ({stories.length})
-          </h4>
-          <div className="col-stack" style={{ gap: 8 }}>
-            <FoldedList items={storyCards} foldLabel="展开其余 User Stories" />
-          </div>
+      <Stack gap="normal">
+        {missingBanner}
+        {rationaleBlock}
+        <div className="inspector-grid">
+          <Stack gap="tight">
+            <SectionLabel>User Stories &amp; 验收标准 ({parsed.userStories.length})</SectionLabel>
+            {storyCards.length > 0 ? (
+              <FoldedList items={storyCards} foldLabel="展开其余 User Stories" />
+            ) : (
+              <EmptyState compact title="暂无 User Stories 数据" />
+            )}
+          </Stack>
+          <Stack gap="tight">
+            <SectionLabel>
+              前置数据埋点规划 Tracking Plan ({parsed.trackingPlanEvents.length})
+            </SectionLabel>
+            {eventCards.length > 0 ? (
+              <FoldedList items={eventCards} foldLabel="展开其余埋点事件" />
+            ) : (
+              <EmptyState compact title="暂无埋点规划" />
+            )}
+            <SectionLabel>非功能与历史避坑约束</SectionLabel>
+            <Stack gap="tight">
+              {parsed.nonFunctionalConstraints.map((c, i) => (
+                <Text key={i} variant="xs" tone="secondary">
+                  • {c}
+                </Text>
+              ))}
+            </Stack>
+          </Stack>
         </div>
-        <div>
-          <h4 className="inspector-subtitle">
-            📊 前置数据埋点规划 Tracking Plan ({events.length})
-          </h4>
-          <div className="col-stack" style={{ gap: 8 }}>
-            <FoldedList items={eventCards} foldLabel="展开其余埋点事件" />
-          </div>
-          <h4 className="inspector-subtitle" style={{ marginTop: 14 }}>
-            🛡️ 非功能性与历史避坑约束
-          </h4>
-          <ul style={{ paddingLeft: 18, fontSize: 12, color: 'var(--text-secondary)' }}>
-            {constraints.map((c, i) => (
-              <li key={i}>{c}</li>
-            ))}
-          </ul>
-        </div>
-      </div>
+      </Stack>
     );
   }
 
-  if (type === 'UI_DESIGN_ARTIFACT_CONTRACT') {
-    const mappings = (details.componentMappings as ComponentMappingDto[] | undefined) ?? [];
-    const a11y = (details.accessibilityChecklist as string[] | undefined) ?? [];
+  if (parsed.kind === 'UI_DESIGN') {
     return (
-      <div className="inspector-grid">
-        <div>
-          <h4 className="inspector-subtitle">
-            🎨 企业 Design System 组件映射清单 ({mappings.length})
-          </h4>
-          <div className="col-stack" style={{ gap: 8 }}>
+      <Stack gap="normal">
+        {missingBanner}
+        {rationaleBlock}
+        <div className="inspector-grid">
+          <Stack gap="tight">
+            <SectionLabel>
+              企业 Design System 组件映射 ({parsed.componentMappings.length})
+            </SectionLabel>
             <FoldedList
               foldLabel="展开其余组件映射"
-              items={mappings.map((m) => (
-                <div className="artifact-subcard" key={m.reqId}>
-                  <div>
-                    <strong>[{m.reqId}]</strong> → 组件{' '}
-                    <code style={{ color: '#c084fc' }}>{m.designSystemComponent}</code>
-                  </div>
-                  <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 4 }}>
-                    交互状态机: {(m.interactionStates ?? []).join(' · ')}
-                  </div>
-                </div>
+              items={parsed.componentMappings.map((m) => (
+                <Card
+                  key={m.reqId}
+                  inset
+                  title={`[${m.reqId}] → ${m.designSystemComponent}`}
+                  subtitle={`交互状态机: ${m.interactionStates.join(' · ')}`}
+                >
+                  <Inline wrap>
+                    {m.interactionStates.map((st) => (
+                      <StatusChip key={st} tone="brand">
+                        {st}
+                      </StatusChip>
+                    ))}
+                  </Inline>
+                </Card>
               ))}
             />
-          </div>
-        </div>
-        <div>
-          <h4 className="inspector-subtitle">♿ 无障碍与交互体验规范</h4>
-          <ul style={{ paddingLeft: 18, fontSize: 12, color: 'var(--text-secondary)' }}>
-            {a11y.map((item, i) => (
-              <li key={i}>{item}</li>
+          </Stack>
+          <Stack gap="tight">
+            <SectionLabel>无障碍与交互规范</SectionLabel>
+            {parsed.accessibilityChecklist.map((item, i) => (
+              <Card key={i} inset>
+                <Text variant="sm">{item}</Text>
+              </Card>
             ))}
-          </ul>
+          </Stack>
         </div>
-      </div>
+      </Stack>
     );
   }
 
-  if (type === 'TECH_SPEC_ARTIFACT_CONTRACT') {
-    const apis = (details.apiContracts as ApiContractDto[] | undefined) ?? [];
-    const ddls = (details.databaseDdlStatements as string[] | undefined) ?? [];
-    const patterns = (details.architecturePatternsUsed as string[] | undefined) ?? [];
+  if (parsed.kind === 'TECH_SPEC') {
     return (
-      <div className="inspector-grid">
-        <div>
-          <h4 className="inspector-subtitle">🔌 OpenAPI 接口契约规范 ({apis.length})</h4>
-          <div className="col-stack" style={{ gap: 8 }}>
+      <Stack gap="normal">
+        {missingBanner}
+        {rationaleBlock}
+        <div className="inspector-grid">
+          <Stack gap="tight">
+            <SectionLabel>OpenAPI 接口契约 ({parsed.apiContracts.length})</SectionLabel>
             <FoldedList
               foldLabel="展开其余接口契约"
-              items={apis.map((api) => (
-                <div className="artifact-subcard" key={`${api.method}-${api.endpoint}`}>
-                  <div>
-                    <span className="pill pill-blue">{api.method}</span> <code>{api.endpoint}</code>
-                  </div>
-                  <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 4 }}>
-                    Req: <code>{api.requestSchema}</code> → Res: <code>{api.responseSchema}</code>
-                  </div>
-                </div>
+              items={parsed.apiContracts.map((api) => (
+                <Card
+                  key={`${api.method}-${api.endpoint}`}
+                  inset
+                  title={
+                    <Inline>
+                      <StatusChip tone="brand">{api.method}</StatusChip>
+                      <code>{api.endpoint}</code>
+                    </Inline>
+                  }
+                  subtitle={`Req: ${api.requestSchema} → Res: ${api.responseSchema}`}
+                >
+                  <KeyValueList
+                    items={[
+                      { key: '请求 Schema', value: <code>{api.requestSchema}</code> },
+                      { key: '响应 Schema', value: <code>{api.responseSchema}</code> },
+                    ]}
+                  />
+                </Card>
               ))}
             />
-          </div>
-          <h4 className="inspector-subtitle" style={{ marginTop: 12 }}>
-            🏛️ 采用的架构设计模式
-          </h4>
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-            {patterns.map((p) => (
-              <span className="pill pill-purple" key={p}>
-                {p}
-              </span>
-            ))}
-          </div>
+            <SectionLabel>采用的架构设计模式</SectionLabel>
+            <Inline wrap>
+              {parsed.architecturePatternsUsed.map((p) => (
+                <StatusChip key={p} tone="violet">
+                  {p}
+                </StatusChip>
+              ))}
+            </Inline>
+          </Stack>
+          <Stack gap="tight">
+            <SectionLabel>
+              数据库 DDL 变更脚本 ({parsed.databaseDdlStatements.length} 条)
+            </SectionLabel>
+            <pre className="code-preview-block">
+              {parsed.databaseDdlStatements.length > 0
+                ? parsed.databaseDdlStatements.join('\n\n')
+                : '-- 无数据库表结构 DDL 变更 (低风险)'}
+            </pre>
+          </Stack>
         </div>
-        <div>
-          <h4 className="inspector-subtitle">🗄️ 数据库 DDL 变更脚本 ({ddls.length} 条)</h4>
-          <pre className="code-preview-block">
-            {ddls.length > 0 ? ddls.join('\n\n') : '-- 无数据库表结构 DDL 变更 (低风险)'}
-          </pre>
-        </div>
-      </div>
+      </Stack>
     );
   }
 
-  if (type === 'CODE_IMPLEMENTATION_ARTIFACT_CONTRACT') {
-    const files = (details.modifiedFiles as ModifiedFileDto[] | undefined) ?? [];
-    const branch = String(details.gitWorktreeBranch ?? '');
+  if (parsed.kind === 'CODE_IMPL') {
     return (
-      <div>
-        <div style={{ marginBottom: 10 }}>
-          <span className="pill pill-cyan">Git Worktree 隔离分支: {branch}</span>
-        </div>
-        <div className="col-stack" style={{ gap: 8 }}>
-          {files.map((f) => (
-            <div
-              className="artifact-subcard"
-              key={f.filePath}
-              style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-            >
-              <div>
-                <div>
-                  <code>{f.filePath}</code>
-                </div>
-                <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
-                  类名: <strong>{f.className}</strong> · 设计模式: {f.designPattern}
-                </div>
-              </div>
-              <span className="pill pill-green">+{f.linesChanged} lines</span>
-            </div>
-          ))}
-        </div>
-      </div>
+      <Stack gap="normal">
+        {missingBanner}
+        {rationaleBlock}
+        <Inline>
+          <StatusChip tone="cyan" dot>
+            Worktree 分支：{parsed.gitWorktreeBranch || '未提供'}
+          </StatusChip>
+          {parsed.selfTestPassed !== null ? (
+            <StatusChip tone={parsed.selfTestPassed ? 'success' : 'danger'} dot>
+              {parsed.selfTestPassed ? '沙箱自测通过' : '沙箱自测存在失败'}
+            </StatusChip>
+          ) : null}
+        </Inline>
+        <DataTable
+          columns={[
+            {
+              key: 'filePath',
+              header: '修改文件',
+              render: (row) => <code>{row.filePath}</code>,
+            },
+            {
+              key: 'className',
+              header: '类 / 模块',
+              render: (row) => row.className,
+            },
+            {
+              key: 'designPattern',
+              header: '设计模式',
+              render: (row) => <StatusChip tone="violet">{row.designPattern}</StatusChip>,
+            },
+            {
+              key: 'linesChanged',
+              header: '变更行数',
+              numeric: true,
+              render: (row) => `+${row.linesChanged}`,
+            },
+          ]}
+          rows={parsed.modifiedFiles}
+          rowKey={(row, idx) => `${row.filePath}-${idx}`}
+          empty={<EmptyState compact title="暂无文件变更列表" />}
+        />
+      </Stack>
     );
   }
 
-  if (type === 'QA_VERIFICATION_ARTIFACT_CONTRACT') {
-    const suites = (details.testSuitesExecuted as TestSuiteDto[] | undefined) ?? [];
-    const secIssues = Number(details.securityIssuesFound ?? 0);
+  if (parsed.kind === 'QA') {
+    const secIssues = parsed.securityIssuesFound ?? 0;
     return (
-      <div>
-        <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
-          <span className={`pill ${secIssues === 0 ? 'pill-green' : 'pill-red'}`}>
-            高危安全漏洞: {secIssues} 个
-          </span>
-          <span className="pill pill-blue">
-            全部验收标准达成: {details.allAcceptanceCriteriaMet ? 'YES' : 'NO'}
-          </span>
-        </div>
-        <div className="col-stack" style={{ gap: 8 }}>
-          {suites.map((s) => (
-            <div
-              className="artifact-subcard"
-              key={s.suiteName}
-              style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-            >
-              <div>
-                <strong>{s.suiteName}</strong>
-                <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
-                  通过用例: {s.passedCases}/{s.totalCases}
-                </div>
-              </div>
-              <span className="pill pill-green">覆盖率 {s.coveragePercent}%</span>
-            </div>
-          ))}
-        </div>
-      </div>
+      <Stack gap="normal">
+        {missingBanner}
+        {rationaleBlock}
+        <Inline wrap>
+          <StatusChip tone={secIssues === 0 ? 'success' : 'danger'} dot>
+            高危安全漏洞：{secIssues} 个
+          </StatusChip>
+          <StatusChip tone={parsed.allAcceptanceCriteriaMet ? 'success' : 'warn'} dot>
+            全部验收标准达成：{parsed.allAcceptanceCriteriaMet ? 'YES' : 'NO'}
+          </StatusChip>
+        </Inline>
+        <DataTable
+          columns={[
+            { key: 'suiteName', header: '测试套件', render: (s) => <strong>{s.suiteName}</strong> },
+            {
+              key: 'passed',
+              header: '通过 / 总计',
+              numeric: true,
+              render: (s) => `${s.passedCases}/${s.totalCases}`,
+            },
+            {
+              key: 'coverage',
+              header: '行覆盖率',
+              numeric: true,
+              render: (s) => (
+                <StatusChip tone={s.coveragePercent >= 80 ? 'success' : 'warn'}>
+                  {s.coveragePercent}%
+                </StatusChip>
+              ),
+            },
+          ]}
+          rows={parsed.testSuitesExecuted}
+          rowKey={(s, i) => `${s.suiteName}-${i}`}
+          empty={<EmptyState compact title="暂无测试套件执行数据" />}
+        />
+      </Stack>
     );
   }
 
-  const badge = stateBadge(snap.state, snap.cacheHit);
+  if (parsed.kind === 'DATA_ANALYSIS') {
+    return (
+      <Stack gap="normal">
+        {missingBanner}
+        {rationaleBlock}
+        <SectionLabel>已核验前置埋点事件 ({parsed.verifiedTrackingEvents.length})</SectionLabel>
+        <Inline wrap>
+          {parsed.verifiedTrackingEvents.map((evt) => (
+            <StatusChip key={evt} tone="success" dot>
+              <code>{evt}</code>
+            </StatusChip>
+          ))}
+        </Inline>
+        <SectionLabel>上线指标与效果基线投影</SectionLabel>
+        <DataTable
+          columns={[
+            {
+              key: 'metricName',
+              header: '核心指标',
+              render: (m) => <strong>{m.metricName}</strong>,
+            },
+            { key: 'baselineValue', header: '当前基线', render: (m) => m.baselineValue },
+            {
+              key: 'targetValue',
+              header: '目标基准',
+              render: (m) => <StatusChip tone="success">{m.targetValue}</StatusChip>,
+            },
+          ]}
+          rows={parsed.projectedMetrics}
+          rowKey={(m, i) => `${m.metricName}-${i}`}
+          empty={<EmptyState compact title="暂无指标投影" />}
+        />
+      </Stack>
+    );
+  }
+
   return (
-    <div>
-      <div style={{ marginBottom: 10 }}>
-        <span className={badge.pillClass}>{badge.label}</span>
-        <span className="pill pill-muted" style={{ marginLeft: 8 }}>
-          {snap.artifactType}
-        </span>
-      </div>
-      <div className="node-panel-summary">{snap.artifactSummary}</div>
-      <details className="raw-fold">
-        <summary>查看本交付物的原始结构化数据 (JSON)</summary>
-        <pre className="code-preview-block">{JSON.stringify(details, null, 2)}</pre>
+    <Stack gap="normal">
+      <Callout tone="neutral" title={`通用契约产物 (${snap.artifactType})`}>
+        {snap.artifactSummary}
+      </Callout>
+      <details className="raw-fold" open>
+        <summary>原始结构化交付物 JSON</summary>
+        <pre className="code-preview-block">{JSON.stringify(parsed.rawDetails, null, 2)}</pre>
       </details>
-    </div>
+    </Stack>
   );
 }

@@ -100,6 +100,7 @@ export async function overrideGate(
     actorUserId?: string;
     verdict: DecisionVerdict;
     reason: string;
+    impersonatedByLabel?: string;
   },
 ): Promise<WorkflowRunState> {
   return facade.submitHumanGateDecision({
@@ -109,6 +110,7 @@ export async function overrideGate(
     actorUserId: params.actorUserId,
     verdict: params.verdict,
     comment: params.reason,
+    impersonatedByLabel: params.impersonatedByLabel,
   });
 }
 
@@ -120,6 +122,7 @@ export async function rollbackAndFork(
     directive: string;
     actorUserId?: string;
     targetStageId?: string;
+    impersonatedByLabel?: string;
   },
 ): Promise<WorkflowRunState> {
   return facade.invokeSupervisorConversationalRollback({
@@ -128,6 +131,7 @@ export async function rollbackAndFork(
     actorUserId: params.actorUserId,
     dialogueInstruction: params.directive,
     explicitTargetStageId: params.targetStageId as never,
+    impersonatedByLabel: params.impersonatedByLabel,
   });
 }
 

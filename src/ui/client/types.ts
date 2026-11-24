@@ -62,6 +62,18 @@ export interface TeamCommentDto {
   readonly createdAtIso: string;
 }
 
+export interface ArtifactKeyDecisionDto {
+  readonly decision: string;
+  readonly rationale: string;
+  readonly tradeoffs: ReadonlyArray<string>;
+}
+
+export interface StructuredArtifactSummaryDto {
+  readonly headline: string;
+  readonly rationale: string;
+  readonly caveats: ReadonlyArray<string>;
+}
+
 export interface SnapshotRecordDto {
   readonly snapshotId: string;
   readonly runId: string;
@@ -83,6 +95,7 @@ export interface SnapshotRecordDto {
   readonly retryCount: number;
   readonly tokensConsumed: number;
   readonly artifactSummary: string;
+  readonly structuredSummary?: StructuredArtifactSummaryDto;
   readonly artifactType: string;
   readonly artifactDetails: Record<string, unknown>;
   readonly createdAtIso: string;
@@ -115,6 +128,7 @@ export interface NegotiationTurnDto {
   readonly negotiationId: string;
   readonly runId: string;
   readonly branchId: string;
+  readonly topic?: string;
   readonly turnIndex: number;
   readonly maxTurnsAllowed: number;
   readonly challengerRole: string;
@@ -260,6 +274,7 @@ export interface DashboardStateDto {
   readonly negativeExperienceRecords?: ReadonlyArray<NegativeExperienceRecordDto>;
   readonly auditTimeline?: ReadonlyArray<AuditEntryDto>;
   readonly liveInteractionStream?: ReadonlyArray<WorkflowDomainEventDto>;
+  readonly liveInteractionStreamTotal?: number;
   readonly retrospectiveReport?: RetrospectiveReportDto;
   readonly workflowDslSummary?: {
     readonly workflowId: string;
@@ -304,4 +319,57 @@ export interface FlowNegotiationHint {
   readonly turnIndex: number;
   readonly maxTurnsAllowed: number;
   readonly escalated: boolean;
+}
+
+/** F1/F2：服务端会话用户视图（/api/auth/* 与 /api/admin/users） */
+export interface AuthUserDto {
+  readonly userId: string;
+  readonly username: string;
+  readonly displayName: string;
+  readonly jobTitle: string;
+  readonly department: string;
+  readonly tier: 'PROJECT_ADMIN' | 'STAGE_SPECIALIST' | string;
+  readonly specialistDomain: string;
+  readonly counterpartAgentRole: string;
+  readonly avatarBadge: string;
+  readonly ownedStageIds: ReadonlyArray<string>;
+  readonly permissions: ReadonlyArray<string>;
+  readonly mustChangePassword: boolean;
+  readonly status: 'ACTIVE' | 'DISABLED' | string;
+}
+
+export interface AuthMeDto {
+  readonly user: AuthUserDto;
+  readonly impersonating: AuthUserDto | null;
+}
+
+export interface LoginAuditEntryDto {
+  readonly id: number;
+  readonly username: string;
+  readonly success: boolean;
+  readonly reason: string;
+  readonly createdAtIso: string;
+}
+
+export interface WorkflowTemplateItemDto {
+  readonly fileName: string;
+}
+
+export interface SandboxVerificationSummaryDto {
+  readonly filesVerifiedCount: number;
+  readonly totalTestCases: number;
+  readonly passedTestCases: number;
+  readonly failedTestCases: number;
+  readonly securityIssuesFound: number;
+  readonly coveragePercent: number | null;
+  readonly runtime?: string;
+  readonly executionLog: string;
+}
+
+export interface EventHistoryPageDto {
+  readonly runId: string;
+  readonly total: number;
+  readonly offset: number;
+  readonly limit: number;
+  readonly events: ReadonlyArray<WorkflowDomainEventDto>;
 }

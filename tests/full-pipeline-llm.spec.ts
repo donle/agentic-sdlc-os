@@ -5,12 +5,16 @@
  */
 
 import * as assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, it, afterEach } from 'node:test';
 
 import { ProjectProposalContract } from '../src/domain/contracts.ts';
 import { WorkflowStageId } from '../src/domain/enums.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
 import type { OpenAiCompatibleChatResponse } from '../src/patterns/ModelRouterGateway.ts';
+import { createTestWorkspace, type TestIsolatedWorkspace } from './helpers/testIsolation.ts';
 
 // 每个阶段返回的 LLM JSON（与 ArtifactContractFactory 期望的字段一一对应）
 const STAGE_JSON: Record<string, string> = {
@@ -109,16 +113,26 @@ function makeResponse(content: string): OpenAiCompatibleChatResponse {
 
 describe('高优 — 全阶段 LLM 管道测试', () => {
   let orchestrator: WorkflowOrchestratorFacade;
+  let workspace: TestIsolatedWorkspace | null = null;
 
   afterEach(() => {
     if (orchestrator) {
       orchestrator.modelRouter.setHttpTransport(null);
     }
+    if (workspace) {
+      workspace.cleanup();
+      workspace = null;
+    }
     delete process.env.LITELLM_ENABLE_LIVE_HTTP;
   });
 
   it('1. 6 阶段全部由 LLM JSON 驱动 → 正常推进到 QA 终审门禁', async () => {
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('full-pipe-1-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
     process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
 
     orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
@@ -172,7 +186,12 @@ describe('高优 — 全阶段 LLM 管道测试', () => {
   });
 
   it('2. 3a 核验通过 → 3b → QA → 全阶段 LLM 完成到 DA', async () => {
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('full-pipe-2-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
     process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
 
     orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
@@ -239,7 +258,12 @@ describe('高优 — 全阶段 LLM 管道测试', () => {
   });
 
   it('3. LLM 输出缺字段 → 自愈重试 → 后续阶段继续用 LLM（全管道不中断）', async () => {
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('full-pipe-3-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
     let pmCallCount = 0;
     process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
 
@@ -288,7 +312,12 @@ describe('高优 — 全阶段 LLM 管道测试', () => {
   });
 
   it('4. 在线 LLM 模式下 Stage 3b/4 必须执行真实沙箱落盘与单测，且拦截 QA 谎报（A1↔E1/E2 闭环）', async () => {
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('full-pipe-4-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
     process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
 
     let capturedEngineerUserPrompt = '';
@@ -379,7 +408,12 @@ describe('高优 — 全阶段 LLM 管道测试', () => {
   });
 
   it('5. C3 总管自然语言回退在 Facade 中已接线 modelRouter（同义词 LLM 解析 + 流水线阶段白名单）', async () => {
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('full-pipe-5-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
     process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
 
     let supervisorLlmCalled = false;
@@ -429,7 +463,12 @@ describe('高优 — 全阶段 LLM 管道测试', () => {
   });
 
   it('6. B1 受限协商在线 LLM 多轮演进：首轮分歧、次轮达成共识，且 Token 计入运行实例', async () => {
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('full-pipe-6-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
     process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
 
     let negTurnCalls = 0;
@@ -483,6 +522,117 @@ describe('高优 — 全阶段 LLM 管道测试', () => {
     assert.equal(history[0].consensusReached, false);
     assert.equal(history[1].consensusReached, true);
     assert.equal(history[1].escalatedToSupervisor, false);
+  });
+
+  it('7. P1-3：Stage 3b LLM filePatches 真实落盘 Worktree 并触发重跑验证与 A2 自愈修复', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p13-filepatches-'));
+    try {
+      orchestrator = new WorkflowOrchestratorFacade({
+        maxNegotiationTurns: 3,
+        persistenceDir: path.join(tmpDir, 'persist'),
+        sandboxRootDir: path.join(tmpDir, 'sandbox'),
+      });
+      process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
+
+      let engineerCalls = 0;
+      orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
+        const systemPrompt = payload.messages?.[0]?.content ?? '';
+        if (systemPrompt.includes('Engineer Agent')) {
+          engineerCalls += 1;
+          const base3b = JSON.parse(STAGE_JSON.STAGE_3B_ENGINEER) as Record<string, unknown>;
+          if (engineerCalls === 1) {
+            return makeResponse(
+              JSON.stringify({
+                ...base3b,
+                summary: '首次补丁写入带缺陷的测试用例',
+                selfTestPassed: true,
+                filePatches: [
+                  {
+                    filePath: 'src/modules/r1/CustomRule.ts',
+                    content:
+                      'export function computeFee(amount: number): number {\n  return amount - 10;\n}\n',
+                  },
+                  {
+                    filePath: 'tests/custom_rule.spec.ts',
+                    content: [
+                      "import * as assert from 'node:assert/strict';",
+                      "import test from 'node:test';",
+                      "import { computeFee } from '../src/modules/r1/CustomRule.ts';",
+                      '',
+                      "test('computeFee 计算 10% 服务费', () => {",
+                      '  assert.equal(computeFee(100), 10);',
+                      '});',
+                      '',
+                    ].join('\n'),
+                  },
+                ],
+              }),
+            );
+          }
+          return makeResponse(
+            JSON.stringify({
+              ...base3b,
+              summary: '自愈重试补丁修复 computeFee 实现并通过重跑',
+              selfTestPassed: true,
+              filePatches: [
+                {
+                  filePath: 'src/modules/r1/CustomRule.ts',
+                  content:
+                    'export function computeFee(amount: number): number {\n  return amount * 0.1;\n}\n',
+                },
+              ],
+            }),
+          );
+        }
+        for (const [stageId, json] of Object.entries(STAGE_JSON)) {
+          if (systemPrompt.includes(stageId) || systemPrompt.includes(stageMetaRole(stageId))) {
+            return makeResponse(json);
+          }
+        }
+        return makeResponse(STAGE_JSON.STAGE_1_PM);
+      });
+
+      const proposal = new ProjectProposalContract({
+        proposalId: 'TEST-P13-PATCH-007',
+        title: 'Stage 3b 真实 filePatches 闭环验证',
+        summary: '验证 LLM filePatches 落盘后重跑 node:test 拦截失败补丁并在重试修复后全通过',
+        requirements: { R1: '计算费用规则', R2: '费率审计' },
+      });
+
+      const runState = await orchestrator.startProposalWorkflow({
+        proposal,
+        initiatorActor: 'P1-3 沙箱测试',
+      });
+      await orchestrator.submitHumanGateDecision({
+        runId: runState.runId,
+        snapshotId: runState.getLatestSnapshotOnActiveBranch()!.snapshotId,
+        reviewerActor: '架构师-张工',
+        verdict: 'APPROVE' as never,
+        comment: 'DDL 签核通过，进入 3b',
+      });
+
+      assert.equal(engineerCalls, 2, '首轮补丁单测失败应触发 A2 自愈重试，次轮补丁修复后通过');
+      const wsPath = orchestrator.sandboxManager.resolveWorkspacePath(
+        runState.runId,
+        runState.getActiveBranchId(),
+      );
+      const customRuleDisk = fs.readFileSync(
+        path.join(wsPath, 'src/modules/r1/CustomRule.ts'),
+        'utf-8',
+      );
+      assert.ok(customRuleDisk.includes('return amount * 0.1;'), '修复后源码应真实落盘 Worktree');
+
+      const verifyRes = orchestrator.sandboxManager.executeSandboxVerification({
+        runId: runState.runId,
+        branchId: runState.getActiveBranchId(),
+        requirementIds: ['R1', 'R2'],
+        runSubprocessNodeTest: true,
+      });
+      assert.equal(verifyRes.failedTestCases, 0);
+      assert.ok(verifyRes.totalTestCases >= 5, '应运行脚手架 + LLM 新增的 custom_rule.spec.ts');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 

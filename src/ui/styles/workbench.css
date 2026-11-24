@@ -5,61 +5,65 @@
  */
 
 :root {
-  --bg-canvas: #f8fafc;
-  --bg-sidebar: #ffffff;
-  --bg-topbar: rgba(255, 255, 255, 0.88);
-  --bg-panel: #ffffff;
-  --bg-card: #ffffff;
-  --bg-subtle: #f1f5f9;
-  --bg-card-hover: #f8fafc;
-  --bg-code: #0f172a;
-  --border-subtle: #e2e8f0;
-  --border-strong: #cbd5e1;
-  --text-primary: #0f172a;
-  --text-secondary: #475569;
-  --text-muted: #64748b;
-  --accent-primary: #4f46e5;
-  --accent-primary-hover: #4338ca;
-  --accent-blue: #2563eb;
-  --accent-indigo: #4f46e5;
-  --status-green: #059669;
-  --status-amber: #d97706;
-  --status-red: #dc2626;
-  --status-purple: #7c3aed;
-  --status-cyan: #0891b2;
-  --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.04);
-  --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
-  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.07);
-  --shadow-focus: 0 0 0 3px rgba(79, 70, 229, 0.14);
+  --bg-canvas: var(--m-canvas, #f4f5f7);
+  --bg-sidebar: var(--m-surface, #ffffff);
+  --bg-topbar: rgba(255, 255, 255, 0.9);
+  --bg-panel: var(--m-surface, #ffffff);
+  --bg-card: var(--m-surface, #ffffff);
+  --bg-subtle: var(--m-surface-2, #f8f9fb);
+  --bg-card-hover: var(--m-surface-3, #eef0f4);
+  --bg-code: var(--m-code-bg, #0f172a);
+  --border-subtle: var(--m-line, #e3e6eb);
+  --border-strong: var(--m-line-2, #cbd1da);
+  --text-primary: var(--m-ink, #10131a);
+  --text-secondary: var(--m-ink-2, #4a5262);
+  --text-muted: var(--m-ink-3, #737c8c);
+  --accent-primary: var(--m-brand, #2f54eb);
+  --accent-primary-hover: var(--m-brand-strong, #2440c4);
+  --accent-blue: var(--m-brand, #2f54eb);
+  --accent-indigo: var(--m-brand, #2f54eb);
+  --status-green: var(--m-jade, #0e9f6e);
+  --status-amber: var(--m-amber, #c77700);
+  --status-red: var(--m-coral, #dc2b2b);
+  --status-purple: var(--m-violet, #7b3fe4);
+  --status-cyan: var(--m-cyan, #0e7490);
+  --shadow-xs: var(--m-shadow-xs, 0 1px 2px rgba(16, 19, 26, 0.05));
+  --shadow-sm: var(
+    --m-shadow-sm,
+    0 1px 3px rgba(16, 19, 26, 0.06),
+    0 1px 2px rgba(16, 19, 26, 0.04)
+  );
+  --shadow-md: var(--m-shadow-md, 0 4px 14px rgba(16, 19, 26, 0.08));
+  --shadow-focus: var(--m-shadow-focus, 0 0 0 3px rgba(47, 84, 235, 0.14));
 }
 
 [data-theme='dark'] {
-  --bg-canvas: #09090b;
-  --bg-sidebar: #0c0c0f;
-  --bg-topbar: rgba(12, 12, 15, 0.88);
-  --bg-panel: #121216;
-  --bg-card: #18181d;
-  --bg-subtle: #1f1f26;
-  --bg-card-hover: #22222a;
-  --bg-code: #09090b;
-  --border-subtle: #27272a;
-  --border-strong: #3f3f46;
-  --text-primary: #fafafa;
-  --text-secondary: #a1a1aa;
-  --text-muted: #71717a;
-  --accent-primary: #6366f1;
-  --accent-primary-hover: #818cf8;
-  --accent-blue: #3b82f6;
-  --accent-indigo: #6366f1;
-  --status-green: #10b981;
-  --status-amber: #f59e0b;
-  --status-red: #ef4444;
-  --status-purple: #a855f7;
-  --status-cyan: #06b6d4;
-  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.35);
-  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
-  --shadow-focus: 0 0 0 3px rgba(99, 102, 241, 0.25);
+  --bg-canvas: var(--m-canvas, #0b0d12);
+  --bg-sidebar: var(--m-surface, #12151c);
+  --bg-topbar: rgba(18, 21, 28, 0.9);
+  --bg-panel: var(--m-surface, #12151c);
+  --bg-card: var(--m-surface-2, #171b24);
+  --bg-subtle: var(--m-surface-3, #1e2430);
+  --bg-card-hover: #222938;
+  --bg-code: var(--m-code-bg, #090b10);
+  --border-subtle: var(--m-line, #232a36);
+  --border-strong: var(--m-line-2, #333c4c);
+  --text-primary: var(--m-ink, #eef1f6);
+  --text-secondary: var(--m-ink-2, #a3adbd);
+  --text-muted: var(--m-ink-3, #7a8496);
+  --accent-primary: var(--m-brand, #5c7cfa);
+  --accent-primary-hover: var(--m-brand-strong, #7c95fb);
+  --accent-blue: var(--m-brand, #5c7cfa);
+  --accent-indigo: var(--m-brand, #5c7cfa);
+  --status-green: var(--m-jade, #22c58b);
+  --status-amber: var(--m-amber, #f0a92b);
+  --status-red: var(--m-coral, #ff5c5c);
+  --status-purple: var(--m-violet, #a77bf5);
+  --status-cyan: var(--m-cyan, #22b8cf);
+  --shadow-xs: var(--m-shadow-xs, 0 1px 2px rgba(0, 0, 0, 0.3));
+  --shadow-sm: var(--m-shadow-sm, 0 2px 6px rgba(0, 0, 0, 0.35));
+  --shadow-md: var(--m-shadow-md, 0 8px 24px rgba(0, 0, 0, 0.45));
+  --shadow-focus: var(--m-shadow-focus, 0 0 0 3px rgba(92, 124, 250, 0.25));
 }
 
 * {
@@ -96,12 +100,6 @@ pre {
   display: grid;
   grid-template-columns: 248px 1fr;
   min-height: 100vh;
-}
-
-@media (max-width: 1024px) {
-  .app-shell {
-    grid-template-columns: 1fr;
-  }
 }
 
 /* Left Sidebar */
@@ -213,6 +211,14 @@ pre {
   height: 16px;
   opacity: 0.75;
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nav-icon svg {
+  width: 100%;
+  height: 100%;
 }
 
 .nav-item:hover {
@@ -250,6 +256,23 @@ pre {
   z-index: 40;
   gap: 14px;
   flex-wrap: wrap;
+}
+
+@media (max-width: 1024px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .app-sidebar {
+    position: static;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .app-topbar {
+    position: static;
+  }
 }
 
 .topbar-group {
@@ -2188,5 +2211,1334 @@ body.drawer-open-lock {
   .drawer-panel,
   .drawer-backdrop {
     transition: none !important;
+  }
+}
+
+/* ========================================================================== */
+/* F1/F2 认证登录页、替身提示条与用户管理控件                                  */
+/* ========================================================================== */
+
+.auth-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg-canvas);
+}
+
+.auth-card {
+  width: min(440px, 100%);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px;
+  padding: 28px 26px;
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.auth-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.auth-subtitle {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.auth-error-box {
+  background: rgba(220, 38, 38, 0.08);
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  color: var(--status-red);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.auth-hint-box {
+  background: var(--bg-subtle);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.impersonation-banner {
+  background: rgba(217, 119, 6, 0.12);
+  border-bottom: 1px solid rgba(217, 119, 6, 0.35);
+  padding: 8px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--text-primary);
+}
+
+.admin-subform-card {
+  margin-top: 14px;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ========================================================================== */
+/* UI v2 & Meridian 业务布局补丁 (审阅面板 / 双栏裁决中心 / 分级抽屉 / L1 节点) */
+/* ========================================================================== */
+
+.gate-center-split {
+  display: grid;
+  grid-template-columns: minmax(300px, 420px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 1120px) {
+  .gate-center-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.review-panel-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 310px;
+  gap: 18px;
+  align-items: start;
+}
+
+@media (max-width: 1024px) {
+  .review-panel-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.review-decision-rail {
+  position: sticky;
+  top: 72px;
+}
+
+@media (max-width: 1024px) {
+  .review-decision-rail {
+    position: static;
+  }
+}
+
+.ab-compare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (max-width: 720px) {
+  .ab-compare-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.gate-queue-item-active {
+  background: var(--m-brand-soft, rgba(47, 84, 235, 0.09)) !important;
+  border-left: 3px solid var(--m-brand, #2f54eb) !important;
+  padding-left: 10px !important;
+  border-radius: 6px;
+}
+
+.project-card-current {
+  border-color: var(--m-brand, #2f54eb) !important;
+}
+
+.m-bullet-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.m-between {
+  justify-content: space-between;
+  width: 100%;
+}
+
+.drawer-panel--sm {
+  width: min(420px, 100vw);
+}
+
+.drawer-panel--md {
+  width: min(640px, 100vw);
+}
+
+.drawer-panel--lg {
+  width: min(960px, 100vw);
+}
+
+.flow-node.node-l1-summary {
+  opacity: 0.72;
+}
+
+.flow-node.node-l1-summary .flow-node-box {
+  stroke-dasharray: 4 3;
+}
+
+/* ========================================================================== */
+/* 拟人化 Agent 岗位形象头像、协同剧场与对话动画系统                            */
+/* ========================================================================== */
+
+.agent-avatar {
+  --agent-accent: var(--accent-primary);
+  --agent-soft: rgba(47, 84, 235, 0.12);
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+
+.agent-avatar--xs {
+  width: 22px;
+  height: 22px;
+}
+
+.agent-avatar--sm {
+  width: 34px;
+  height: 34px;
+}
+
+.agent-avatar--md {
+  width: 44px;
+  height: 44px;
+}
+
+.agent-avatar--lg {
+  width: 62px;
+  height: 62px;
+}
+
+.agent-avatar--xl {
+  width: 88px;
+  height: 88px;
+}
+
+.agent-avatar-frame {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  overflow: hidden;
+  border: 2px solid var(--agent-accent);
+  background: var(--agent-soft);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: var(--shadow-xs);
+  position: relative;
+  z-index: 1;
+}
+
+.agent-avatar--xs .agent-avatar-frame {
+  border-width: 1.5px;
+}
+
+.agent-avatar--xl .agent-avatar-frame {
+  border-width: 3px;
+  box-shadow: 0 8px 20px color-mix(in srgb, var(--agent-accent) 26%, transparent);
+}
+
+.agent-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center top;
+  display: block;
+}
+
+.agent-avatar-fallback {
+  font-size: 1.1em;
+}
+
+.agent-avatar-ring {
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.agent-avatar-mood-badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  z-index: 3;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--bg-panel);
+  border: 1.5px solid var(--agent-accent);
+  box-shadow: var(--shadow-xs);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.agent-avatar--lg .agent-avatar-mood-badge {
+  min-width: 22px;
+  height: 22px;
+  font-size: 12px;
+}
+
+.agent-avatar--xl .agent-avatar-mood-badge {
+  min-width: 26px;
+  height: 26px;
+  font-size: 14px;
+  right: 0;
+  bottom: 0;
+}
+
+/* 说话声波条 */
+.agent-speaking-waves {
+  position: absolute;
+  top: -4px;
+  right: -8px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  padding: 3px 5px;
+  border-radius: 999px;
+  background: var(--bg-panel);
+  border: 1px solid var(--agent-accent);
+  box-shadow: var(--shadow-xs);
+}
+
+.agent-speaking-waves i {
+  display: block;
+  width: 2.5px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--agent-accent);
+  animation: agent-wave-bar 0.85s ease-in-out infinite;
+}
+
+.agent-speaking-waves i:nth-child(2) {
+  animation-delay: 0.18s;
+  height: 10px;
+}
+
+.agent-speaking-waves i:nth-child(3) {
+  animation-delay: 0.36s;
+  height: 6px;
+}
+
+@keyframes agent-wave-bar {
+  0%,
+  100% {
+    transform: scaleY(0.45);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scaleY(1.15);
+    opacity: 1;
+  }
+}
+
+/* 情绪动画 */
+.agent-mood--working .agent-avatar-ring,
+.agent-mood--thinking .agent-avatar-ring {
+  border-color: color-mix(in srgb, var(--agent-accent) 45%, transparent);
+  animation: agent-pulse-ring 1.8s ease-out infinite;
+}
+
+.agent-mood--waiting .agent-avatar-ring {
+  border-color: var(--status-amber);
+  animation: agent-pulse-ring 1.3s ease-out infinite;
+}
+
+.agent-mood--waiting .agent-avatar-frame {
+  animation: agent-gentle-hop 1.6s ease-in-out infinite;
+}
+
+.agent-mood--talking .agent-avatar-frame {
+  animation: agent-talk-tilt 1.4s ease-in-out infinite;
+}
+
+.agent-mood--celebrating .agent-avatar-frame {
+  animation: agent-celebrate-pop 2.2s ease-in-out infinite;
+}
+
+.agent-mood--alert .agent-avatar-ring {
+  border-color: var(--status-red);
+  animation: agent-pulse-ring 1.2s ease-out infinite;
+}
+
+.agent-mood--archived .agent-avatar-frame {
+  opacity: 0.65;
+  filter: grayscale(0.35);
+}
+
+@keyframes agent-pulse-ring {
+  0% {
+    transform: scale(0.96);
+    opacity: 0.85;
+  }
+  70% {
+    transform: scale(1.18);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1.18);
+    opacity: 0;
+  }
+}
+
+@keyframes agent-gentle-hop {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+
+@keyframes agent-talk-tilt {
+  0%,
+  100% {
+    transform: rotate(0deg) scale(1);
+  }
+  30% {
+    transform: rotate(-3deg) scale(1.03);
+  }
+  70% {
+    transform: rotate(3deg) scale(1.03);
+  }
+}
+
+@keyframes agent-celebrate-pop {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.04);
+  }
+}
+
+/* 顶部 RunSummaryBar 团队头像叠层 */
+.run-squad-avatars {
+  display: inline-flex;
+  align-items: center;
+  padding-right: 4px;
+}
+
+.run-squad-avatars .agent-avatar {
+  margin-left: -6px;
+  transition: transform 0.18s ease;
+}
+
+.run-squad-avatars .agent-avatar:first-child {
+  margin-left: 0;
+}
+
+.run-squad-avatars .agent-avatar:hover {
+  transform: translateY(-3px) scale(1.12);
+  z-index: 4;
+}
+
+/* SVG 流程画布拟人增强 */
+.flow-node-person-tag {
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.flow-speech-bubble {
+  animation: bubble-float 2.2s ease-in-out infinite;
+}
+
+.flow-speech-bubble-box {
+  fill: var(--bg-panel);
+  stroke-width: 1.4;
+  filter: drop-shadow(0 2px 6px rgba(15, 23, 42, 0.1));
+}
+
+.flow-speech-bubble-tail {
+  fill: var(--bg-panel);
+}
+
+.flow-speech-bubble-text {
+  fill: var(--text-primary);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.flow-node-avatar-group.avatar-bobbing {
+  animation: svg-avatar-bob 1.9s ease-in-out infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.flow-supervisor-pulse-orb {
+  fill: var(--status-purple);
+  filter: drop-shadow(0 0 5px rgba(124, 58, 237, 0.7));
+}
+
+.flow-negotiation-orb {
+  fill: var(--status-amber);
+  filter: drop-shadow(0 0 4px rgba(217, 119, 6, 0.75));
+}
+
+.flow-packet-orb {
+  filter: drop-shadow(0 0 4px rgba(47, 84, 235, 0.55));
+}
+
+@keyframes bubble-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+
+@keyframes svg-avatar-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2.5px);
+  }
+}
+
+/* 审阅面板头部拟人问候卡 */
+.agent-persona-greeting {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
+  border-left-width: 4px;
+  background: linear-gradient(135deg, var(--bg-subtle) 0%, var(--bg-card) 100%);
+}
+
+.agent-greeting-bubble {
+  min-width: 0;
+  flex: 1;
+}
+
+.agent-greeting-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.agent-greeting-name span {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.agent-greeting-quote {
+  margin-top: 5px;
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+/* 跨角色对话气泡线程 (AgentDiscussion) */
+.dialogue-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.dialogue-msg {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  animation: dialogue-pop-in 0.35s var(--m-ease-spring, cubic-bezier(0.34, 1.56, 0.64, 1));
+}
+
+.dialogue-msg-right {
+  justify-content: flex-end;
+}
+
+.dialogue-bubble {
+  max-width: min(82%, 58ch);
+  padding: 10px 13px;
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-xs);
+}
+
+.dialogue-bubble-left {
+  border-top-left-radius: 4px;
+  border-left-width: 3px;
+}
+
+.dialogue-bubble-right {
+  border-top-right-radius: 4px;
+  border-right-width: 3px;
+  background: var(--bg-subtle);
+}
+
+.dialogue-speaker {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.dialogue-speaker span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.dialogue-text {
+  font-size: 12.5px;
+  color: var(--text-primary);
+  line-height: 1.55;
+}
+
+@keyframes dialogue-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ========================================================================== */
+/* 多 Agent 拟人协同动画剧场 (AgentCollaborationTheater)                      */
+/* ========================================================================== */
+
+.collaboration-theater {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  padding: 16px 20px;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.theater-header-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.theater-title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.theater-live-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--status-green);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--status-green) 22%, transparent);
+  animation: theater-beacon 1.8s ease-in-out infinite;
+}
+
+@keyframes theater-beacon {
+  0%,
+  100% {
+    transform: scale(0.92);
+    opacity: 0.8;
+  }
+  50% {
+    transform: scale(1.15);
+    opacity: 1;
+  }
+}
+
+.theater-title {
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.theater-subtitle {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.theater-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.theater-mode-switch {
+  display: inline-flex;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.theater-mode-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 4px 11px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.theater-mode-btn.active {
+  background: var(--bg-panel);
+  color: var(--accent-primary);
+  box-shadow: var(--shadow-xs);
+}
+
+.theater-playback-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.theater-speed-btn {
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  border-radius: 7px;
+  padding: 4px 9px;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.theater-speed-btn:hover {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+/* 角色接力队列条 */
+.theater-squad-strip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+}
+
+.theater-squad-slot {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+}
+
+.theater-squad-connector {
+  position: relative;
+  flex: 1;
+  min-width: 22px;
+  height: 2px;
+  background: var(--border-strong);
+  margin: 0 4px;
+}
+
+.theater-squad-connector.reached {
+  background: linear-gradient(90deg, var(--accent-primary), var(--status-cyan));
+}
+
+.theater-packet-dot {
+  display: none;
+}
+
+.theater-squad-connector.reached .theater-packet-dot {
+  display: block;
+  position: absolute;
+  top: -3px;
+  left: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-primary);
+  box-shadow: 0 0 6px var(--accent-primary);
+  animation: squad-packet-slide 1.8s linear infinite;
+}
+
+@keyframes squad-packet-slide {
+  0% {
+    left: 0;
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    left: calc(100% - 8px);
+    opacity: 0;
+  }
+}
+
+.theater-squad-member {
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 10px;
+  padding: 5px 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+  min-width: 72px;
+  transition: all 0.16s ease;
+}
+
+.theater-squad-member:hover {
+  background: var(--bg-card);
+  border-color: var(--border-subtle);
+}
+
+.theater-squad-member.is-active {
+  background: var(--bg-panel);
+  border-color: var(--accent-primary);
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-2px);
+}
+
+.theater-squad-name {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.theater-squad-role {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* 剧场剧情舞台 */
+.theater-story-stage {
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
+  background: linear-gradient(160deg, var(--bg-subtle) 0%, var(--bg-card) 65%);
+  padding: 16px 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: theater-scene-enter 0.34s var(--m-ease-out, ease-out);
+}
+
+@keyframes theater-scene-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.theater-handoff-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border-radius: 10px;
+  background: var(--bg-panel);
+  border: 1px dashed var(--border-strong);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.theater-handoff-actor {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.theater-handoff-track {
+  position: relative;
+  flex: 1;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+}
+
+.theater-handoff-capsule {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 11%, var(--bg-panel));
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 28%, transparent);
+  animation: handoff-glide 1.8s ease-in-out infinite;
+}
+
+@keyframes handoff-glide {
+  0% {
+    transform: translateX(-28px);
+    opacity: 0.65;
+  }
+  50% {
+    transform: translateX(28px);
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(-28px);
+    opacity: 0.65;
+  }
+}
+
+.theater-actor-spotlight {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 18px;
+  align-items: center;
+}
+
+@media (max-width: 780px) {
+  .theater-actor-spotlight {
+    grid-template-columns: 1fr;
+  }
+}
+
+.theater-actor-stage-left {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.theater-character-float {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  animation: character-breathe 3s ease-in-out infinite;
+}
+
+.theater-float-delayed {
+  animation-delay: 0.7s;
+}
+
+@keyframes character-breathe {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+/* 角色工位小道具动画 */
+.theater-desk-prop {
+  position: absolute;
+  left: -14px;
+  bottom: 2px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-sm);
+  font-size: 13px;
+  z-index: 3;
+}
+
+.theater-typing-dots {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.theater-typing-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent-primary);
+  animation: typing-bounce 1s ease-in-out infinite;
+}
+
+.theater-typing-dots i:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.theater-typing-dots i:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+@keyframes typing-bounce {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.45;
+  }
+  40% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+.theater-thought-cloud,
+.theater-hand-wave,
+.theater-sparkle-burst {
+  font-size: 12px;
+  animation: prop-wiggle 1.4s ease-in-out infinite;
+}
+
+@keyframes prop-wiggle {
+  0%,
+  100% {
+    transform: rotate(-6deg) scale(1);
+  }
+  50% {
+    transform: rotate(10deg) scale(1.16);
+  }
+}
+
+.theater-character-tag {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  font-size: 11.5px;
+}
+
+.theater-character-tag strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+
+.theater-character-tag span {
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.theater-speech-bubble {
+  position: relative;
+  background: var(--bg-panel);
+  border: 1.5px solid var(--border-subtle);
+  border-radius: 16px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.theater-bubble-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.theater-bubble-headline {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.55;
+}
+
+.theater-payload-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.theater-bubble-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-subtle);
+}
+
+/* 剧场时间轴进度点 */
+.theater-scrubber {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.theater-scrubber-dots {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  overflow-x: auto;
+  padding: 4px 2px;
+}
+
+.theater-scrubber-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  border: 1.5px solid var(--dot-accent, var(--border-strong));
+  background: var(--bg-panel);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.16s ease;
+}
+
+.theater-scrubber-dot.passed {
+  background: color-mix(in srgb, var(--dot-accent, var(--accent-primary)) 45%, transparent);
+}
+
+.theater-scrubber-dot.current {
+  width: 24px;
+  background: var(--dot-accent, var(--accent-primary));
+}
+
+/* 双角色对谈仲裁竞技场 */
+.theater-dialogue-stage {
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
+  background: linear-gradient(160deg, var(--bg-subtle) 0%, var(--bg-card) 70%);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: theater-scene-enter 0.34s var(--m-ease-out, ease-out);
+}
+
+.theater-dialogue-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.theater-turn-pill {
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.theater-turn-pill.active {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: #ffffff;
+}
+
+.theater-versus-arena {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+}
+
+@media (max-width: 960px) {
+  .theater-versus-arena {
+    grid-template-columns: 1fr;
+  }
+}
+
+.theater-character-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.theater-bubble-left {
+  width: 100%;
+  border-left-width: 4px;
+  animation: dialogue-pop-in 0.38s var(--m-ease-spring, ease-out);
+}
+
+.theater-bubble-right {
+  width: 100%;
+  border-right-width: 4px;
+  animation: dialogue-pop-in 0.52s var(--m-ease-spring, ease-out);
+}
+
+.theater-bubble-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.theater-bubble-text {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.55;
+}
+
+.theater-bridge-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.theater-spark-bridge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.theater-spark-line {
+  width: 100%;
+  height: 2px;
+  background: repeating-linear-gradient(90deg, var(--status-amber) 0 8px, transparent 8px 14px);
+  animation: spark-dash 1.2s linear infinite;
+}
+
+@keyframes spark-dash {
+  to {
+    background-position: 28px 0;
+  }
+}
+
+.theater-spark-pill {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 700;
+  background: var(--bg-panel);
+  border: 1px solid var(--status-amber);
+  color: var(--status-amber);
+  white-space: nowrap;
+}
+
+.theater-supervisor-swoop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--status-purple) 10%, var(--bg-panel));
+  border: 1.5px solid var(--status-purple);
+  animation: dialogue-pop-in 0.45s var(--m-ease-spring, ease-out);
+}
+
+.theater-supervisor-callout {
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.theater-supervisor-callout strong {
+  font-size: 12px;
+  color: var(--status-purple);
+}
+
+.theater-supervisor-callout span {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-speaking-waves i,
+  .agent-mood--working .agent-avatar-ring,
+  .agent-mood--thinking .agent-avatar-ring,
+  .agent-mood--waiting .agent-avatar-ring,
+  .agent-mood--waiting .agent-avatar-frame,
+  .agent-mood--talking .agent-avatar-frame,
+  .agent-mood--celebrating .agent-avatar-frame,
+  .agent-mood--alert .agent-avatar-ring,
+  .flow-speech-bubble,
+  .flow-node-avatar-group.avatar-bobbing,
+  .theater-live-dot,
+  .theater-squad-connector.reached .theater-packet-dot,
+  .theater-story-stage,
+  .theater-handoff-capsule,
+  .theater-character-float,
+  .theater-typing-dots i,
+  .theater-thought-cloud,
+  .theater-hand-wave,
+  .theater-sparkle-burst,
+  .theater-dialogue-stage,
+  .dialogue-msg,
+  .theater-bubble-left,
+  .theater-bubble-right,
+  .theater-spark-line,
+  .theater-supervisor-swoop {
+    animation: none !important;
   }
 }

@@ -16,12 +16,16 @@ import { DecisionVerdict, WorkflowStageId } from '../src/domain/enums.ts';
 import { SystemPermissionCode, UserHierarchyTier } from '../src/domain/rbac.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
 import { SessionService } from '../src/server/auth/SessionService.ts';
+import { withTestWorkspace } from './helpers/testIsolation.ts';
 
 describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测试套件', () => {
   it('1. 所有环节员工均应共享完整工作流视图，但仅专长领域负责人或顶层管理员可签核对应阶段门禁', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-rbac-'));
     try {
-      const orchestrator = new WorkflowOrchestratorFacade({ persistenceDir: tempDir });
+      const orchestrator = new WorkflowOrchestratorFacade({
+        persistenceDir: tempDir,
+        sandboxRootDir: path.join(tempDir, 'sandbox'),
+      });
       const proposal = new ProjectProposalContract({
         proposalId: 'TEST-RBAC-001',
         title: '核心账户权限与表结构升级',
@@ -103,45 +107,56 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
   });
 
   it('2. 仅顶层管理员 (PROJECT_ADMIN) 可修改全局工作流治理参数，普通专长员工调用将被拦截', async () => {
-    const orchestrator = new WorkflowOrchestratorFacade();
-    const adminUser = orchestrator.rbacService.getUserOrThrow('user-admin-01');
-    const engUser = orchestrator.rbacService.getUserOrThrow('user-eng-01');
-
-    assert.equal(adminUser.tier, UserHierarchyTier.PROJECT_ADMIN);
-    assert.equal(engUser.tier, UserHierarchyTier.STAGE_SPECIALIST);
-
-    assert.throws(() => {
-      orchestrator.updateAdminGovernanceConfig({
-        actorUserId: 'user-eng-01',
-        maxNegotiationTurns: 5,
+    await withTestWorkspace('rbac-admin-', (ws) => {
+      const orchestrator = new WorkflowOrchestratorFacade({
+        persistenceDir: ws.persistenceDir,
+        sandboxRootDir: ws.sandboxRootDir,
       });
-    }, /RBAC 最高权限拦截/);
+      const adminUser = orchestrator.rbacService.getUserOrThrow('user-admin-01');
+      const engUser = orchestrator.rbacService.getUserOrThrow('user-eng-01');
 
-    const updated = orchestrator.updateAdminGovernanceConfig({
-      actorUserId: 'user-admin-01',
-      maxNegotiationTurns: 4,
-      highRiskScoreThreshold: 70,
-      allowSpecialistCrossStageRollback: false,
-    });
+      assert.equal(adminUser.tier, UserHierarchyTier.PROJECT_ADMIN);
+      assert.equal(engUser.tier, UserHierarchyTier.STAGE_SPECIALIST);
 
-    assert.equal(updated.maxNegotiationTurns, 4);
-    assert.equal(updated.highRiskScoreThreshold, 70);
-    assert.equal(updated.allowSpecialistCrossStageRollback, false);
+      assert.throws(() => {
+        orchestrator.updateAdminGovernanceConfig({
+          actorUserId: 'user-eng-01',
+          maxNegotiationTurns: 5,
+        });
+      }, /RBAC 最高权限拦截/);
 
-    // 开启严格回退限制后，Engineer (user-eng-01) 尝试跨领域回退到 Stage 1 PM 应被拦截，而 Admin 不受限
-    assert.throws(() => {
-      orchestrator.rbacService.assertCanInvokeRollback('user-eng-01', WorkflowStageId.STAGE_1_PM);
-    }, /RBAC 权限拦截/);
+      const updated = orchestrator.updateAdminGovernanceConfig({
+        actorUserId: 'user-admin-01',
+        maxNegotiationTurns: 4,
+        highRiskScoreThreshold: 70,
+        allowSpecialistCrossStageRollback: false,
+      });
 
-    assert.doesNotThrow(() => {
-      orchestrator.rbacService.assertCanInvokeRollback('user-admin-01', WorkflowStageId.STAGE_1_PM);
+      assert.equal(updated.maxNegotiationTurns, 4);
+      assert.equal(updated.highRiskScoreThreshold, 70);
+      assert.equal(updated.allowSpecialistCrossStageRollback, false);
+
+      // 开启严格回退限制后，Engineer (user-eng-01) 尝试跨领域回退到 Stage 1 PM 应被拦截，而 Admin 不受限
+      assert.throws(() => {
+        orchestrator.rbacService.assertCanInvokeRollback('user-eng-01', WorkflowStageId.STAGE_1_PM);
+      }, /RBAC 权限拦截/);
+
+      assert.doesNotThrow(() => {
+        orchestrator.rbacService.assertCanInvokeRollback(
+          'user-admin-01',
+          WorkflowStageId.STAGE_1_PM,
+        );
+      });
     });
   });
 
   it('3. 任何角色的团队成员均可在任意项目步骤下发表共享评论，且签核或回退操作自动记入步骤评论流', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-cmt-'));
     try {
-      const orchestrator = new WorkflowOrchestratorFacade({ persistenceDir: tempDir });
+      const orchestrator = new WorkflowOrchestratorFacade({
+        persistenceDir: tempDir,
+        sandboxRootDir: path.join(tempDir, 'sandbox'),
+      });
       const proposal = new ProjectProposalContract({
         proposalId: 'TEST-CMT-001',
         title: '多角色步骤评论协同测试项目',
@@ -177,7 +192,10 @@ describe('Block 6 — 企业级多层级用户 RBAC 与最高管理员治理测�
   it('4. SessionService 与 RbacGovernanceService 共享用户源，且严格禁止未知/未认证用户提权为管理员', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-sdlc-sync-'));
     try {
-      const orchestrator = new WorkflowOrchestratorFacade({ persistenceDir: tempDir });
+      const orchestrator = new WorkflowOrchestratorFacade({
+        persistenceDir: tempDir,
+        sandboxRootDir: path.join(tempDir, 'sandbox'),
+      });
       const sessionSvc = new SessionService(
         path.join(tempDir, 'users.json'),
         orchestrator.rbacService,

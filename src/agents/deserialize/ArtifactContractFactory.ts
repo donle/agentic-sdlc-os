@@ -7,6 +7,7 @@
  */
 
 import {
+  type ArtifactKeyDecision,
   CodeImplementationArtifactContract,
   DataAnalysisArtifactContract,
   PrdArtifactContract,
@@ -40,6 +41,32 @@ function riskLevel(raw: unknown): BusinessRiskLevel {
     : BusinessRiskLevel.MEDIUM;
 }
 
+function parseRationaleMeta(raw: Record<string, unknown>): {
+  readonly agentRationale?: string;
+  readonly keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
+} {
+  const agentRationale =
+    typeof raw.agentRationale === 'string' && raw.agentRationale.trim().length > 0
+      ? raw.agentRationale.trim()
+      : undefined;
+  const keyDecisions = Array.isArray(raw.keyDecisions)
+    ? raw.keyDecisions
+        .filter((item): item is Record<string, unknown> =>
+          Boolean(item && typeof item === 'object'),
+        )
+        .map((item) => ({
+          decision: String(item.decision ?? '').trim(),
+          rationale: String(item.rationale ?? '').trim(),
+          tradeoffs: asStringArray(item.tradeoffs),
+        }))
+        .filter((item) => item.decision.length > 0 || item.rationale.length > 0)
+    : undefined;
+  return {
+    agentRationale,
+    keyDecisions: keyDecisions && keyDecisions.length > 0 ? keyDecisions : undefined,
+  };
+}
+
 export class ArtifactContractFactory {
   /**
    * 按阶段把 LLM/持久化的原始 JSON 映射为强类型契约。
@@ -49,6 +76,7 @@ export class ArtifactContractFactory {
     const coreIds = asStringArray(raw.coreRequirementIds);
     const summary = String(raw.summary ?? '');
     const producer = AgentRole.SUPERVISOR; // 以 stageId 为准，producerRole 由各契约类常量决定
+    const rationaleMeta = parseRationaleMeta(raw);
 
     try {
       switch (stageId) {
@@ -71,6 +99,7 @@ export class ArtifactContractFactory {
               properties: asStringArray(ev.properties),
             })),
             nonFunctionalConstraints: asStringArray(raw.nonFunctionalConstraints),
+            ...rationaleMeta,
           });
           return { ok: true, artifact, violations: [] };
         }
@@ -90,6 +119,7 @@ export class ArtifactContractFactory {
               raw.designChallengeNote === null || raw.designChallengeNote === undefined
                 ? null
                 : String(raw.designChallengeNote),
+            ...rationaleMeta,
           });
           return { ok: true, artifact, violations: [] };
         }
@@ -108,6 +138,7 @@ export class ArtifactContractFactory {
             databaseDdlStatements: asStringArray(raw.databaseDdlStatements),
             declaredRiskLevel: riskLevel(raw.declaredRiskLevel),
             architecturePatternsUsed: asStringArray(raw.architecturePatternsUsed),
+            ...rationaleMeta,
           });
           return { ok: true, artifact, violations: [] };
         }
@@ -125,6 +156,7 @@ export class ArtifactContractFactory {
               linesChanged: asNumber(f.linesChanged, 0),
             })),
             selfTestPassed: asBoolean(raw.selfTestPassed),
+            ...rationaleMeta,
           });
           return { ok: true, artifact, violations: [] };
         }
@@ -142,6 +174,7 @@ export class ArtifactContractFactory {
             })),
             securityIssuesFound: asNumber(raw.securityIssuesFound, 0),
             allAcceptanceCriteriaMet: asBoolean(raw.allAcceptanceCriteriaMet),
+            ...rationaleMeta,
           });
           return { ok: true, artifact, violations: [] };
         }
@@ -157,6 +190,7 @@ export class ArtifactContractFactory {
               baselineValue: String(m.baselineValue ?? ''),
               targetValue: String(m.targetValue ?? ''),
             })),
+            ...rationaleMeta,
           });
           return { ok: true, artifact, violations: [] };
         }

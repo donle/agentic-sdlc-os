@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <defs>
+    <linearGradient id="pmBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#DBEAFE"/>
+      <stop offset="100%" stop-color="#BFDBFE"/>
+    </linearGradient>
+    <linearGradient id="pmSweater" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#1D4ED8"/>
+    </linearGradient>
+    <linearGradient id="pmSkin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FDE2C8"/>
+      <stop offset="100%" stop-color="#F3C39B"/>
+    </linearGradient>
+  </defs>
+  <rect width="400" height="400" fill="url(#pmBg)"/>
+  <circle cx="330" cy="84" r="34" fill="#93C5FD" opacity="0.35"/>
+  <circle cx="68" cy="112" r="22" fill="#60A5FA" opacity="0.25"/>
+  <!-- Hair back -->
+  <path d="M138 140 C134 86 168 62 204 62 C244 62 272 88 264 142 Z" fill="#2B2533"/>
+  <!-- Neck & Collar -->
+  <path d="M178 210 L178 248 L222 248 L222 210 Z" fill="#EBB890" stroke="#241E2B" stroke-width="3"/>
+  <!-- Sweater Torso -->
+  <path d="M88 400 C92 292 126 244 176 238 L224 238 C274 244 308 292 312 400 Z" fill="url(#pmSweater)" stroke="#1E293B" stroke-width="3.5"/>
+  <!-- White shirt collar -->
+  <path d="M174 234 L200 264 L226 234 L214 228 L200 246 L186 228 Z" fill="#F8FAFC" stroke="#1E293B" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- Head -->
+  <path d="M148 134 C148 92 252 92 252 134 C254 182 232 218 200 220 C168 218 146 182 148 134 Z" fill="url(#pmSkin)" stroke="#241E2B" stroke-width="3.5"/>
+  <!-- Ears -->
+  <ellipse cx="145" cy="158" rx="9" ry="14" fill="#F6C8A4" stroke="#241E2B" stroke-width="3"/>
+  <ellipse cx="255" cy="158" rx="9" ry="14" fill="#F6C8A4" stroke="#241E2B" stroke-width="3"/>
+  <!-- Hair front -->
+  <path d="M144 134 C146 82 184 68 212 72 C242 76 260 100 256 134 C244 114 222 104 196 106 C174 108 158 118 144 134 Z" fill="#352E40" stroke="#1E1B24" stroke-width="3"/>
+  <path d="M178 86 C198 78 220 82 234 94" fill="none" stroke="#574E66" stroke-width="4" stroke-linecap="round"/>
+  <!-- Cheeks -->
+  <ellipse cx="168" cy="172" rx="10" ry="5" fill="#F4978E" opacity="0.45"/>
+  <ellipse cx="232" cy="172" rx="10" ry="5" fill="#F4978E" opacity="0.45"/>
+  <!-- Eyes & Eyebrows -->
+  <path d="M166 136 Q178 130 189 135" fill="none" stroke="#241E2B" stroke-width="3.5" stroke-linecap="round"/>
+  <path d="M211 135 Q222 130 234 136" fill="none" stroke="#241E2B" stroke-width="3.5" stroke-linecap="round"/>
+  <circle cx="178" cy="152" r="7" fill="#1F2937"/>
+  <circle cx="222" cy="152" r="7" fill="#1F2937"/>
+  <circle cx="180" cy="150" r="2.4" fill="#FFFFFF"/>
+  <circle cx="224" cy="150" r="2.4" fill="#FFFFFF"/>
+  <!-- Round Glasses -->
+  <circle cx="178" cy="153" r="18" fill="none" stroke="#1E293B" stroke-width="3.2"/>
+  <circle cx="222" cy="153" r="18" fill="none" stroke="#1E293B" stroke-width="3.2"/>
+  <path d="M196 152 Q200 148 204 152" fill="none" stroke="#1E293B" stroke-width="3"/>
+  <!-- Nose & Smile -->
+  <path d="M200 160 L197 170 L203 171" fill="none" stroke="#D1956B" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M186 186 Q200 198 214 186" fill="#FFFFFF" stroke="#241E2B" stroke-width="3" stroke-linecap="round"/>
+  <!-- Clipboard / PRD Tablet -->
+  <g transform="translate(132, 268)">
+    <rect x="0" y="6" width="136" height="106" rx="14" fill="#1E293B" stroke="#0F172A" stroke-width="3"/>
+    <rect x="10" y="16" width="116" height="86" rx="8" fill="#EFF6FF"/>
+    <rect x="44" y="-2" width="48" height="16" rx="6" fill="#64748B" stroke="#1E293B" stroke-width="2.5"/>
+    <!-- Sticky notes & lines -->
+    <rect x="20" y="28" width="28" height="24" rx="4" fill="#FDE047" stroke="#EAB308" stroke-width="1.5"/>
+    <rect x="54" y="28" width="28" height="24" rx="4" fill="#93C5FD" stroke="#3B82F6" stroke-width="1.5"/>
+    <rect x="88" y="28" width="28" height="24" rx="4" fill="#86EFAC" stroke="#22C55E" stroke-width="1.5"/>
+    <line x1="22" y1="66" x2="112" y2="66" stroke="#93C5FD" stroke-width="5" stroke-linecap="round"/>
+    <line x1="22" y1="80" x2="88" y2="80" stroke="#BFDBFE" stroke-width="5" stroke-linecap="round"/>
+  </g>
+  <!-- Hands holding tablet -->
+  <ellipse cx="132" cy="332" rx="14" ry="18" fill="#F9CEAA" stroke="#241E2B" stroke-width="3"/>
+  <ellipse cx="268" cy="332" rx="14" ry="18" fill="#F9CEAA" stroke="#241E2B" stroke-width="3"/>
+</svg>

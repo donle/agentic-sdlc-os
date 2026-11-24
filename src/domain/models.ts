@@ -147,6 +147,16 @@ export class StageSnapshotMemento {
       retryCount: this.retryCount,
       tokensConsumed: this.tokensConsumed,
       artifactSummary: this.artifact.summary,
+      structuredSummary: {
+        headline: this.artifact.summary,
+        rationale: this.artifact.agentRationale?.trim() || this.artifact.summary,
+        caveats: [
+          ...this.riskReasons,
+          ...(this.scopeDiffReport.hasUnauthorizedScopeReduction
+            ? [`检测到未授权需求删减 (${this.scopeDiffReport.droppedRequirementIds.join(', ')})`]
+            : []),
+        ],
+      },
       artifactType: this.artifact.contractType,
       artifactDetails: this.artifact,
       createdAtIso: this.createdAtIso,
@@ -244,6 +254,7 @@ export class HumanDecisionRecord {
       branchId: String(raw.branchId ?? ''),
       stageId: String(raw.stageId ?? 'STAGE_1_PM') as never,
       reviewerActor: String(raw.reviewerActor ?? ''),
+      reviewerUserId: raw.reviewerUserId ? String(raw.reviewerUserId) : undefined,
       verdict: String(raw.verdict ?? 'APPROVE') as never,
       comment: String(raw.comment ?? ''),
       createdAtIso: raw.createdAtIso ? String(raw.createdAtIso) : undefined,
@@ -256,6 +267,7 @@ export class HumanDecisionRecord {
   public readonly branchId: string;
   public readonly stageId: WorkflowStageId;
   public readonly reviewerActor: string;
+  public readonly reviewerUserId?: string;
   public readonly verdict: DecisionVerdict;
   public readonly comment: string;
   public readonly createdAtIso: string;
@@ -267,6 +279,7 @@ export class HumanDecisionRecord {
     branchId: string;
     stageId: WorkflowStageId;
     reviewerActor: string;
+    reviewerUserId?: string;
     verdict: DecisionVerdict;
     comment: string;
     createdAtIso?: string;
@@ -277,6 +290,7 @@ export class HumanDecisionRecord {
     this.branchId = params.branchId;
     this.stageId = params.stageId;
     this.reviewerActor = params.reviewerActor;
+    this.reviewerUserId = params.reviewerUserId;
     this.verdict = params.verdict;
     this.comment = params.comment;
     this.createdAtIso = params.createdAtIso ?? new Date().toISOString();

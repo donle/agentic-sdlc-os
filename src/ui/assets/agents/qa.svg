@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <defs>
+    <linearGradient id="qaBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FEF3C7"/>
+      <stop offset="100%" stop-color="#FDE68A"/>
+    </linearGradient>
+    <linearGradient id="qaVest" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </linearGradient>
+    <linearGradient id="qaSkin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFE4CC"/>
+      <stop offset="100%" stop-color="#F3C199"/>
+    </linearGradient>
+  </defs>
+  <rect width="400" height="400" fill="url(#qaBg)"/>
+  <circle cx="80" cy="96" r="28" fill="#FCD34D" opacity="0.45"/>
+  <!-- Hair ponytail / bun -->
+  <circle cx="246" cy="92" r="26" fill="#3B231E" stroke="#1F120F" stroke-width="3"/>
+  <!-- Neck -->
+  <path d="M180 210 L180 248 L220 248 L220 210 Z" fill="#EFC09B" stroke="#1F120F" stroke-width="3"/>
+  <!-- Shirt & Amber Vest -->
+  <path d="M92 400 C98 292 132 246 176 240 L224 240 C268 246 302 292 308 400 Z" fill="#FFFBEB" stroke="#1F120F" stroke-width="3.5"/>
+  <path d="M138 244 L176 240 L192 380 L118 380 Z" fill="url(#qaVest)" stroke="#1F120F" stroke-width="3"/>
+  <path d="M262 244 L224 240 L208 380 L282 380 Z" fill="url(#qaVest)" stroke="#1F120F" stroke-width="3"/>
+  <!-- Head -->
+  <path d="M150 134 C150 92 250 92 250 134 C252 180 230 214 200 216 C170 214 148 180 150 134 Z" fill="url(#qaSkin)" stroke="#1F120F" stroke-width="3.5"/>
+  <!-- Hair bangs -->
+  <path d="M146 134 C146 82 186 66 216 70 C246 76 258 104 254 134 C236 112 212 104 186 110 C168 114 156 122 146 134 Z" fill="#472B24" stroke="#1F120F" stroke-width="3"/>
+  <!-- Cheeks -->
+  <ellipse cx="168" cy="170" rx="10" ry="5" fill="#FB923C" opacity="0.38"/>
+  <ellipse cx="232" cy="170" rx="10" ry="5" fill="#FB923C" opacity="0.38"/>
+  <!-- Sharp Friendly Eyes -->
+  <path d="M164 136 Q177 129 188 135" fill="none" stroke="#1F120F" stroke-width="3.2" stroke-linecap="round"/>
+  <path d="M212 135 Q223 129 236 136" fill="none" stroke="#1F120F" stroke-width="3.2" stroke-linecap="round"/>
+  <circle cx="178" cy="152" r="7" fill="#1F120F"/>
+  <circle cx="222" cy="152" r="7" fill="#1F120F"/>
+  <circle cx="180" cy="150" r="2.5" fill="#FFFFFF"/>
+  <circle cx="224" cy="150" r="2.5" fill="#FFFFFF"/>
+  <!-- Smile -->
+  <path d="M186 184 Q200 196 214 184" fill="#FFFFFF" stroke="#1F120F" stroke-width="3" stroke-linecap="round"/>
+  <!-- Shield Badge on right -->
+  <g transform="translate(238, 250)">
+    <path d="M36 4 L68 16 L68 46 C68 68 52 84 36 92 C20 84 4 68 4 46 L4 16 Z" fill="#10B981" stroke="#064E3B" stroke-width="3.5"/>
+    <path d="M22 46 L32 56 L52 34" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <!-- Magnifying Glass on left -->
+  <g transform="translate(92, 246)">
+    <line x1="60" y1="62" x2="88" y2="92" stroke="#78350F" stroke-width="10" stroke-linecap="round"/>
+    <circle cx="42" cy="42" r="28" fill="#E0F2FE" stroke="#1E293B" stroke-width="5"/>
+    <path d="M28 32 Q36 24 46 26" fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round"/>
+  </g>
+  <ellipse cx="164" cy="322" rx="14" ry="16" fill="#F9CEAA" stroke="#1F120F" stroke-width="3"/>
+</svg>

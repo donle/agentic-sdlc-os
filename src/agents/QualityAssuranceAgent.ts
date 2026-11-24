@@ -36,14 +36,16 @@ import {
   RecognizedStageIntent,
 } from './AbstractWorkerAgent.ts';
 
+interface PreparedVerificationEntry {
+  readonly key: string;
+  readonly reqIds: ReadonlyArray<string>;
+  readonly verification: SandboxVerificationResult;
+  readonly forceQaFailure: boolean;
+}
+
 export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArtifactContract> {
   private readonly sandboxManager: GitWorktreeSandboxManager;
-  private lastPreparedVerification: {
-    readonly key: string;
-    readonly reqIds: ReadonlyArray<string>;
-    readonly verification: SandboxVerificationResult;
-    readonly forceQaFailure: boolean;
-  } | null = null;
+  private readonly preparedVerifications = new Map<string, PreparedVerificationEntry>();
 
   public constructor(deps: {
     eventBus: WorkflowEventBus;
@@ -72,15 +74,11 @@ export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArt
     );
   }
 
-  private ensureSandboxVerified(context: AgentExecutionInputContext): {
-    readonly key: string;
-    readonly reqIds: ReadonlyArray<string>;
-    readonly verification: SandboxVerificationResult;
-    readonly forceQaFailure: boolean;
-  } {
-    const key = `${context.runId}::${context.branchId}::${context.humanFeedbackDirective ?? ''}`;
-    if (this.lastPreparedVerification && this.lastPreparedVerification.key === key) {
-      return this.lastPreparedVerification;
+  private ensureSandboxVerified(context: AgentExecutionInputContext): PreparedVerificationEntry {
+    const key = this.buildPreparedContextKey(context);
+    const cached = this.preparedVerifications.get(key);
+    if (cached) {
+      return cached;
     }
 
     const upstreamCode = context.upstreamArtifacts.get(WorkflowStageId.STAGE_3B_ENGINEER) as
@@ -99,8 +97,12 @@ export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArt
     });
 
     const forceQaFailure = context.scenarioHints?.forceQaFailure === true;
-    this.lastPreparedVerification = { key, reqIds, verification, forceQaFailure };
-    return this.lastPreparedVerification;
+    return this.saveBoundedPreparedState(this.preparedVerifications, key, {
+      key,
+      reqIds,
+      verification,
+      forceQaFailure,
+    });
   }
 
   /**
@@ -142,11 +144,12 @@ export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArt
     candidate: QaVerificationArtifactContract,
     context: AgentExecutionInputContext,
   ): ReadonlyArray<string> {
-    const key = `${context.runId}::${context.branchId}::${context.humanFeedbackDirective ?? ''}`;
-    if (!this.lastPreparedVerification || this.lastPreparedVerification.key !== key) {
+    const key = this.buildPreparedContextKey(context);
+    const prepared = this.preparedVerifications.get(key);
+    if (!prepared) {
       return [];
     }
-    const { verification, forceQaFailure } = this.lastPreparedVerification;
+    const { verification, forceQaFailure } = prepared;
     const effectiveSecurityIssues = forceQaFailure
       ? verification.securityIssuesFound + 1
       : verification.securityIssuesFound;
@@ -194,6 +197,19 @@ export class QualityAssuranceAgent extends AbstractWorkerAgent<QaVerificationArt
         verification.failedTestCases === 0 &&
         verification.securityIssuesFound === 0 &&
         !forceQaFailure,
+      agentRationale: `QA 在隔离沙箱（${verification.runtime}）中校验了 ${verification.filesVerifiedCount} 个文件：通过 ${verification.passedTestCases}/${totalCases} 条用例，静态安全扫描发现 ${forceQaFailure ? verification.securityIssuesFound + 1 : verification.securityIssuesFound} 个风险项。`,
+      keyDecisions: [
+        {
+          decision:
+            verification.failedTestCases === 0 &&
+            verification.securityIssuesFound === 0 &&
+            !forceQaFailure
+              ? '建议通过上线终审门禁'
+              : '阻断放行并要求回退 Engineer 修复沙箱缺陷',
+          rationale: '严格以沙箱 subprocess/Docker 实测计数为准，禁止口头放行未验证代码',
+          tradeoffs: ['多耗时执行真实单测子进程', '消除测试谎报与带病上线风险'],
+        },
+      ],
     });
   }
 }

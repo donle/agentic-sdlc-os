@@ -45,6 +45,7 @@ import {
 import type { EmbeddingProvider } from '../src/telemetry/EmbeddingProvider.ts';
 import { IntentFulfillmentTracker } from '../src/telemetry/IntentFulfillmentTracker.ts';
 import { PromptCacheManager } from '../src/telemetry/PromptCacheManager.ts';
+import { withTestWorkspace } from './helpers/testIsolation.ts';
 
 function chatResponse(
   content: string,
@@ -718,202 +719,224 @@ describe('Agent 质量、跨模型缓存、Token/防死循环与反迎合协商�
   });
 
   it('AC-8: 对抗式协商触发 ESCALATE_TRADEOFF 时在第 1 轮即时熔断上报人类（不白烧后续轮次）', async () => {
-    process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
-    const orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
-    let responderCalls = 0;
-    let challengerOrJudgeCalls = 0;
+    await withTestWorkspace('aqe-ac8-', async (ws) => {
+      process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
+      const orchestrator = new WorkflowOrchestratorFacade({
+        maxNegotiationTurns: 3,
+        persistenceDir: ws.persistenceDir,
+        sandboxRootDir: ws.sandboxRootDir,
+      });
+      let responderCalls = 0;
+      let challengerOrJudgeCalls = 0;
 
-    orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
-      const sys = payload.messages[0].content;
-      if (sys.includes('受限协商中的响应方')) {
-        responderCalls += 1;
-        return chatResponse(
-          JSON.stringify({
-            action: 'ESCALATE_TRADEOFF',
-            responseResolution: '涉及工期与移动端交互体验的业务取舍，需人类拍板',
-            concretePatch: '',
-            optionAProposal: '方案 A：表格自动转卡片折叠（0 额外工期）',
-            optionBProposal: '方案 B：投入 3 人日研发虚拟横滑网格',
-          }),
-        );
-      }
-      if (sys.includes('挑战方独立复核者') || sys.includes('独立盲审裁判')) {
-        challengerOrJudgeCalls += 1;
-      }
-      for (const [stageId, json] of Object.entries(BASE_STAGE_JSON)) {
-        if (sys.includes(stageId) || sys.includes(roleKeyword(stageId))) {
-          return chatResponse(json);
+      orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
+        const sys = payload.messages[0].content;
+        if (sys.includes('受限协商中的响应方')) {
+          responderCalls += 1;
+          return chatResponse(
+            JSON.stringify({
+              action: 'ESCALATE_TRADEOFF',
+              responseResolution: '涉及工期与移动端交互体验的业务取舍，需人类拍板',
+              concretePatch: '',
+              optionAProposal: '方案 A：表格自动转卡片折叠（0 额外工期）',
+              optionBProposal: '方案 B：投入 3 人日研发虚拟横滑网格',
+            }),
+          );
         }
-      }
-      return chatResponse(BASE_STAGE_JSON.STAGE_1_PM);
-    });
+        if (sys.includes('挑战方独立复核者') || sys.includes('独立盲审裁判')) {
+          challengerOrJudgeCalls += 1;
+        }
+        for (const [stageId, json] of Object.entries(BASE_STAGE_JSON)) {
+          if (sys.includes(stageId) || sys.includes(roleKeyword(stageId))) {
+            return chatResponse(json);
+          }
+        }
+        return chatResponse(BASE_STAGE_JSON.STAGE_1_PM);
+      });
 
-    const runState = await orchestrator.startProposalWorkflow({
-      proposal: new ProjectProposalContract({
-        proposalId: 'AC8-001',
-        title: 'ESCALATE_TRADEOFF 即时熔断测试',
-        summary: '权衡类分歧不应空转 3 轮',
-        requirements: { R1: '需求1', R2: '需求2' },
-      }),
-      initiatorActor: 'AC8',
-    });
+      const runState = await orchestrator.startProposalWorkflow({
+        proposal: new ProjectProposalContract({
+          proposalId: 'AC8-001',
+          title: 'ESCALATE_TRADEOFF 即时熔断测试',
+          summary: '权衡类分歧不应空转 3 轮',
+          requirements: { R1: '需求1', R2: '需求2' },
+        }),
+        initiatorActor: 'AC8',
+      });
 
-    assert.equal(responderCalls, 1, 'ESCALATE_TRADEOFF 应在第 1 轮立即结束协商');
-    assert.equal(challengerOrJudgeCalls, 0, '即时上交权衡无需再浪费挑战/盲审 Token');
-    const history = orchestrator.negotiationMediator.getNegotiationHistory(runState.runId);
-    assert.equal(history.length, 1);
-    assert.equal(history[0].escalatedToSupervisor, true);
-    assert.ok(history[0].optionAProposal.includes('方案 A'));
-    const inbox = orchestrator.eventBus.getNotificationInbox(runState.runId);
-    assert.ok(inbox.some((n) => n.category === NotificationCategory.CONFLICT_ARBITRATION_REQUIRED));
+      assert.equal(responderCalls, 1, 'ESCALATE_TRADEOFF 应在第 1 轮立即结束协商');
+      assert.equal(challengerOrJudgeCalls, 0, '即时上交权衡无需再浪费挑战/盲审 Token');
+      const history = orchestrator.negotiationMediator.getNegotiationHistory(runState.runId);
+      assert.equal(history.length, 1);
+      assert.equal(history[0].escalatedToSupervisor, true);
+      assert.ok(history[0].optionAProposal.includes('方案 A'));
+      const inbox = orchestrator.eventBus.getNotificationInbox(runState.runId);
+      assert.ok(
+        inbox.some((n) => n.category === NotificationCategory.CONFLICT_ARBITRATION_REQUIRED),
+      );
+    });
   });
 
   it('AC-9: 挑战方独立否决阻止第 1 轮伪共识，并将 previousTurns 传至第 2 轮达成真共识', async () => {
-    process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
-    const orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
-    let responderCalls = 0;
-    let turn2UserPrompt = '';
+    await withTestWorkspace('aqe-ac9-', async (ws) => {
+      process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
+      const orchestrator = new WorkflowOrchestratorFacade({
+        maxNegotiationTurns: 3,
+        persistenceDir: ws.persistenceDir,
+        sandboxRootDir: ws.sandboxRootDir,
+      });
+      let responderCalls = 0;
+      let turn2UserPrompt = '';
 
-    orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
-      const sys = payload.messages[0].content;
-      const usr = payload.messages[1].content;
-      if (sys.includes('受限协商中的响应方')) {
-        responderCalls += 1;
-        if (responderCalls === 1) {
+      orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
+        const sys = payload.messages[0].content;
+        const usr = payload.messages[1].content;
+        if (sys.includes('受限协商中的响应方')) {
+          responderCalls += 1;
+          if (responderCalls === 1) {
+            return chatResponse(
+              JSON.stringify({
+                action: 'ACCEPT_AND_PATCH',
+                responseResolution: '第 1 轮：简单调整表头宽度',
+                concretePatch: '略微压缩列宽',
+                optionAProposal: '方案 A',
+                optionBProposal: '方案 B',
+              }),
+            );
+          }
+          turn2UserPrompt = usr;
           return chatResponse(
             JSON.stringify({
               action: 'ACCEPT_AND_PATCH',
-              responseResolution: '第 1 轮：简单调整表头宽度',
-              concretePatch: '略微压缩列宽',
+              responseResolution: '第 2 轮：依据挑战意见补充响应式折叠卡片',
+              concretePatch: '小于 768px 自动切换 CollapsibleCard 并保留全部 15 字段导出',
               optionAProposal: '方案 A',
               optionBProposal: '方案 B',
             }),
           );
         }
-        turn2UserPrompt = usr;
-        return chatResponse(
-          JSON.stringify({
-            action: 'ACCEPT_AND_PATCH',
-            responseResolution: '第 2 轮：依据挑战意见补充响应式折叠卡片',
-            concretePatch: '小于 768px 自动切换 CollapsibleCard 并保留全部 15 字段导出',
-            optionAProposal: '方案 A',
-            optionBProposal: '方案 B',
-          }),
-        );
-      }
-      if (sys.includes('挑战方独立复核者')) {
-        if (usr.includes('略微压缩列宽')) {
+        if (sys.includes('挑战方独立复核者')) {
+          if (usr.includes('略微压缩列宽')) {
+            return chatResponse(
+              JSON.stringify({
+                accepted: false,
+                critique: '压缩列宽仍无法在 375px 手机屏可读，拒绝妥协',
+                containsImplicitScopeCut: false,
+              }),
+            );
+          }
           return chatResponse(
             JSON.stringify({
-              accepted: false,
-              critique: '压缩列宽仍无法在 375px 手机屏可读，拒绝妥协',
+              accepted: true,
+              critique: '响应式卡片方案满足规范且未丢失字段',
               containsImplicitScopeCut: false,
             }),
           );
         }
-        return chatResponse(
-          JSON.stringify({
-            accepted: true,
-            critique: '响应式卡片方案满足规范且未丢失字段',
-            containsImplicitScopeCut: false,
-          }),
-        );
-      }
-      if (sys.includes('独立盲审裁判')) {
-        return chatResponse(JSON.stringify({ hasImplicitDowngrade: false, reason: '无功能缩水' }));
-      }
-      for (const [stageId, json] of Object.entries(BASE_STAGE_JSON)) {
-        if (sys.includes(stageId) || sys.includes(roleKeyword(stageId))) {
-          return chatResponse(json);
+        if (sys.includes('独立盲审裁判')) {
+          return chatResponse(
+            JSON.stringify({ hasImplicitDowngrade: false, reason: '无功能缩水' }),
+          );
         }
-      }
-      return chatResponse(BASE_STAGE_JSON.STAGE_1_PM);
-    });
+        for (const [stageId, json] of Object.entries(BASE_STAGE_JSON)) {
+          if (sys.includes(stageId) || sys.includes(roleKeyword(stageId))) {
+            return chatResponse(json);
+          }
+        }
+        return chatResponse(BASE_STAGE_JSON.STAGE_1_PM);
+      });
 
-    const runState = await orchestrator.startProposalWorkflow({
-      proposal: new ProjectProposalContract({
-        proposalId: 'AC9-001',
-        title: '双上下文独立对抗协商测试',
-        summary: '挑战方否决后第 2 轮带历史修正并通过',
-        requirements: { R1: '需求1', R2: '需求2' },
-      }),
-      initiatorActor: 'AC9',
-    });
+      const runState = await orchestrator.startProposalWorkflow({
+        proposal: new ProjectProposalContract({
+          proposalId: 'AC9-001',
+          title: '双上下文独立对抗协商测试',
+          summary: '挑战方否决后第 2 轮带历史修正并通过',
+          requirements: { R1: '需求1', R2: '需求2' },
+        }),
+        initiatorActor: 'AC9',
+      });
 
-    const history = orchestrator.negotiationMediator.getNegotiationHistory(runState.runId);
-    assert.equal(history.length, 2);
-    assert.equal(history[0].consensusReached, false);
-    assert.ok(history[0].responseResolution.includes('挑战方独立复核否决'));
-    assert.ok(turn2UserPrompt.includes('拒绝妥协'), '第 2 轮响应方必须收到第 1 轮挑战方否决历史');
-    assert.equal(history[1].consensusReached, true);
-    assert.equal(history[1].escalatedToSupervisor, false);
+      const history = orchestrator.negotiationMediator.getNegotiationHistory(runState.runId);
+      assert.equal(history.length, 2);
+      assert.equal(history[0].consensusReached, false);
+      assert.ok(history[0].responseResolution.includes('挑战方独立复核否决'));
+      assert.ok(turn2UserPrompt.includes('拒绝妥协'), '第 2 轮响应方必须收到第 1 轮挑战方否决历史');
+      assert.equal(history[1].consensusReached, true);
+      assert.equal(history[1].escalatedToSupervisor, false);
+    });
   });
 
   it('AC-10: 双方迎合达成共识时，无历史盲审裁判识破软降级并否决伪共识', async () => {
-    process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
-    const orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 2 });
-    let judgeSawHistory = false;
+    await withTestWorkspace('aqe-ac10-', async (ws) => {
+      process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
+      const orchestrator = new WorkflowOrchestratorFacade({
+        maxNegotiationTurns: 2,
+        persistenceDir: ws.persistenceDir,
+        sandboxRootDir: ws.sandboxRootDir,
+      });
+      let judgeSawHistory = false;
 
-    orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
-      const sys = payload.messages[0].content;
-      const usr = payload.messages[1].content;
-      if (sys.includes('受限协商中的响应方')) {
-        return chatResponse(
-          JSON.stringify({
-            action: 'ACCEPT_AND_PATCH',
-            responseResolution: '双方一致同意先用前端按钮防抖替代并发分布式锁以快速上线',
-            concretePatch: '移除后端锁检查，改用 500ms 防抖',
-            optionAProposal: '方案 A：保分布式锁',
-            optionBProposal: '方案 B：仅前端防抖',
-          }),
-        );
-      }
-      if (sys.includes('挑战方独立复核者')) {
-        // 故意模拟双方共谋迎合
-        return chatResponse(
-          JSON.stringify({
-            accepted: true,
-            critique: '可以接受，先上线再说',
-            containsImplicitScopeCut: false,
-          }),
-        );
-      }
-      if (sys.includes('独立盲审裁判')) {
-        if (usr.includes('历史交锋记录')) {
-          judgeSawHistory = true;
+      orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
+        const sys = payload.messages[0].content;
+        const usr = payload.messages[1].content;
+        if (sys.includes('受限协商中的响应方')) {
+          return chatResponse(
+            JSON.stringify({
+              action: 'ACCEPT_AND_PATCH',
+              responseResolution: '双方一致同意先用前端按钮防抖替代并发分布式锁以快速上线',
+              concretePatch: '移除后端锁检查，改用 500ms 防抖',
+              optionAProposal: '方案 A：保分布式锁',
+              optionBProposal: '方案 B：仅前端防抖',
+            }),
+          );
         }
-        return chatResponse(
-          JSON.stringify({
-            hasImplicitDowngrade: true,
-            reason: '将后端分布式并发锁软降级为前端防抖，实质阉割核心一致性要求',
-          }),
-        );
-      }
-      for (const [stageId, json] of Object.entries(BASE_STAGE_JSON)) {
-        if (sys.includes(stageId) || sys.includes(roleKeyword(stageId))) {
-          return chatResponse(json);
+        if (sys.includes('挑战方独立复核者')) {
+          // 故意模拟双方共谋迎合
+          return chatResponse(
+            JSON.stringify({
+              accepted: true,
+              critique: '可以接受，先上线再说',
+              containsImplicitScopeCut: false,
+            }),
+          );
         }
-      }
-      return chatResponse(BASE_STAGE_JSON.STAGE_1_PM);
-    });
+        if (sys.includes('独立盲审裁判')) {
+          if (usr.includes('历史交锋记录')) {
+            judgeSawHistory = true;
+          }
+          return chatResponse(
+            JSON.stringify({
+              hasImplicitDowngrade: true,
+              reason: '将后端分布式并发锁软降级为前端防抖，实质阉割核心一致性要求',
+            }),
+          );
+        }
+        for (const [stageId, json] of Object.entries(BASE_STAGE_JSON)) {
+          if (sys.includes(stageId) || sys.includes(roleKeyword(stageId))) {
+            return chatResponse(json);
+          }
+        }
+        return chatResponse(BASE_STAGE_JSON.STAGE_1_PM);
+      });
 
-    const runState = await orchestrator.startProposalWorkflow({
-      proposal: new ProjectProposalContract({
-        proposalId: 'AC10-001',
-        title: '防迎合盲审拦截测试',
-        summary: '盲审裁判不看聊天记录直接抓出隐性软降级',
-        requirements: { R1: '需求1', R2: '需求2' },
-      }),
-      initiatorActor: 'AC10',
-    });
+      const runState = await orchestrator.startProposalWorkflow({
+        proposal: new ProjectProposalContract({
+          proposalId: 'AC10-001',
+          title: '防迎合盲审拦截测试',
+          summary: '盲审裁判不看聊天记录直接抓出隐性软降级',
+          requirements: { R1: '需求1', R2: '需求2' },
+        }),
+        initiatorActor: 'AC10',
+      });
 
-    assert.equal(judgeSawHistory, false, '盲审裁判输入不得混入双方协商历史');
-    const history = orchestrator.negotiationMediator.getNegotiationHistory(runState.runId);
-    assert.equal(history.length, 2);
-    assert.equal(history[0].consensusReached, false);
-    assert.equal(history[1].consensusReached, false);
-    assert.equal(history[1].escalatedToSupervisor, true);
-    assert.ok(history[1].responseResolution.includes('防伪共识盲审否决'));
+      assert.equal(judgeSawHistory, false, '盲审裁判输入不得混入双方协商历史');
+      const history = orchestrator.negotiationMediator.getNegotiationHistory(runState.runId);
+      assert.equal(history.length, 2);
+      assert.equal(history[0].consensusReached, false);
+      assert.equal(history[1].consensusReached, false);
+      assert.equal(history[1].escalatedToSupervisor, true);
+      assert.ok(history[1].responseResolution.includes('防伪共识盲审否决'));
+    });
   });
 
   it('AC-11: FalseConsensusGuard.evaluateSemanticInvariants 拦截未删 ID 但软阉割/低报风险/自相矛盾产物', () => {

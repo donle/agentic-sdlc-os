@@ -127,6 +127,55 @@ export class WorkflowEventBus {
     return this.eventHistory.filter((item) => item.runId === runId);
   }
 
+  /** G3：按 runId、stageId 与时间范围倒序分页查询交互事件链 */
+  public getEventHistoryPage(params: {
+    runId: string;
+    stageId?: string;
+    sinceIso?: string;
+    untilIso?: string;
+    offset?: number;
+    limit?: number;
+  }): {
+    readonly total: number;
+    readonly offset: number;
+    readonly limit: number;
+    readonly events: ReadonlyArray<WorkflowDomainEvent>;
+  } {
+    const sinceMs = params.sinceIso ? Date.parse(params.sinceIso) : Number.NaN;
+    const untilMs = params.untilIso ? Date.parse(params.untilIso) : Number.NaN;
+    const filtered = this.eventHistory
+      .filter((item) => {
+        if (item.runId !== params.runId) {
+          return false;
+        }
+        if (params.stageId && item.stageId !== params.stageId) {
+          return false;
+        }
+        if (Number.isFinite(sinceMs) || Number.isFinite(untilMs)) {
+          const ts = Date.parse(item.timestampIso);
+          if (Number.isFinite(sinceMs) && ts < sinceMs) {
+            return false;
+          }
+          if (Number.isFinite(untilMs) && ts > untilMs) {
+            return false;
+          }
+        }
+        return true;
+      })
+      .reverse();
+
+    const offset = Math.max(0, Math.floor(params.offset ?? 0));
+    const rawLimit = Math.floor(params.limit ?? 40);
+    const limit = Math.min(200, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 40));
+
+    return {
+      total: filtered.length,
+      offset,
+      limit,
+      events: filtered.slice(offset, offset + limit),
+    };
+  }
+
   public getNotificationInbox(runId?: string): ReadonlyArray<AgentUserNotification> {
     if (!runId) {
       return [...this.notificationInbox];

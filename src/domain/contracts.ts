@@ -24,6 +24,24 @@ export function containsPlaceholderText(text: string, allowEllipsis = false): bo
 }
 
 /**
+ * 阶段产出的关键决策权衡记录 (G1)
+ */
+export interface ArtifactKeyDecision {
+  readonly decision: string;
+  readonly rationale: string;
+  readonly tradeoffs: ReadonlyArray<string>;
+}
+
+/**
+ * 结构化交付摘要（G6：保留旧 summary 字符串同时提供可解析依据与风险提示）
+ */
+export interface StructuredArtifactSummary {
+  readonly headline: string;
+  readonly rationale: string;
+  readonly caveats: ReadonlyArray<string>;
+}
+
+/**
  * 所有阶段结构化交付物的顶层契约接口
  */
 export interface IDomainArtifactContract {
@@ -33,6 +51,8 @@ export interface IDomainArtifactContract {
   readonly schemaVersion: string;
   readonly summary: string;
   readonly coreRequirementIds: ReadonlyArray<string>;
+  readonly agentRationale?: string;
+  readonly keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
   validateContractIntegrity(): ContractValidationResult;
 }
 
@@ -148,6 +168,8 @@ export class PrdArtifactContract implements IDomainArtifactContract {
     readonly properties: ReadonlyArray<string>;
   }>;
   public readonly nonFunctionalConstraints: ReadonlyArray<string>;
+  public readonly agentRationale?: string;
+  public readonly keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
 
   public constructor(params: {
     summary: string;
@@ -163,12 +185,24 @@ export class PrdArtifactContract implements IDomainArtifactContract {
       properties: ReadonlyArray<string>;
     }>;
     nonFunctionalConstraints: ReadonlyArray<string>;
+    agentRationale?: string;
+    keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
   }) {
     this.summary = params.summary;
     this.coreRequirementIds = [...params.coreRequirementIds];
     this.userStories = [...params.userStories];
     this.trackingPlanEvents = [...params.trackingPlanEvents];
     this.nonFunctionalConstraints = [...params.nonFunctionalConstraints];
+    if (params.agentRationale !== undefined) {
+      this.agentRationale = params.agentRationale;
+    }
+    if (params.keyDecisions !== undefined) {
+      this.keyDecisions = params.keyDecisions.map((d) => ({
+        decision: d.decision,
+        rationale: d.rationale,
+        tradeoffs: [...d.tradeoffs],
+      }));
+    }
   }
 
   public validateContractIntegrity(): ContractValidationResult {
@@ -200,6 +234,8 @@ export class UiDesignArtifactContract implements IDomainArtifactContract {
   }>;
   public readonly accessibilityChecklist: ReadonlyArray<string>;
   public readonly designChallengeNote: string | null;
+  public readonly agentRationale?: string;
+  public readonly keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
 
   public constructor(params: {
     summary: string;
@@ -211,12 +247,25 @@ export class UiDesignArtifactContract implements IDomainArtifactContract {
     }>;
     accessibilityChecklist: ReadonlyArray<string>;
     designChallengeNote?: string | null;
+    agentRationale?: string;
+    keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
   }) {
     this.summary = params.summary;
     this.coreRequirementIds = [...params.coreRequirementIds];
     this.componentMappings = [...params.componentMappings];
     this.accessibilityChecklist = [...params.accessibilityChecklist];
     this.designChallengeNote = params.designChallengeNote ?? null;
+    const effectiveRationale = params.agentRationale ?? params.designChallengeNote ?? undefined;
+    if (effectiveRationale) {
+      this.agentRationale = effectiveRationale;
+    }
+    if (params.keyDecisions !== undefined) {
+      this.keyDecisions = params.keyDecisions.map((d) => ({
+        decision: d.decision,
+        rationale: d.rationale,
+        tradeoffs: [...d.tradeoffs],
+      }));
+    }
   }
 
   public validateContractIntegrity(): ContractValidationResult {
@@ -247,6 +296,8 @@ export class TechSpecArtifactContract implements IDomainArtifactContract {
   public readonly databaseDdlStatements: ReadonlyArray<string>;
   public readonly declaredRiskLevel: BusinessRiskLevel;
   public readonly architecturePatternsUsed: ReadonlyArray<string>;
+  public readonly agentRationale?: string;
+  public readonly keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
 
   public constructor(params: {
     summary: string;
@@ -260,6 +311,8 @@ export class TechSpecArtifactContract implements IDomainArtifactContract {
     databaseDdlStatements: ReadonlyArray<string>;
     declaredRiskLevel: BusinessRiskLevel;
     architecturePatternsUsed: ReadonlyArray<string>;
+    agentRationale?: string;
+    keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
   }) {
     this.summary = params.summary;
     this.coreRequirementIds = [...params.coreRequirementIds];
@@ -267,6 +320,16 @@ export class TechSpecArtifactContract implements IDomainArtifactContract {
     this.databaseDdlStatements = [...params.databaseDdlStatements];
     this.declaredRiskLevel = params.declaredRiskLevel;
     this.architecturePatternsUsed = [...params.architecturePatternsUsed];
+    if (params.agentRationale !== undefined) {
+      this.agentRationale = params.agentRationale;
+    }
+    if (params.keyDecisions !== undefined) {
+      this.keyDecisions = params.keyDecisions.map((d) => ({
+        decision: d.decision,
+        rationale: d.rationale,
+        tradeoffs: [...d.tradeoffs],
+      }));
+    }
   }
 
   public validateContractIntegrity(): ContractValidationResult {
@@ -296,6 +359,8 @@ export class CodeImplementationArtifactContract implements IDomainArtifactContra
     readonly linesChanged: number;
   }>;
   public readonly selfTestPassed: boolean;
+  public readonly agentRationale?: string;
+  public readonly keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
 
   public constructor(params: {
     summary: string;
@@ -308,12 +373,24 @@ export class CodeImplementationArtifactContract implements IDomainArtifactContra
       linesChanged: number;
     }>;
     selfTestPassed: boolean;
+    agentRationale?: string;
+    keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
   }) {
     this.summary = params.summary;
     this.coreRequirementIds = [...params.coreRequirementIds];
     this.gitWorktreeBranch = params.gitWorktreeBranch;
     this.modifiedFiles = [...params.modifiedFiles];
     this.selfTestPassed = params.selfTestPassed;
+    if (params.agentRationale !== undefined) {
+      this.agentRationale = params.agentRationale;
+    }
+    if (params.keyDecisions !== undefined) {
+      this.keyDecisions = params.keyDecisions.map((d) => ({
+        decision: d.decision,
+        rationale: d.rationale,
+        tradeoffs: [...d.tradeoffs],
+      }));
+    }
   }
 
   public validateContractIntegrity(): ContractValidationResult {
@@ -346,6 +423,8 @@ export class QaVerificationArtifactContract implements IDomainArtifactContract {
   }>;
   public readonly securityIssuesFound: number;
   public readonly allAcceptanceCriteriaMet: boolean;
+  public readonly agentRationale?: string;
+  public readonly keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
 
   public constructor(params: {
     summary: string;
@@ -358,12 +437,24 @@ export class QaVerificationArtifactContract implements IDomainArtifactContract {
     }>;
     securityIssuesFound: number;
     allAcceptanceCriteriaMet: boolean;
+    agentRationale?: string;
+    keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
   }) {
     this.summary = params.summary;
     this.coreRequirementIds = [...params.coreRequirementIds];
     this.testSuitesExecuted = [...params.testSuitesExecuted];
     this.securityIssuesFound = params.securityIssuesFound;
     this.allAcceptanceCriteriaMet = params.allAcceptanceCriteriaMet;
+    if (params.agentRationale !== undefined) {
+      this.agentRationale = params.agentRationale;
+    }
+    if (params.keyDecisions !== undefined) {
+      this.keyDecisions = params.keyDecisions.map((d) => ({
+        decision: d.decision,
+        rationale: d.rationale,
+        tradeoffs: [...d.tradeoffs],
+      }));
+    }
   }
 
   public validateContractIntegrity(): ContractValidationResult {
@@ -405,6 +496,8 @@ export class DataAnalysisArtifactContract implements IDomainArtifactContract {
     readonly baselineValue: string;
     readonly targetValue: string;
   }>;
+  public readonly agentRationale?: string;
+  public readonly keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
 
   public constructor(params: {
     summary: string;
@@ -415,11 +508,23 @@ export class DataAnalysisArtifactContract implements IDomainArtifactContract {
       baselineValue: string;
       targetValue: string;
     }>;
+    agentRationale?: string;
+    keyDecisions?: ReadonlyArray<ArtifactKeyDecision>;
   }) {
     this.summary = params.summary;
     this.coreRequirementIds = [...params.coreRequirementIds];
     this.verifiedTrackingEvents = [...params.verifiedTrackingEvents];
     this.projectedMetrics = [...params.projectedMetrics];
+    if (params.agentRationale !== undefined) {
+      this.agentRationale = params.agentRationale;
+    }
+    if (params.keyDecisions !== undefined) {
+      this.keyDecisions = params.keyDecisions.map((d) => ({
+        decision: d.decision,
+        rationale: d.rationale,
+        tradeoffs: [...d.tradeoffs],
+      }));
+    }
   }
 
   public validateContractIntegrity(): ContractValidationResult {

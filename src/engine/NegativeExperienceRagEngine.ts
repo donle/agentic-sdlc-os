@@ -44,11 +44,12 @@ export interface RetrievedNegativeLesson {
 }
 
 export class NegativeExperienceRagEngine {
-  /** 哈希降级向量维度：与 PG `vector(1536)` 对齐（G2 迁移脚本同步改维度） */
-  private static readonly VECTOR_DIM = 1536;
+  /** 默认哈希降级向量维度：未显式配置 RAG_VECTOR_DIM 时保持 1536 维向后兼容 */
+  private static readonly DEFAULT_VECTOR_DIM = 1536;
   private readonly desensitizer: PayloadDesensitizer;
   private readonly records: NegativeExperienceVectorRecord[];
   private readonly embeddingProvider: EmbeddingProvider | null;
+  private readonly vectorDim: number;
   /** 后台升级队列：串行链，避免并发写 records */
   private upgradeChain: Promise<void> = Promise.resolve();
   private pendingUpgradeCount = 0;
@@ -56,18 +57,42 @@ export class NegativeExperienceRagEngine {
   public constructor(
     initialRecords?: ReadonlyArray<NegativeExperienceVectorRecord>,
     embeddingProvider?: EmbeddingProvider | null,
+    vectorDim?: number,
   ) {
     this.desensitizer = new PayloadDesensitizer();
     this.records = initialRecords ? [...initialRecords] : [];
     this.embeddingProvider = embeddingProvider ?? null;
+    this.vectorDim =
+      vectorDim !== undefined && Number.isFinite(vectorDim) && Math.floor(vectorDim) >= 8
+        ? Math.floor(vectorDim)
+        : NegativeExperienceRagEngine.resolveDefaultVectorDim();
+  }
+
+  /** P1-2：读取 RAG_VECTOR_DIM 环境变量（>=8 的合法整数），默认返回 1536 */
+  public static resolveDefaultVectorDim(): number {
+    const raw = process.env.RAG_VECTOR_DIM;
+    if (raw !== undefined && raw.trim() !== '') {
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed) && Math.floor(parsed) >= 8) {
+        return Math.floor(parsed);
+      }
+    }
+    return NegativeExperienceRagEngine.DEFAULT_VECTOR_DIM;
   }
 
   /**
    * 计算文本的哈希降级特征向量（L2 归一化，字符/bigram 局部敏感哈希投影）。
    * 纯确定性、零依赖——离线环境的检索质量底线（M7 兼容路径）。
    */
-  public static computeNormalizedEmbedding(text: string): ReadonlyArray<number> {
-    const vec = new Array<number>(NegativeExperienceRagEngine.VECTOR_DIM).fill(0);
+  public static computeNormalizedEmbedding(
+    text: string,
+    vectorDim?: number,
+  ): ReadonlyArray<number> {
+    const dim =
+      vectorDim !== undefined && Number.isFinite(vectorDim) && Math.floor(vectorDim) >= 8
+        ? Math.floor(vectorDim)
+        : NegativeExperienceRagEngine.resolveDefaultVectorDim();
+    const vec = new Array<number>(dim).fill(0);
     const cleaned = text.toLowerCase().trim();
     if (!cleaned) {
       vec[0] = 1;
@@ -78,8 +103,8 @@ export class NegativeExperienceRagEngine {
     for (let i = 0; i < cleaned.length; i += 1) {
       const code1 = cleaned.charCodeAt(i);
       const code2 = i + 1 < cleaned.length ? cleaned.charCodeAt(i + 1) : 31;
-      const bucketA = (code1 * 31 + code2 * 17) % NegativeExperienceRagEngine.VECTOR_DIM;
-      const bucketB = (code1 * 13 + i * 7) % NegativeExperienceRagEngine.VECTOR_DIM;
+      const bucketA = (code1 * 31 + code2 * 17) % dim;
+      const bucketB = (code1 * 13 + i * 7) % dim;
       vec[bucketA] += 1.0;
       vec[bucketB] += 0.5;
     }
@@ -115,9 +140,10 @@ export class NegativeExperienceRagEngine {
     const desensitized = this.desensitizer.desensitize(rawLessonText);
     const embedding = NegativeExperienceRagEngine.computeNormalizedEmbedding(
       desensitized.sanitizedText,
+      this.vectorDim,
     );
     const record: NegativeExperienceVectorRecord = {
-      recordId: `RAG-LESSON-${this.records.length + 1}-${Date.now()}`,
+      recordId: `RAG-LESSON-${this.records.length + 1}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       stageId,
       desensitizedLesson: desensitized.sanitizedText,
       embedding,
@@ -156,10 +182,16 @@ export class NegativeExperienceRagEngine {
         queryEmbedding = realVector;
         queryIsReal = true;
       } else {
-        queryEmbedding = NegativeExperienceRagEngine.computeNormalizedEmbedding(params.queryText);
+        queryEmbedding = NegativeExperienceRagEngine.computeNormalizedEmbedding(
+          params.queryText,
+          this.vectorDim,
+        );
       }
     } else {
-      queryEmbedding = NegativeExperienceRagEngine.computeNormalizedEmbedding(params.queryText);
+      queryEmbedding = NegativeExperienceRagEngine.computeNormalizedEmbedding(
+        params.queryText,
+        this.vectorDim,
+      );
     }
 
     const scored = stageRecords.map((rec) => {

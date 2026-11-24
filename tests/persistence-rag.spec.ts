@@ -157,6 +157,7 @@ describe('Block 3 — 状态持久化仓储、PostgreSQL pgvector 同步与负�
     try {
       const orchestrator = new WorkflowOrchestratorFacade({
         persistenceDir: tempDir,
+        sandboxRootDir: path.join(tempDir, 'sandbox'),
       });
 
       const proposal = new ProjectProposalContract({

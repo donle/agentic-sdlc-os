@@ -35,6 +35,7 @@ import {
 } from '../telemetry/IntentFulfillmentTracker.ts';
 import { PromptCacheManager } from '../telemetry/PromptCacheManager.ts';
 import { UpstreamCompressor } from './context/UpstreamCompressor.ts';
+import type { TrimmedContext } from './context/ContextBudgetTrimmer.ts';
 import { ToolRegistry } from './context/ToolRegistry.ts';
 import { STAGE_CONTEXT_NEEDS } from './context/types.ts';
 import type { ContextNeed } from './context/types.ts';
@@ -87,6 +88,8 @@ export class AgentExecutionInputContext {
   public readonly tokenBudgetRemaining: number;
   /** 步骤 4：Facade 侧 LLM 意图分析推断的动态上下文需求（类型已过目录白名单；离线为空） */
   public readonly dynamicContextNeeds: ReadonlyArray<ContextNeed>;
+  /** P1-3：经 ContextBudgetTrimmer 裁剪后的外部上下文预算包（非 null 时优先使用，替代未裁剪 runCache） */
+  public readonly trimmedExternalContext: TrimmedContext | null;
 
   public constructor(params: {
     runId: string;
@@ -98,6 +101,7 @@ export class AgentExecutionInputContext {
     scenarioHints?: ScenarioHints;
     tokenBudgetRemaining?: number;
     dynamicContextNeeds?: ReadonlyArray<ContextNeed>;
+    trimmedExternalContext?: TrimmedContext | null;
   }) {
     this.runId = params.runId;
     this.branchId = params.branchId;
@@ -110,6 +114,7 @@ export class AgentExecutionInputContext {
     this.scenarioHints = params.scenarioHints ?? {};
     this.tokenBudgetRemaining = params.tokenBudgetRemaining ?? -1;
     this.dynamicContextNeeds = params.dynamicContextNeeds ?? [];
+    this.trimmedExternalContext = params.trimmedExternalContext ?? null;
   }
 }
 
@@ -493,9 +498,22 @@ export abstract class AbstractWorkerAgent<
           } else {
             const parsedCandidate = parsed.artifact as TArtifact;
             const validation = parsedCandidate.validateContractIntegrity();
+            const postViolations = this.applyLlmPostProcessing(
+              parsedCandidate,
+              lastRawCandidate,
+              context,
+            );
             const stageViolations = this.validateStageSpecificConstraints(parsedCandidate, context);
-            const allViolations = [...validation.getViolations(), ...stageViolations];
-            if (validation.isValid() && stageViolations.length === 0) {
+            const allViolations = [
+              ...validation.getViolations(),
+              ...postViolations,
+              ...stageViolations,
+            ];
+            if (
+              validation.isValid() &&
+              postViolations.length === 0 &&
+              stageViolations.length === 0
+            ) {
               candidate = parsedCandidate;
               violations = [];
               break;
@@ -678,24 +696,45 @@ export abstract class AbstractWorkerAgent<
       })),
     );
 
-    // 外部上下文注入（使用 runCache 已预取的结果；步骤 4：静态声明 + LLM 动态需求合并）
+    // 外部上下文注入（P1-3：优先消费 Facade 经 ContextBudgetTrimmer 裁剪后的 trimmedExternalContext；无注入时回落 runCache）
     const staticNeeds = STAGE_CONTEXT_NEEDS[this.stageId] ?? [];
     const seenTypes = new Set(staticNeeds.map((n) => n.type));
     const dynamicExtras = context.dynamicContextNeeds.filter((n) => !seenTypes.has(n.type));
     const contextNeeds: ReadonlyArray<ContextNeed> = [...staticNeeds, ...dynamicExtras];
-    const externalContexts = contextNeeds
-      .map((need) => {
-        const cachedResult = this.contextRegistry?.getCached(
-          context.runId,
-          need.type,
-          this.stageId,
-        );
-        if (cachedResult) {
-          return { type: need.type, content: cachedResult.content, source: cachedResult.source };
-        }
-        return null;
-      })
-      .filter((c): c is { type: string; content: string; source: string } => c !== null);
+    let externalContexts: Array<{ type: string; content: string; source: string }>;
+    let contextBudgetSummary:
+      | { totalTokens: number; truncated: ReadonlyArray<{ type: string; reason: string }> }
+      | undefined;
+
+    if (context.trimmedExternalContext !== null) {
+      externalContexts = context.trimmedExternalContext.included
+        .filter((item) => item.result !== null)
+        .map((item) => ({
+          type: item.need.type,
+          content: item.result!.content,
+          source: item.result!.source,
+        }));
+      if (context.trimmedExternalContext.truncated.length > 0) {
+        contextBudgetSummary = {
+          totalTokens: context.trimmedExternalContext.totalTokens,
+          truncated: context.trimmedExternalContext.truncated,
+        };
+      }
+    } else {
+      externalContexts = contextNeeds
+        .map((need) => {
+          const cachedResult = this.contextRegistry?.getCached(
+            context.runId,
+            need.type,
+            this.stageId,
+          );
+          if (cachedResult) {
+            return { type: need.type, content: cachedResult.content, source: cachedResult.source };
+          }
+          return null;
+        })
+        .filter((c): c is { type: string; content: string; source: string } => c !== null);
+    }
 
     const repairMode = attemptIndex > 0 && previousCandidate ? 'TARGETED_PATCH' : undefined;
     const previousValidKeys =
@@ -708,6 +747,7 @@ export abstract class AbstractWorkerAgent<
       proposal: context.proposal.toSerializableRecord(),
       upstreamDigests, // 压缩后的上游摘要（非全文）
       externalContext: externalContexts.length > 0 ? externalContexts : undefined,
+      contextBudgetSummary,
       sandboxVerification: stageEnvironment ?? undefined,
       rejectionLessons: context.historicalRejectionLessons.slice(0, 5),
       humanDirective: context.humanFeedbackDirective,
@@ -757,6 +797,48 @@ export abstract class AbstractWorkerAgent<
     _context: AgentExecutionInputContext,
   ): Record<string, unknown> | null {
     return null;
+  }
+
+  /**
+   * P0-4：为多 run 并发隔离构造阶段准备缓存键（runId + branchId + humanFeedbackDirective）
+   */
+  protected buildPreparedContextKey(context: AgentExecutionInputContext): string {
+    return `${context.runId}::${context.branchId}::${context.humanFeedbackDirective ?? ''}`;
+  }
+
+  /**
+   * P0-4：有界 Map 写入辅助（避免并发执行多 run 时以单实例字段互相覆盖或无限增长）
+   */
+  protected saveBoundedPreparedState<TValue>(
+    store: Map<string, TValue>,
+    key: string,
+    value: TValue,
+    maxEntries = 64,
+  ): TValue {
+    if (store.has(key)) {
+      store.delete(key);
+    }
+    store.set(key, value);
+    while (store.size > maxEntries) {
+      const oldestKey = store.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      store.delete(oldestKey);
+    }
+    return value;
+  }
+
+  /**
+   * 子类钩子（可选）：在 LLM 输出解析完成后执行后置副作用（如 Stage 3b 将 `filePatches` 写入 Worktree 并重跑自测），
+   * 返回违规描述数组（空数组 = 后置处理通过）。
+   */
+  protected applyLlmPostProcessing(
+    _candidate: TArtifact,
+    _rawCandidate: Record<string, unknown>,
+    _context: AgentExecutionInputContext,
+  ): ReadonlyArray<string> {
+    return [];
   }
 
   /**

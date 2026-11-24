@@ -203,4 +203,99 @@ describe('I3 — worktree 保留策略', () => {
       }
     }
   });
+
+  it('6. P1-3：worktree 保留清理扫描必须排除 docker-results/ 与隐藏目录', () => {
+    const tempSandboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-p13-dockerres-'));
+    try {
+      const dockerResultsDir = path.join(tempSandboxRoot, 'docker-results', 'RUN-1');
+      fs.mkdirSync(dockerResultsDir, { recursive: true });
+      fs.writeFileSync(path.join(dockerResultsDir, 'report.txt'), 'ok', 'utf-8');
+      const oldDate = new Date(Date.UTC(2020, 0, 1));
+      fs.utimesSync(path.join(tempSandboxRoot, 'docker-results'), oldDate, oldDate);
+
+      for (const runName of ['RUN-A', 'RUN-B']) {
+        const d = path.join(tempSandboxRoot, runName);
+        fs.mkdirSync(d, { recursive: true });
+      }
+
+      const manager = new GitWorktreeSandboxManager(tempSandboxRoot);
+      const result = manager.enforceWorktreeRetention({ keepLastN: 1 });
+      assert.equal(result.removedRunIds.includes('docker-results'), false);
+      assert.equal(result.retainedRunIds.includes('docker-results'), false);
+      assert.equal(fs.existsSync(dockerResultsDir), true, 'docker-results 目录及其成果不得被清理');
+    } finally {
+      fs.rmSync(tempSandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('7. P1-3：COMPLETED 终态触发 worktree 保留清理并调用 clearRunCache(runId)', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-p13-completed-'));
+    const prevRetention = process.env.SANDBOX_WORKTREE_RETENTION;
+    try {
+      process.env.SANDBOX_WORKTREE_RETENTION = '1';
+      const sandboxRoot = path.join(tmpDir, 'sandbox');
+      const persistDir = path.join(tmpDir, 'persist');
+      const staleRunDir = path.join(sandboxRoot, 'RUN-STALE-1');
+      const freshRunDir = path.join(sandboxRoot, 'RUN-FRESH-1');
+      fs.mkdirSync(staleRunDir, { recursive: true });
+      fs.mkdirSync(freshRunDir, { recursive: true });
+      fs.utimesSync(staleRunDir, new Date(Date.UTC(2022, 0, 1)), new Date(Date.UTC(2022, 0, 1)));
+
+      const shortYamlPath = path.join(tmpDir, 'short-complete.yaml');
+      fs.writeFileSync(
+        shortYamlPath,
+        [
+          'workflow:',
+          '  id: "short_complete_p13"',
+          '  name: "单阶段完结测试"',
+          '  guardrails:',
+          '    maxNegotiationTurns: 2',
+          '    maxExecutionRetries: 1',
+          '    tokenBudgetLimit: 50000',
+          '    highRiskScoreThreshold: 99',
+          '  stages:',
+          '    - stageId: "STAGE_1_PM"',
+          '      agentRole: "PM_AGENT"',
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const orchestrator = new WorkflowOrchestratorFacade({
+        sandboxRootDir: sandboxRoot,
+        persistenceDir: persistDir,
+      });
+      orchestrator.reloadWorkflowDsl(shortYamlPath);
+
+      // 预写入另一运行 cache，确认不会因当前 run COMPLETED 被误删
+      const registry = orchestrator.getContextRegistry()!;
+      const proposal = new ProjectProposalContract({
+        proposalId: 'PROP-P13-COMP',
+        title: '终态完成清理验证',
+        summary: '单阶段低风险自动放行直达 COMPLETED',
+        requirements: { REQ_COMP: '完成清理钩子' },
+      });
+      await registry.resolve([{ type: 'dependency_versions', required: true, maxTokens: 500 }], {
+        runId: 'RUN-ALIVE',
+        stageId: WorkflowStageId.STAGE_3B_ENGINEER,
+        proposal,
+        upstreamSummaries: [],
+      });
+
+      const runState = await orchestrator.startProposalWorkflow({
+        proposal,
+        initiatorActor: '终态验证',
+      });
+      assert.equal(runState.getStatus(), 'COMPLETED');
+      assert.equal(fs.existsSync(staleRunDir), false, 'COMPLETED 终态应触发清理陈旧 worktree');
+      assert.equal(registry.getCacheEntryCount(runState.runId), 0, 'COMPLETED 后应清空本 run 缓存');
+      assert.ok(registry.getCacheEntryCount('RUN-ALIVE') > 0, '其他活跃 run 缓存不受影响');
+    } finally {
+      if (prevRetention === undefined) {
+        delete process.env.SANDBOX_WORKTREE_RETENTION;
+      } else {
+        process.env.SANDBOX_WORKTREE_RETENTION = prevRetention;
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

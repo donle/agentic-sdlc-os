@@ -15,6 +15,31 @@ import { AgentRole, IntentFulfillmentStatus, WorkflowStageId } from '../domain/e
  * 单次 Agent 意图识别与执行追踪记录实体
  */
 export class IntentExecutionTraceRecord {
+  public static fromJSON(raw: Record<string, unknown>): IntentExecutionTraceRecord {
+    const retryReasons = Array.isArray(raw.retryReasons)
+      ? raw.retryReasons.map((item) => String(item))
+      : [];
+    return new IntentExecutionTraceRecord({
+      traceId: String(raw.traceId ?? ''),
+      runId: String(raw.runId ?? ''),
+      branchId: String(raw.branchId ?? ''),
+      stageId: String(raw.stageId ?? WorkflowStageId.STAGE_1_PM) as WorkflowStageId,
+      agentRole: String(raw.agentRole ?? AgentRole.PRODUCT_MANAGER) as AgentRole,
+      recognizedIntentCode: String(raw.recognizedIntentCode ?? ''),
+      intentConfidence: Number(raw.intentConfidence ?? 0),
+      retryCount: Number(raw.retryCount ?? 0),
+      retryReasons,
+      cacheHit: Boolean(raw.cacheHit),
+      fulfillmentStatus: String(
+        raw.fulfillmentStatus ?? IntentFulfillmentStatus.FULFILLED_ON_FIRST_TRY,
+      ) as IntentFulfillmentStatus,
+      tokensConsumed: Number(raw.tokensConsumed ?? 0),
+      retryOverheadTokens: Number(raw.retryOverheadTokens ?? 0),
+      costUsd: Number(raw.costUsd ?? 0),
+      timestampIso: raw.timestampIso ? String(raw.timestampIso) : undefined,
+    });
+  }
+
   public readonly traceId: string;
   public readonly runId: string;
   public readonly branchId: string;
@@ -46,6 +71,7 @@ export class IntentExecutionTraceRecord {
     tokensConsumed: number;
     retryOverheadTokens: number;
     costUsd: number;
+    timestampIso?: string;
   }) {
     this.traceId = params.traceId;
     this.runId = params.runId;
@@ -61,7 +87,27 @@ export class IntentExecutionTraceRecord {
     this.tokensConsumed = params.tokensConsumed;
     this.retryOverheadTokens = params.retryOverheadTokens;
     this.costUsd = params.costUsd;
-    this.timestampIso = new Date().toISOString();
+    this.timestampIso = params.timestampIso ?? new Date().toISOString();
+  }
+
+  public toSerializableRecord(): Record<string, unknown> {
+    return {
+      traceId: this.traceId,
+      runId: this.runId,
+      branchId: this.branchId,
+      stageId: this.stageId,
+      agentRole: this.agentRole,
+      recognizedIntentCode: this.recognizedIntentCode,
+      intentConfidence: this.intentConfidence,
+      retryCount: this.retryCount,
+      retryReasons: [...this.retryReasons],
+      cacheHit: this.cacheHit,
+      fulfillmentStatus: this.fulfillmentStatus,
+      tokensConsumed: this.tokensConsumed,
+      retryOverheadTokens: this.retryOverheadTokens,
+      costUsd: this.costUsd,
+      timestampIso: this.timestampIso,
+    };
   }
 
   public isFulfilled(): boolean {
@@ -160,6 +206,14 @@ export class IntentFulfillmentTracker {
   }
 
   public recordTrace(trace: IntentExecutionTraceRecord): void {
+    this.traces.push(trace);
+  }
+
+  /** P1-2：从持久化快照幂等恢复执行追踪记录 */
+  public restoreTrace(trace: IntentExecutionTraceRecord): void {
+    if (!trace.traceId || this.traces.some((t) => t.traceId === trace.traceId)) {
+      return;
+    }
     this.traces.push(trace);
   }
 

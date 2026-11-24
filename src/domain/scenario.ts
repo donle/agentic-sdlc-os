@@ -17,6 +17,8 @@ export interface ScenarioHints {
   readonly forceTransientRetry?: boolean;
   /** B2 演示：QA 验证注入未通过缺陷，驱动 Engineer 修复闭环（自动打回 3b → 超限仲裁） */
   readonly forceQaFailure?: boolean;
+  /** G4：开启扩展跨角色协商（让 Stage 1 PM↔DA 与 Stage 3a TechLead↔Eng 也产出真实协商记录） */
+  readonly enableExtendedPeerNegotiation?: boolean;
 }
 
 export function emptyScenarioHints(): ScenarioHints {
@@ -28,6 +30,9 @@ export function hasAnyHint(hints: ScenarioHints | undefined): boolean {
     return false;
   }
   return Boolean(
-    hints.forceNegotiationDeadlock || hints.forceScopeReduction || hints.forceTransientRetry,
+    hints.forceNegotiationDeadlock ||
+    hints.forceScopeReduction ||
+    hints.forceTransientRetry ||
+    hints.enableExtendedPeerNegotiation,
   );
 }

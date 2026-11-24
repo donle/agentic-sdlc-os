@@ -17,18 +17,26 @@ import * as path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { ProjectProposalContract } from '../src/domain/contracts.ts';
-import { DecisionVerdict, WorkflowStageId } from '../src/domain/enums.ts';
+import {
+  AgentRole,
+  DecisionVerdict,
+  IntentFulfillmentStatus,
+  WorkflowStageId,
+} from '../src/domain/enums.ts';
+import { NegativeExperienceRagEngine } from '../src/engine/NegativeExperienceRagEngine.ts';
 import { PersistenceRepository } from '../src/engine/PersistenceRepository.ts';
 import { WorkflowDslConfiguration, WorkflowDslLoader } from '../src/engine/WorkflowDslLoader.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
 import {
   buildPgUpsertSql,
   PgPersistenceDriver,
+  type PgAsyncSqlExecutor,
   type PgSqlExecutor,
   selectPersistenceDriver,
 } from '../src/engine/pg/PgPersistenceDriver.ts';
 import { SessionService } from '../src/server/auth/SessionService.ts';
 import { JsonUserStore, PgUserStore, selectUserStore } from '../src/server/auth/UserStore.ts';
+import { IntentExecutionTraceRecord } from '../src/telemetry/IntentFulfillmentTracker.ts';
 
 type SqlToken = string | number | boolean | null;
 
@@ -182,6 +190,10 @@ function createFakePgLedgerExecutor(): {
     decisions: Map<string, Record<string, unknown>>;
     rag: Map<string, Record<string, unknown>>;
     comments: Map<string, Record<string, unknown>>;
+    notifications: Map<string, Record<string, unknown>>;
+    liveEvents: Map<string, Record<string, unknown>>;
+    auditEntries: Map<string, Record<string, unknown>>;
+    runtimeState: Map<string, Record<string, unknown>>;
   };
 } {
   const capturedSql: string[] = [];
@@ -192,6 +204,10 @@ function createFakePgLedgerExecutor(): {
     decisions: new Map<string, Record<string, unknown>>(),
     rag: new Map<string, Record<string, unknown>>(),
     comments: new Map<string, Record<string, unknown>>(),
+    notifications: new Map<string, Record<string, unknown>>(),
+    liveEvents: new Map<string, Record<string, unknown>>(),
+    auditEntries: new Map<string, Record<string, unknown>>(),
+    runtimeState: new Map<string, Record<string, unknown>>(),
   };
 
   const executor: PgSqlExecutor = (sql, options) => {
@@ -204,6 +220,10 @@ function createFakePgLedgerExecutor(): {
         human_decisions: [...tables.decisions.values()],
         rejected_history_rag: [...tables.rag.values()],
         team_comments: [...tables.comments.values()],
+        notifications: [...tables.notifications.values()],
+        live_events: [...tables.liveEvents.values()],
+        audit_entries: [...tables.auditEntries.values()],
+        system_runtime_state: [...tables.runtimeState.values()],
       });
     }
 
@@ -216,6 +236,8 @@ function createFakePgLedgerExecutor(): {
       switch (parsed.table) {
         case 'workflow_runs': {
           const id = String(v[0]);
+          const prev = tables.runs.get(id);
+          const nextUserId = v[10] ? String(v[10]) : (prev?.created_by_user_id ?? null);
           tables.runs.set(id, {
             id,
             title: String(v[1]),
@@ -227,6 +249,7 @@ function createFakePgLedgerExecutor(): {
             status: String(v[7]),
             created_by: String(v[8]),
             created_at: String(v[9]),
+            created_by_user_id: nextUserId,
           });
           break;
         }
@@ -274,6 +297,7 @@ function createFakePgLedgerExecutor(): {
               decision_type: String(v[4]),
               comment: String(v[5]),
               created_at: String(v[6]),
+              reviewer_user_id: v[7] ? String(v[7]) : null,
             });
           }
           break;
@@ -286,6 +310,8 @@ function createFakePgLedgerExecutor(): {
             desensitized_lesson: String(v[2]),
             embedding: String(v[3]),
             created_at: String(v[4]),
+            embedding_dim: Number(v[5] ?? 1536),
+            embedding_source: String(v[6] ?? 'HASH_FALLBACK'),
           });
           break;
         }
@@ -307,6 +333,67 @@ function createFakePgLedgerExecutor(): {
           }
           break;
         }
+        case 'notifications': {
+          const id = String(v[0]);
+          tables.notifications.set(id, {
+            id,
+            run_id: String(v[1]),
+            branch_id: String(v[2]),
+            stage_id: String(v[3]),
+            sender_role: String(v[4]),
+            category: String(v[5]),
+            title: String(v[6]),
+            message: String(v[7]),
+            related_snapshot_id: String(v[8]),
+            requires_human_action: Boolean(v[9]),
+            resolved: Boolean(v[10]),
+            action_options: JSON.parse(String(v[11] ?? '[]')),
+            created_at: String(v[12]),
+          });
+          break;
+        }
+        case 'live_events': {
+          const id = String(v[0]);
+          if (!tables.liveEvents.has(id)) {
+            tables.liveEvents.set(id, {
+              id,
+              run_id: String(v[1]),
+              branch_id: String(v[2]),
+              stage_id: String(v[3]),
+              agent_role: String(v[4]),
+              lifecycle_state: String(v[5]),
+              headline: String(v[6]),
+              detail_payload: JSON.parse(String(v[7] ?? '{}')),
+              created_at: String(v[8]),
+            });
+          }
+          break;
+        }
+        case 'audit_entries': {
+          const id = String(v[0]);
+          if (!tables.auditEntries.has(id)) {
+            tables.auditEntries.set(id, {
+              id,
+              run_id: String(v[1]),
+              branch_id: String(v[2]),
+              stage_id: String(v[3]),
+              actor: String(v[4]),
+              action_type: String(v[5]),
+              summary: String(v[6]),
+              metadata: JSON.parse(String(v[7] ?? '{}')),
+              created_at: String(v[8]),
+            });
+          }
+          break;
+        }
+        case 'system_runtime_state': {
+          const stateKey = String(v[0]);
+          tables.runtimeState.set(stateKey, {
+            state_key: stateKey,
+            payload: JSON.parse(String(v[1] ?? '{}')),
+          });
+          break;
+        }
         default:
           break;
       }
@@ -320,6 +407,8 @@ function createFakePgLedgerExecutor(): {
 /** 创建模拟 PG 用户库执行器：处理 users / user_owned_stages / auth_sessions / auth_login_audit */
 function createFakePgAuthExecutor(): {
   executor: PgSqlExecutor;
+  readCount: { value: number };
+  writeCount: { value: number };
   users: Map<string, Record<string, unknown>>;
   ownedStages: Map<string, Set<string>>;
   sessions: Map<string, Record<string, unknown>>;
@@ -328,9 +417,12 @@ function createFakePgAuthExecutor(): {
     username: string;
     success: boolean;
     reason: string;
+    ip: string | null;
     createdAtIso: string;
   }>;
 } {
+  const readCount = { value: 0 };
+  const writeCount = { value: 0 };
   const users = new Map<string, Record<string, unknown>>();
   const ownedStages = new Map<string, Set<string>>();
   const sessions = new Map<string, Record<string, unknown>>();
@@ -339,11 +431,13 @@ function createFakePgAuthExecutor(): {
     username: string;
     success: boolean;
     reason: string;
+    ip: string | null;
     createdAtIso: string;
   }> = [];
 
   const executor: PgSqlExecutor = (sql, options) => {
     if (options?.readOnly) {
+      readCount.value += 1;
       if (sql.includes('FROM users u')) {
         const list = [...users.values()].map((u) => ({
           ...u,
@@ -371,6 +465,7 @@ function createFakePgAuthExecutor(): {
       }
     }
 
+    writeCount.value += 1;
     let lastReturn = '';
     for (const stmt of splitSqlStatements(sql)) {
       if (/^DELETE\s+FROM\s+user_owned_stages/i.test(stmt)) {
@@ -383,11 +478,15 @@ function createFakePgAuthExecutor(): {
       if (/^UPDATE\s+auth_sessions/i.test(stmt)) {
         const expMatch = stmt.match(/expires_at\s*=\s*'([^']+)'::timestamptz/);
         const hashMatch = stmt.match(/token_hash\s*=\s*'([^']+)'/);
+        const ipMatch = stmt.match(/,\s*ip\s*=\s*'([^']*)'/);
+        const uaMatch = stmt.match(/,\s*user_agent\s*=\s*'([^']*)'/);
         if (hashMatch && expMatch && sessions.has(hashMatch[1])) {
           const existing = sessions.get(hashMatch[1])!;
           sessions.set(hashMatch[1], {
             ...existing,
             expiresAt: Date.parse(expMatch[1]),
+            ...(ipMatch ? { ip: ipMatch[1] } : {}),
+            ...(uaMatch ? { userAgent: uaMatch[1] } : {}),
           });
         }
         continue;
@@ -447,6 +546,8 @@ function createFakePgAuthExecutor(): {
           userId: String(v[1]),
           impersonatedBy: v[2] ? String(v[2]) : null,
           expiresAt: Date.parse(String(v[5])),
+          ip: v[6] ? String(v[6]) : null,
+          userAgent: v[7] ? String(v[7]) : null,
         });
       } else if (parsed.table === 'auth_login_audit') {
         const id = loginAudits.length + 1;
@@ -456,6 +557,7 @@ function createFakePgAuthExecutor(): {
           success: Boolean(v[1]),
           reason: String(v[2]),
           createdAtIso: String(v[3]),
+          ip: v[4] ? String(v[4]) : null,
         });
         lastReturn = String(id);
       }
@@ -463,7 +565,7 @@ function createFakePgAuthExecutor(): {
     return lastReturn;
   };
 
-  return { executor, users, ownedStages, sessions, loginAudits };
+  return { executor, readCount, writeCount, users, ownedStages, sessions, loginAudits };
 }
 
 describe('AUDIT-8 / D2 — PostgreSQL 全量同步、PgPersistenceDriver 与 PgUserStore 验收测试', () => {
@@ -696,7 +798,7 @@ describe('AUDIT-8 / D2 — PostgreSQL 全量同步、PgPersistenceDriver 与 PgU
     }
   });
 
-  it('4. deploy/init-pgvector-schema.sql 应包含全部 10 张业务/用户表与双轨关联 ALTER TABLE 语句', () => {
+  it('4. deploy/init-pgvector-schema.sql 应包含全部 14 张业务/用户/事件通知表、变长 RAG 向量与双轨关联 ALTER TABLE 语句', () => {
     const schemaPath = path.resolve(process.cwd(), 'deploy', 'init-pgvector-schema.sql');
     const sql = fs.readFileSync(schemaPath, 'utf-8');
     const requiredTables = [
@@ -710,10 +812,20 @@ describe('AUDIT-8 / D2 — PostgreSQL 全量同步、PgPersistenceDriver 与 PgU
       'auth_sessions',
       'auth_login_audit',
       'team_comments',
+      'notifications',
+      'live_events',
+      'audit_entries',
+      'system_runtime_state',
     ];
     for (const table of requiredTables) {
       assert.ok(sql.includes(`CREATE TABLE IF NOT EXISTS ${table}`), `Schema 缺失表定义: ${table}`);
     }
+    assert.ok(
+      sql.includes('embedding vector NOT NULL'),
+      'rejected_history_rag 应使用变长 vector 列兼容 1024/1536 维模型',
+    );
+    assert.ok(sql.includes('embedding_dim'), 'Schema 应记录 embedding_dim');
+    assert.ok(sql.includes('embedding_source'), 'Schema 应记录 embedding_source');
     assert.ok(
       sql.includes('ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS created_by_user_id'),
       'Schema 缺失 workflow_runs.created_by_user_id 外键列',
@@ -806,5 +918,337 @@ describe('AUDIT-8 / D2 — PostgreSQL 全量同步、PgPersistenceDriver 与 PgU
       }
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it('6. P1-2：删除本地 ledger-store.json 与全部 WAL 文件后，纯 PG 恢复 notifications / liveEvents / auditEntries / 双轨 FK / governance / cacheTelemetry / intentTraces', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p12-pure-pg-'));
+    const persistDir = path.join(tempDir, 'persist');
+    const sandboxDir = path.join(tempDir, 'sandbox');
+    try {
+      const fakePg = createFakePgLedgerExecutor();
+      const pgDriver = new PgPersistenceDriver('postgres://fake/db', fakePg.executor);
+
+      const facade1 = new WorkflowOrchestratorFacade({
+        persistenceDir: persistDir,
+        sandboxRootDir: sandboxDir,
+        persistenceDriver: pgDriver,
+      });
+
+      const proposal = new ProjectProposalContract({
+        proposalId: 'PROP-P12-PG-ONLY',
+        title: '纯 PG 容器重启恢复一致性验证',
+        summary: '验证 notifications/live_events/audit_entries 与配置遥测从 PG 恢复',
+        requirements: {
+          REQ_P12_A: '保留门禁通知卡与时间轴',
+          REQ_P12_B: '保留双轨外键与治理参数',
+        },
+        involvesDatabaseMigration: true,
+      });
+
+      const run1 = await facade1.startProposalWorkflow({
+        proposal,
+        initiatorActor: '陈工 (PM)',
+        initiatorUserId: 'user-pm-01',
+        scenarioHints: { forceNegotiationDeadlock: true },
+      });
+
+      facade1.updateAdminGovernanceConfig({
+        actorUserId: 'user-admin-01',
+        maxNegotiationTurns: 5,
+        highRiskScoreThreshold: 72,
+        allowSpecialistCrossStageRollback: true,
+      });
+      facade1.fulfillmentTracker.recordTrace(
+        new IntentExecutionTraceRecord({
+          traceId: 'TRC-P12-PG-1',
+          runId: run1.runId,
+          branchId: run1.getActiveBranchId(),
+          stageId: WorkflowStageId.STAGE_1_PM,
+          agentRole: AgentRole.PRODUCT_MANAGER,
+          recognizedIntentCode: 'PM_ANALYSIS',
+          intentConfidence: 0.96,
+          retryCount: 0,
+          retryReasons: [],
+          cacheHit: true,
+          fulfillmentStatus: IntentFulfillmentStatus.FULFILLED_VIA_CACHE,
+          tokensConsumed: 0,
+          retryOverheadTokens: 0,
+          costUsd: 0,
+        }),
+      );
+
+      const pendingSnap = run1.getLatestSnapshotOnActiveBranch();
+      assert.ok(pendingSnap);
+      await facade1.submitHumanGateDecision({
+        runId: run1.runId,
+        snapshotId: pendingSnap.snapshotId,
+        reviewerActor: '林工 (PD/UX)',
+        actorUserId: 'user-pd-01',
+        verdict: DecisionVerdict.ARBITRATE_OPTION_A,
+        comment: '采纳标准组件方案 A',
+      });
+
+      const notifCountBefore = facade1.eventBus.getNotificationInbox(run1.runId).length;
+      const eventCountBefore = facade1.eventBus.getEventHistory(run1.runId).length;
+      const auditCountBefore = facade1.auditLedger.getAuditTimeline(run1.runId).length;
+      const cacheBefore = facade1.cacheManager.getMetricsSnapshot();
+
+      assert.ok(fakePg.tables.notifications.size >= notifCountBefore);
+      assert.ok(fakePg.tables.liveEvents.size >= eventCountBefore);
+      assert.ok(fakePg.tables.auditEntries.size >= auditCountBefore);
+      assert.equal(fakePg.tables.runs.get(run1.runId)?.created_by_user_id, 'user-pm-01');
+
+      // 彻底清除本地 .runtime-data JSON + 月度 WAL，模拟纯 PG 无状态容器重建
+      fs.rmSync(persistDir, { recursive: true, force: true });
+      fs.mkdirSync(persistDir, { recursive: true });
+
+      const facade2 = new WorkflowOrchestratorFacade({
+        persistenceDir: persistDir,
+        sandboxRootDir: sandboxDir,
+        persistenceDriver: pgDriver,
+      });
+      const restored = facade2.restoreFromPersistence();
+      assert.equal(restored.restored, true);
+      assert.ok(restored.runIds.includes(run1.runId));
+
+      const run2 = facade2.stateEngine.getRunOrThrow(run1.runId);
+      assert.equal(run2.createdByUserId, 'user-pm-01');
+      assert.equal(
+        facade2.auditLedger
+          .getHumanDecisions(run1.runId)
+          .some((d) => d.reviewerUserId === 'user-pd-01'),
+        true,
+      );
+      assert.equal(facade2.eventBus.getNotificationInbox(run1.runId).length, notifCountBefore);
+      assert.equal(facade2.eventBus.getEventHistory(run1.runId).length, eventCountBefore);
+      assert.equal(facade2.auditLedger.getAuditTimeline(run1.runId).length, auditCountBefore);
+      assert.equal(facade2.negotiationMediator.getMaxNegotiationTurns(), 5);
+      assert.equal(facade2.riskPipeline.getHighRiskThreshold(), 72);
+      assert.equal(facade2.rbacService.isCrossStageRollbackAllowedForSpecialists(), true);
+      assert.equal(
+        facade2.cacheManager.getMetricsSnapshot().totalLookups,
+        cacheBefore.totalLookups,
+      );
+      assert.equal(
+        facade2.fulfillmentTracker.getTraces(run1.runId).some((t) => t.traceId === 'TRC-P12-PG-1'),
+        true,
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('7. P1-2：RAG_VECTOR_DIM=1024 与 1536 维混存 PG 无维数冲突，pinnedVectorDim 可按需对齐', () => {
+    const prevDim = process.env.RAG_VECTOR_DIM;
+    try {
+      process.env.RAG_VECTOR_DIM = '1024';
+      const rag1024 = new NegativeExperienceRagEngine();
+      const rec1024 = rag1024.ingestRejectionLesson(
+        WorkflowStageId.STAGE_3A_TECH_SPEC,
+        'bge-m3 1024 维经验',
+      );
+      assert.equal(rec1024.embedding.length, 1024);
+
+      const rag1536 = new NegativeExperienceRagEngine(undefined, null, 1536);
+      const rec1536 = rag1536.ingestRejectionLesson(
+        WorkflowStageId.STAGE_3A_TECH_SPEC,
+        'legacy 1536 维经验',
+      );
+      assert.equal(rec1536.embedding.length, 1536);
+
+      const fakePg = createFakePgLedgerExecutor();
+      const driver = new PgPersistenceDriver('postgres://fake/db', fakePg.executor);
+      driver.saveFullState({
+        schemaVersion: '1.1.0',
+        lastSyncedAtIso: new Date().toISOString(),
+        runs: [
+          {
+            runId: 'RUN-VEC-MIX',
+            title: '向量混存验证',
+            workflowTemplateId: 'enterprise_standard_sdlc_v1',
+            activeBranchId: 'branch-v1-main',
+            status: 'RUNNING',
+            initiatorActor: '测试',
+            createdAtIso: new Date().toISOString(),
+            proposal: {},
+            stagePipeline: ['STAGE_1_PM'],
+            currentStageIndex: 0,
+            branchCounter: 1,
+            branchHistory: ['branch-v1-main'],
+            tokensUsedTotal: 0,
+            scenarioHints: {},
+          },
+        ],
+        snapshots: [],
+        negotiationLogs: [],
+        humanDecisions: [],
+        negativeExperienceRecords: [rec1024, rec1536],
+      });
+
+      assert.equal(fakePg.tables.rag.get(rec1024.recordId)?.embedding_dim, 1024);
+      assert.equal(fakePg.tables.rag.get(rec1536.recordId)?.embedding_dim, 1536);
+
+      const loaded = driver.loadFullState();
+      assert.ok(loaded);
+      assert.equal(loaded.negativeExperienceRecords[0].embedding.length, 1024);
+      assert.equal(loaded.negativeExperienceRecords[1].embedding.length, 1536);
+
+      // 若显式启用 pinnedVectorDim=1536，1024 维自动零填充归一化而不报错
+      const pinnedSql = buildPgUpsertSql(loaded, { pinnedVectorDim: 1536 });
+      assert.ok(pinnedSql.includes(', 1536, '));
+      assert.equal(pinnedSql.includes(', 1024, '), false);
+    } finally {
+      if (prevDim === undefined) {
+        delete process.env.RAG_VECTOR_DIM;
+      } else {
+        process.env.RAG_VECTOR_DIM = prevDim;
+      }
+    }
+  });
+
+  it('8. P1-2：JsonUserStore 会话（含 IP/UA）与登录审计落盘持久化，重启后保留有效会话与吊销状态', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p12-json-auth-'));
+    try {
+      const usersPath = path.join(tempDir, 'users.json');
+      const store1 = new JsonUserStore(usersPath);
+      const svc1 = new SessionService(store1);
+
+      const badRes = svc1.login('admin', 'wrongpass', {
+        ip: '10.1.2.3',
+        userAgent: 'TestAgent/1.0',
+      });
+      assert.equal(badRes.ok, false);
+      const login1 = svc1.login('admin', 'admin', {
+        ip: '203.0.113.10',
+        userAgent: 'Mozilla/5.0 P12Browser',
+      }) as { ok: true; token: string };
+      const login2 = svc1.login('admin', 'admin', {
+        ip: '203.0.113.11',
+        userAgent: 'curl/8.0',
+      }) as { ok: true; token: string };
+      svc1.logout(login2.token);
+
+      assert.equal(fs.existsSync(path.join(tempDir, 'auth-sessions.json')), true);
+      assert.equal(fs.existsSync(path.join(tempDir, 'auth-login-audit.jsonl')), true);
+
+      // 重启恢复
+      const store2 = new JsonUserStore(usersPath);
+      const svc2 = new SessionService(store2);
+      assert.equal(svc2.validate(login2.token), null, '已登出令牌跨重启保持失效');
+      assert.equal(svc2.validate(login1.token)?.userId, 'user-admin-01');
+
+      const audits = svc2.getLoginAudit({ username: 'admin', limit: 10 });
+      assert.equal(audits.length, 3);
+      assert.ok(audits.some((a) => a.reason === 'BAD_PASSWORD' && a.ip === '10.1.2.3'));
+      assert.ok(audits.some((a) => a.reason === 'OK' && a.ip === '203.0.113.10'));
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('9. P1-2：PgUserStore 会话 TTL 缓存 + 续期节流 + 吊销瞬时驱逐 + PgUserStore/PgPersistenceDriver 非阻塞异步写入队列合并', async () => {
+    const fakeAuth = createFakePgAuthExecutor();
+    const pgUrl = 'postgres://sdlc:secret@localhost:5432/sdlc_os';
+    const asyncUserSqls: string[] = [];
+    const asyncUserExecutor: PgAsyncSqlExecutor = async (sql, opts) => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      asyncUserSqls.push(sql);
+      return fakeAuth.executor(sql, opts);
+    };
+
+    const userStore = new PgUserStore(pgUrl, fakeAuth.executor, {
+      asyncSqlExecutor: asyncUserExecutor,
+      sessionCacheTtlMs: 30_000,
+      touchThrottleMs: 60_000,
+    });
+    const svc = new SessionService(userStore);
+    await userStore.flushPendingWrites();
+
+    const loginRes = svc.login('admin', 'admin', {
+      ip: '198.51.100.7',
+      userAgent: 'CacheCheck/2.0',
+    }) as { ok: true; token: string };
+    await userStore.flushPendingWrites();
+
+    const writesAfterLogin = fakeAuth.writeCount.value;
+    const readsBeforeBurst = fakeAuth.readCount.value;
+
+    // 连续 5 次 validateWithMeta 应全部命中内存缓存且被 touchThrottleMs 节流，不触发 psql 读写
+    for (let i = 0; i < 5; i += 1) {
+      const checked = svc.validateWithMeta(loginRes.token, {
+        ip: '198.51.100.7',
+        userAgent: 'CacheCheck/2.0',
+      });
+      assert.equal(checked?.user.userId, 'user-admin-01');
+    }
+    await userStore.flushPendingWrites();
+    assert.equal(fakeAuth.readCount.value, readsBeforeBurst, '热路径校验应命中 TTL 缓存不读 PG');
+    assert.equal(fakeAuth.writeCount.value, writesAfterLogin, 'touch 节流窗口内不重复写 PG');
+
+    // 登出后同步驱逐缓存，在异步 DELETE 完成前即立刻拒绝验证
+    svc.logout(loginRes.token);
+    assert.equal(svc.validate(loginRes.token), null, '登出必须立即驱逐内存会话缓存');
+    await userStore.flushPendingWrites();
+
+    // 验证 PgPersistenceDriver 异步合并队列：并发连发 3 次仅执行首包与最新包合并写入，绝不堆积过时全量 SQL
+    const fakeLedger = createFakePgLedgerExecutor();
+    const asyncLedgerSqls: string[] = [];
+    let releaseFirstWrite!: () => void;
+    const firstWriteBarrier = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let callIdx = 0;
+    const asyncLedgerExecutor: PgAsyncSqlExecutor = async (sql, opts) => {
+      callIdx += 1;
+      if (callIdx === 1) {
+        await firstWriteBarrier;
+      } else {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      asyncLedgerSqls.push(sql);
+      return fakeLedger.executor(sql, opts);
+    };
+
+    const asyncDriver = new PgPersistenceDriver(pgUrl, fakeLedger.executor, {
+      asyncSqlExecutor: asyncLedgerExecutor,
+    });
+    const makeSnap = (
+      statusLabel: string,
+    ): Parameters<PgPersistenceDriver['saveFullState']>[0] => ({
+      schemaVersion: '1.1.0',
+      lastSyncedAtIso: new Date().toISOString(),
+      runs: [
+        {
+          runId: 'RUN-COALESCE',
+          title: statusLabel,
+          workflowTemplateId: 'enterprise_standard_sdlc_v1',
+          activeBranchId: 'branch-v1-main',
+          status: statusLabel,
+          initiatorActor: '测试',
+          createdAtIso: new Date().toISOString(),
+          proposal: {},
+          stagePipeline: ['STAGE_1_PM'],
+          currentStageIndex: 0,
+          branchCounter: 1,
+          branchHistory: ['branch-v1-main'],
+          tokensUsedTotal: 0,
+          scenarioHints: {},
+        },
+      ],
+      snapshots: [],
+      negotiationLogs: [],
+      humanDecisions: [],
+      negativeExperienceRecords: [],
+    });
+
+    asyncDriver.saveFullState(makeSnap('STATE_1'));
+    asyncDriver.saveFullState(makeSnap('STATE_2_DROPPED'));
+    asyncDriver.saveFullState(makeSnap('STATE_3_LATEST'));
+    releaseFirstWrite();
+    await asyncDriver.flushPendingWrites();
+
+    assert.equal(asyncLedgerSqls.length, 2, '队列合并后只应执行第 1 次与最终最新状态');
+    assert.ok(asyncLedgerSqls[1].includes('STATE_3_LATEST'));
+    assert.equal(fakeLedger.tables.runs.get('RUN-COALESCE')?.status, 'STATE_3_LATEST');
   });
 });

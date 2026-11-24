@@ -41,6 +41,23 @@ export interface AuthUserView {
   status: string;
 }
 
+export interface AuthClientMetadata {
+  readonly ip?: string;
+  readonly userAgent?: string;
+}
+
+function normalizeClientMeta(meta?: AuthClientMetadata): {
+  ip: string | null;
+  userAgent: string | null;
+} {
+  const rawIp = meta?.ip?.trim() ?? '';
+  const rawUa = meta?.userAgent?.trim() ?? '';
+  return {
+    ip: rawIp ? rawIp.slice(0, 64) : null,
+    userAgent: rawUa ? rawUa.slice(0, 255) : null,
+  };
+}
+
 export type LoginResult =
   | { ok: true; token: string; user: AuthUserView }
   | {
@@ -135,11 +152,13 @@ export class SessionService {
     username: string,
     success: boolean,
     reason: LoginAuditEntry['reason'],
+    ip?: string | null,
   ): void {
     this.store.appendLoginAudit({
       username,
       success,
       reason,
+      ...(ip !== undefined ? { ip } : {}),
       createdAtIso: new Date().toISOString(),
     });
   }
@@ -308,20 +327,21 @@ export class SessionService {
     };
   }
 
-  public login(username: string, password: string): LoginResult {
+  public login(username: string, password: string, meta?: AuthClientMetadata): LoginResult {
+    const clientMeta = normalizeClientMeta(meta);
     const normalized = username.trim().toLowerCase();
     const user = this.users.find((u) => u.username === normalized);
     if (!user) {
-      this.recordLoginAudit(normalized, false, 'UNKNOWN_USER');
+      this.recordLoginAudit(normalized, false, 'UNKNOWN_USER', clientMeta.ip);
       return { ok: false, reason: 'BAD_PASSWORD' };
     }
     if (user.status === 'DISABLED') {
-      this.recordLoginAudit(user.username, false, 'DISABLED');
+      this.recordLoginAudit(user.username, false, 'DISABLED', clientMeta.ip);
       return { ok: false, reason: 'DISABLED' };
     }
     if (user.lockedUntil && Date.now() < Date.parse(user.lockedUntil)) {
       const retryAfterSec = Math.ceil((Date.parse(user.lockedUntil) - Date.now()) / 1000);
-      this.recordLoginAudit(user.username, false, 'LOCKED');
+      this.recordLoginAudit(user.username, false, 'LOCKED', clientMeta.ip);
       return { ok: false, reason: 'LOCKED', retryAfterSec };
     }
 
@@ -332,14 +352,14 @@ export class SessionService {
         user.failedLoginCount = 0;
       }
       this.store.upsertUser(user);
-      this.recordLoginAudit(user.username, false, 'BAD_PASSWORD');
+      this.recordLoginAudit(user.username, false, 'BAD_PASSWORD', clientMeta.ip);
       return { ok: false, reason: 'BAD_PASSWORD' };
     }
 
     user.failedLoginCount = 0;
     user.lockedUntil = null;
     this.store.upsertUser(user);
-    this.recordLoginAudit(user.username, true, 'OK');
+    this.recordLoginAudit(user.username, true, 'OK', clientMeta.ip);
 
     const token = crypto.randomBytes(32).toString('base64url');
     this.store.saveSession({
@@ -347,11 +367,17 @@ export class SessionService {
       userId: user.userId,
       impersonatedBy: null,
       expiresAt: Date.now() + SESSION_TTL_MS,
+      ip: clientMeta.ip,
+      userAgent: clientMeta.userAgent,
     });
     return { ok: true, token, user: this.toView(user) };
   }
 
-  public validate(token: string): AuthUserView | null {
+  /** P1-2：单次会话查询同时返回当前用户与视角切换管理员（避免热路径重复查 PG） */
+  public validateWithMeta(
+    token: string,
+    meta?: AuthClientMetadata,
+  ): { user: AuthUserView; impersonatedBy: AuthUserView | null } | null {
     if (!token) {
       return null;
     }
@@ -366,9 +392,24 @@ export class SessionService {
       this.store.deleteSession(tokenHash);
       return null;
     }
+    const clientMeta = normalizeClientMeta(meta);
     // 滑动续期
-    this.store.touchSession(tokenHash, Date.now() + SESSION_TTL_MS);
-    return this.toView(user);
+    this.store.touchSession(tokenHash, Date.now() + SESSION_TTL_MS, {
+      ip: clientMeta.ip ?? session.ip ?? null,
+      userAgent: clientMeta.userAgent ?? session.userAgent ?? null,
+    });
+    const admin =
+      session.impersonatedBy !== null
+        ? (this.users.find((u) => u.userId === session.impersonatedBy) ?? null)
+        : null;
+    return {
+      user: this.toView(user),
+      impersonatedBy: admin ? this.toView(admin) : null,
+    };
+  }
+
+  public validate(token: string, meta?: AuthClientMetadata): AuthUserView | null {
+    return this.validateWithMeta(token, meta)?.user ?? null;
   }
 
   public logout(token: string): void {
@@ -378,19 +419,22 @@ export class SessionService {
     this.store.deleteSession(hashSessionToken(token));
   }
 
-  /** 管理员切换视角（act-as） */
+  /** 管理员切换视角（act-as）：支持在替身态下连续切换角色或切回管理员自身 */
   public actAs(
-    adminToken: string,
+    currentToken: string,
     targetUserId: string,
-  ): { token: string; user: AuthUserView } | null {
-    if (!adminToken) {
+    meta?: AuthClientMetadata,
+  ): { token: string; user: AuthUserView; impersonating: AuthUserView | null } | null {
+    if (!currentToken) {
       return null;
     }
-    const session = this.store.getSessionByHash(hashSessionToken(adminToken));
+    const currentHash = hashSessionToken(currentToken);
+    const session = this.store.getSessionByHash(currentHash);
     if (!session || Date.now() > session.expiresAt) {
       return null;
     }
-    const admin = this.users.find((u) => u.userId === session.userId && u.status === 'ACTIVE');
+    const realAdminId = session.impersonatedBy ?? session.userId;
+    const admin = this.users.find((u) => u.userId === realAdminId && u.status === 'ACTIVE');
     if (!admin || admin.tier !== 'PROJECT_ADMIN') {
       return null;
     }
@@ -398,15 +442,65 @@ export class SessionService {
     if (!target) {
       return null;
     }
+    if (session.impersonatedBy !== null) {
+      this.store.deleteSession(currentHash);
+    }
+    const clientMeta = normalizeClientMeta(meta);
     const newToken = crypto.randomBytes(32).toString('base64url');
+    const isReturningToAdmin = target.userId === admin.userId;
     this.store.saveSession({
       tokenHash: hashSessionToken(newToken),
       userId: targetUserId,
-      impersonatedBy: admin.userId,
+      impersonatedBy: isReturningToAdmin ? null : admin.userId,
       expiresAt: Date.now() + SESSION_TTL_MS,
+      ip: clientMeta.ip ?? session.ip ?? null,
+      userAgent: clientMeta.userAgent ?? session.userAgent ?? null,
     });
-    this.recordLoginAudit(admin.username, true, 'ACT_AS');
-    return { token: newToken, user: this.toView(target) };
+    this.recordLoginAudit(
+      admin.username,
+      true,
+      isReturningToAdmin ? 'EXIT_ACT_AS' : 'ACT_AS',
+      clientMeta.ip,
+    );
+    return {
+      token: newToken,
+      user: this.toView(target),
+      impersonating: isReturningToAdmin ? null : this.toView(admin),
+    };
+  }
+
+  /** 退出管理员视角切换（exit-act-as），吊销当前替身会话并签发管理员自身会话 */
+  public exitActAs(
+    currentToken: string,
+    meta?: AuthClientMetadata,
+  ): { token: string; user: AuthUserView } | null {
+    if (!currentToken) {
+      return null;
+    }
+    const currentHash = hashSessionToken(currentToken);
+    const session = this.store.getSessionByHash(currentHash);
+    if (!session || Date.now() > session.expiresAt || session.impersonatedBy === null) {
+      return null;
+    }
+    const admin = this.users.find(
+      (u) => u.userId === session.impersonatedBy && u.status === 'ACTIVE',
+    );
+    if (!admin || admin.tier !== 'PROJECT_ADMIN') {
+      return null;
+    }
+    const clientMeta = normalizeClientMeta(meta);
+    this.store.deleteSession(currentHash);
+    const newToken = crypto.randomBytes(32).toString('base64url');
+    this.store.saveSession({
+      tokenHash: hashSessionToken(newToken),
+      userId: admin.userId,
+      impersonatedBy: null,
+      expiresAt: Date.now() + SESSION_TTL_MS,
+      ip: clientMeta.ip ?? session.ip ?? null,
+      userAgent: clientMeta.userAgent ?? session.userAgent ?? null,
+    });
+    this.recordLoginAudit(admin.username, true, 'EXIT_ACT_AS', clientMeta.ip);
+    return { token: newToken, user: this.toView(admin) };
   }
 
   public isImpersonating(token: string): AuthUserView | null {

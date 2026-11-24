@@ -5,9 +5,6 @@
  */
 
 import * as assert from 'node:assert/strict';
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
 import { describe, it, afterEach } from 'node:test';
 
 import { ProjectProposalContract } from '../src/domain/contracts.ts';
@@ -15,6 +12,7 @@ import { WorkflowStageId } from '../src/domain/enums.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
 import { WorkbenchHttpServer } from '../src/server/WorkbenchServer.ts';
 import type { OpenAiCompatibleChatResponse } from '../src/patterns/ModelRouterGateway.ts';
+import { createTestWorkspace, type TestIsolatedWorkspace } from './helpers/testIsolation.ts';
 
 const PM_JSON_WITH_INTENT = JSON.stringify({
   summary: '已完成 PRD 拆解（A4 意图测试）',
@@ -55,12 +53,17 @@ function makeResponse(content: string): OpenAiCompatibleChatResponse {
 
 describe('A4 — LLM 意图识别（__intent 随主调用返回）', () => {
   let orchestrator: WorkflowOrchestratorFacade | null = null;
+  let workspace: TestIsolatedWorkspace | null = null;
   const savedEnv: Record<string, string | undefined> = {};
 
   afterEach(() => {
     if (orchestrator) {
       orchestrator.modelRouter.setHttpTransport(null);
       orchestrator = null;
+    }
+    if (workspace) {
+      workspace.cleanup();
+      workspace = null;
     }
     for (const [key, value] of Object.entries(savedEnv)) {
       if (value === undefined) {
@@ -80,7 +83,12 @@ describe('A4 — LLM 意图识别（__intent 随主调用返回）', () => {
   it('1. 主调用顺带返回 __intent → 捕获缓存；下一个 run 复用 LLM 意图（无单独 LLM 往返）', async () => {
     saveEnv(['LITELLM_ENABLE_LIVE_HTTP']);
     process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('a4-intent-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
 
     const stageCalls: string[] = [];
     orchestrator.modelRouter.setHttpTransport(async (_url, payload) => {
@@ -157,7 +165,12 @@ describe('A4 — LLM 意图识别（__intent 随主调用返回）', () => {
   it('2. __intent 非法（空 intentCode）→ 静默忽略，回落规则意图', async () => {
     saveEnv(['LITELLM_ENABLE_LIVE_HTTP']);
     process.env.LITELLM_ENABLE_LIVE_HTTP = 'true';
-    orchestrator = new WorkflowOrchestratorFacade({ maxNegotiationTurns: 3 });
+    workspace = createTestWorkspace('a4-bad-intent-');
+    orchestrator = new WorkflowOrchestratorFacade({
+      maxNegotiationTurns: 3,
+      persistenceDir: workspace.persistenceDir,
+      sandboxRootDir: workspace.sandboxRootDir,
+    });
     orchestrator.modelRouter.setHttpTransport(async () => makeResponse(PM_JSON_BAD_INTENT));
 
     const run = await orchestrator.startProposalWorkflow({
@@ -184,6 +197,7 @@ describe('A4 — LLM 意图识别（__intent 随主调用返回）', () => {
 describe('A4 — POST /api/admin/model-baseline 体检端点', () => {
   let workbench: WorkbenchHttpServer | null = null;
   let activeServer: import('node:http').Server | null = null;
+  let serverWorkspace: TestIsolatedWorkspace | null = null;
   const savedEnv: Record<string, string | undefined> = {};
 
   afterEach(async () => {
@@ -191,6 +205,10 @@ describe('A4 — POST /api/admin/model-baseline 体检端点', () => {
       await new Promise<void>((resolve) => activeServer?.close(() => resolve()));
       activeServer = null;
       workbench = null;
+    }
+    if (serverWorkspace) {
+      serverWorkspace.cleanup();
+      serverWorkspace = null;
     }
     for (const [key, value] of Object.entries(savedEnv)) {
       if (value === undefined) {
@@ -208,8 +226,11 @@ describe('A4 — POST /api/admin/model-baseline 体检端点', () => {
   }
 
   async function startServer(): Promise<string> {
-    const tempPersistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-a4-persist-'));
-    workbench = new WorkbenchHttpServer(0, { persistenceDir: tempPersistDir });
+    serverWorkspace = createTestWorkspace('agentic-a4-srv-');
+    workbench = new WorkbenchHttpServer(0, {
+      persistenceDir: serverWorkspace.persistenceDir,
+      sandboxRootDir: serverWorkspace.sandboxRootDir,
+    });
     const server = await workbench.start();
     activeServer = server;
     const addr = server.address();

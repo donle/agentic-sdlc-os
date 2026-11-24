@@ -62,12 +62,14 @@ CREATE TABLE IF NOT EXISTS human_decisions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 5. 负向经验飞轮向量表 (rejected_history_rag — pgvector 余弦相似度检索)
+-- 5. 负向经验飞轮向量表 (rejected_history_rag — pgvector 余弦相似度检索，不限定维数以兼容 1024 维 bge-m3 与 1536 维模型)
 CREATE TABLE IF NOT EXISTS rejected_history_rag (
     id VARCHAR(96) PRIMARY KEY,
     stage_id VARCHAR(64) NOT NULL,
     desensitized_lesson TEXT NOT NULL,
-    embedding vector(1536) NOT NULL,
+    embedding vector NOT NULL,
+    embedding_dim INT NOT NULL DEFAULT 1536,
+    embedding_source VARCHAR(32) NOT NULL DEFAULT 'HASH_FALLBACK',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -147,6 +149,72 @@ CREATE TABLE IF NOT EXISTS team_comments (
 CREATE INDEX IF NOT EXISTS idx_team_comments_run_stage
     ON team_comments(run_id, stage_id);
 
--- 11. 既有业务表的用户双轨关联外键（可空 FK + 保留原展示字符串列）
+-- 11. 既有业务表的用户双轨关联外键（可空 FK + 保留原展示字符串列）与 RAG 变长向量兼容迁移
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS created_by_user_id VARCHAR(64) REFERENCES users(id);
 ALTER TABLE human_decisions ADD COLUMN IF NOT EXISTS reviewer_user_id VARCHAR(64) REFERENCES users(id);
+ALTER TABLE rejected_history_rag ALTER COLUMN embedding TYPE vector;
+ALTER TABLE rejected_history_rag ADD COLUMN IF NOT EXISTS embedding_dim INT NOT NULL DEFAULT 1536;
+ALTER TABLE rejected_history_rag ADD COLUMN IF NOT EXISTS embedding_source VARCHAR(32) NOT NULL DEFAULT 'HASH_FALLBACK';
+
+-- ============================================================================
+-- P1-2 — 纯 PG 模式下通知、实时事件流、审计时间线与运行时配置/复盘持久表
+-- ============================================================================
+
+-- 12. 前端人机门禁与协商提醒通知表 (notifications)
+CREATE TABLE IF NOT EXISTS notifications (
+    id VARCHAR(96) PRIMARY KEY,
+    run_id VARCHAR(64) NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    branch_id VARCHAR(64) NOT NULL,
+    stage_id VARCHAR(64) NOT NULL,
+    sender_role VARCHAR(64) NOT NULL,
+    category VARCHAR(64) NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    related_snapshot_id VARCHAR(96) NOT NULL DEFAULT '',
+    requires_human_action BOOLEAN NOT NULL DEFAULT FALSE,
+    resolved BOOLEAN NOT NULL DEFAULT FALSE,
+    action_options JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_run
+    ON notifications(run_id, created_at ASC);
+
+-- 13. Agent 实时交互事件流表 (live_events)
+CREATE TABLE IF NOT EXISTS live_events (
+    id VARCHAR(96) PRIMARY KEY,
+    run_id VARCHAR(64) NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    branch_id VARCHAR(64) NOT NULL,
+    stage_id VARCHAR(64) NOT NULL,
+    agent_role VARCHAR(64) NOT NULL,
+    lifecycle_state VARCHAR(64) NOT NULL,
+    headline TEXT NOT NULL,
+    detail_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_events_run
+    ON live_events(run_id, created_at ASC);
+
+-- 14. 不可变审计时间线表 (audit_entries)
+CREATE TABLE IF NOT EXISTS audit_entries (
+    id VARCHAR(96) PRIMARY KEY,
+    run_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    stage_id VARCHAR(64) NOT NULL,
+    actor VARCHAR(256) NOT NULL,
+    action_type VARCHAR(64) NOT NULL,
+    summary TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_entries_run
+    ON audit_entries(run_id, created_at ASC);
+
+-- 15. 系统运行时治理配置、缓存遥测与复盘追踪状态表 (system_runtime_state)
+CREATE TABLE IF NOT EXISTS system_runtime_state (
+    state_key VARCHAR(64) PRIMARY KEY,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

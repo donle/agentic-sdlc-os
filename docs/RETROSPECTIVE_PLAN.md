@@ -48,4 +48,4 @@ npm run retrospective:eval
 
 该任务依次编排冷启动自愈重试、PM-PD 协商熔断裁决、总管对话式 DAG 分叉回退，以及同构 `proposalB` 复用缓存——其中离线模式下主要验证 **L1 精确缓存**（L2 语义向量命中需启用在线 `/v1/embeddings` 端点，或参见 `tests/concurrency-and-cache.spec.ts` 中的独立单元测试），并输出包含 4 项 SLA 诊断结论与优化建议的报告。
 
-> 注：核查现行 `src/retrospective/runRetrospective.ts` 存在一处已知脚本缺陷——对异步方法 `submitHumanGateDecision` / `invokeSupervisorConversationalRollback` 未加 `await`，直接运行脚本时裁决与回退存在并发竞态，后续修复脚本时需同步补齐 `await`。
+> 注：2026-11-24 已完成 `P0-6` 修复（见 [`P0_6_RETROSPECTIVE_RUNNER_FIX.md`](./P0_6_RETROSPECTIVE_RUNNER_FIX.md)）：`src/retrospective/runRetrospective.ts` 全部 6 处异步 `await` 已补齐，默认模式优先只读调用 `evaluatePersistedHistory()` 评估真实持久化历史运行，无历史数据时在 `os.tmpdir()` 隔离目录执行合成基准（亦可传 `--benchmark` / `--history-only`），不再污染工作区 `.runtime-data/`。

@@ -32,6 +32,7 @@ export class WorkflowRunState {
   public readonly runId: string;
   public readonly proposal: ProjectProposalContract;
   public readonly initiatorActor: string;
+  public readonly createdByUserId?: string;
   public readonly workflowTemplateId: string;
   public readonly createdAtIso: string;
   /** 演示/测试场景开关（运行元数据，见 domain/scenario.ts，不属于提案契约） */
@@ -51,6 +52,7 @@ export class WorkflowRunState {
     runId: string;
     proposal: ProjectProposalContract;
     initiatorActor: string;
+    createdByUserId?: string;
     stagePipeline?: ReadonlyArray<WorkflowStageId>;
     workflowTemplateId?: string;
     createdAtIso?: string;
@@ -60,6 +62,7 @@ export class WorkflowRunState {
     this.runId = params.runId;
     this.proposal = params.proposal;
     this.initiatorActor = params.initiatorActor;
+    this.createdByUserId = params.createdByUserId;
     this.workflowTemplateId = params.workflowTemplateId ?? 'enterprise_standard_sdlc_v1';
     this.createdAtIso = params.createdAtIso ?? new Date().toISOString();
     this.scenarioHints = params.scenarioHints ?? {};
@@ -341,6 +344,7 @@ export class DagWorkflowStateEngine {
     runId: string;
     proposal: ProjectProposalContract;
     initiatorActor: string;
+    createdByUserId?: string;
     stagePipeline?: ReadonlyArray<WorkflowStageId>;
     workflowTemplateId?: string;
     scenarioHints?: ScenarioHints;

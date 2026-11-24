@@ -1,23 +1,35 @@
 /**
  * @file StepViewer.tsx
  * @description 执行历史步骤查看器：所有 Agent 动作按时间正序排列，
- * ‹ › 步进或点击任意步骤，联动流程图高亮对应节点；当前步骤渲染为
- * 强调 Agent 身份的大卡片。
+ * ‹ › 步进或点击任意步骤，联动流程图与协同剧场高亮对应角色；当前步骤渲染为拟人角色大卡片。
  */
 
-import type { WorkflowDomainEventDto } from '../types.ts';
+import { moodActionCue, moodFromState, personaFor } from '../lib/agentPersona.ts';
 import { formatRelativeTime, lifecycleCss, lifecycleIcon, stageMeta } from '../lib/display.ts';
+import type { WorkflowDomainEventDto } from '../types.ts';
+import { AgentAvatar } from './AgentAvatar.tsx';
 
 function AgentActionCard({ event }: { event: WorkflowDomainEventDto }) {
   const meta = stageMeta(event.stageId);
+  const persona = personaFor(event.agentRole || event.stageId);
+  const mood = moodFromState(event.lifecycleState);
+
   return (
     <div className={`agent-action-card ${lifecycleCss(event.lifecycleState)}`}>
       <div className="agent-action-head">
-        <span className="agent-action-avatar">{lifecycleIcon(event.lifecycleState)}</span>
+        <AgentAvatar
+          roleOrStage={event.agentRole || event.stageId}
+          size="md"
+          mood={mood}
+          showMoodBadge
+          showSpeakingWaves={mood === 'talking' || mood === 'working'}
+        />
         <div className="agent-action-identity">
-          <div className="agent-action-name">{meta.agentDisplayName}</div>
+          <div className="agent-action-name">
+            {persona.personName} · {meta.agentDisplayName}
+          </div>
           <div className="agent-action-role">
-            {meta.shortName} · 协同责任专家: {meta.specialistLabel}
+            {meta.shortName} · {moodActionCue(mood)} · 协同专家: {meta.specialistLabel}
           </div>
         </div>
         <span className="agent-action-time">{formatRelativeTime(event.timestampIso)}</span>
@@ -64,19 +76,28 @@ export function StepViewer({
           ‹
         </button>
         <div className="step-viewer-chips">
-          {events.map((event, index) => (
-            <button
-              type="button"
-              key={event.eventId + String(index)}
-              className={`step-chip ${index === safeCursor ? 'current' : ''}`}
-              onClick={() => onCursorChange(index)}
-            >
-              <span>{lifecycleIcon(event.lifecycleState)}</span>
-              <span className="step-chip-stage">
-                {stageMeta(event.stageId).stepTag.replace('STEP ', 'S')}
-              </span>
-            </button>
-          ))}
+          {events.map((event, index) => {
+            const p = personaFor(event.agentRole || event.stageId);
+            return (
+              <button
+                type="button"
+                key={event.eventId + String(index)}
+                className={`step-chip ${index === safeCursor ? 'current' : ''}`}
+                onClick={() => onCursorChange(index)}
+              >
+                <AgentAvatar
+                  roleOrStage={event.agentRole || event.stageId}
+                  size="xs"
+                  mood={index === safeCursor ? moodFromState(event.lifecycleState) : 'idle'}
+                />
+                <span>{p.personName}</span>
+                <span className="step-chip-stage">
+                  {stageMeta(event.stageId).stepTag.replace('STEP ', 'S')} ·{' '}
+                  {lifecycleIcon(event.lifecycleState)}
+                </span>
+              </button>
+            );
+          })}
         </div>
         <button
           type="button"

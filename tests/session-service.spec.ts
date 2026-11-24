@@ -98,6 +98,41 @@ describe('F1 — SessionService 边界测试', () => {
       svc.updateUser('user-admin-01', 'user-pd-01', { status: 'DISABLED' });
       assert.equal(svc.actAs(adminLogin.token, 'user-pd-01'), null);
     });
+
+    it('9b. P0-3：act-as 支持替身态连续切换、切回自身及 exitActAs 退出恢复（吊销旧替身令牌并记录 EXIT_ACT_AS）', () => {
+      const adminLogin = svc.login('admin', 'admin') as { ok: true; token: string };
+      // 1) admin -> pd
+      const pdAct = svc.actAs(adminLogin.token, 'user-pd-01');
+      assert.ok(pdAct);
+      assert.equal(pdAct.impersonating?.userId, 'user-admin-01');
+
+      // 2) 在 pd 替身态下连续切换 -> pm（旧 pd 替身 token 应失效）
+      const pmAct = svc.actAs(pdAct.token, 'user-pm-01');
+      assert.ok(pmAct);
+      assert.equal(pmAct.user.userId, 'user-pm-01');
+      assert.equal(pmAct.impersonating?.userId, 'user-admin-01');
+      assert.equal(svc.validate(pdAct.token), null, '连续切换后旧替身令牌必须失效');
+
+      // 3) exitActAs 恢复为管理员，旧 pm 替身令牌失效，原管理员令牌仍可用或新管理员令牌可用
+      const exited = svc.exitActAs(pmAct.token);
+      assert.ok(exited);
+      assert.equal(exited.user.userId, 'user-admin-01');
+      assert.equal(svc.validate(pmAct.token), null, '退出 act-as 后原替身令牌必须失效');
+      assert.equal(svc.isImpersonating(exited.token), null);
+      assert.equal(svc.exitActAs(exited.token), null, '非替身会话不可重复 exitActAs');
+
+      // 4) 再次 act-as 到 qa 后通过 actAs(target=admin) 直接切回自身
+      const qaAct = svc.actAs(exited.token, 'user-qa-01');
+      assert.ok(qaAct);
+      const backToSelf = svc.actAs(qaAct.token, 'user-admin-01');
+      assert.ok(backToSelf);
+      assert.equal(backToSelf.user.userId, 'user-admin-01');
+      assert.equal(backToSelf.impersonating, null);
+      assert.equal(svc.isImpersonating(backToSelf.token), null);
+
+      const reasons = svc.getLoginAudit({ limit: 20 }).map((e) => e.reason);
+      assert.ok(reasons.includes('EXIT_ACT_AS'));
+    });
   });
 
   describe('改密', () => {
@@ -526,6 +561,301 @@ describe('F1/F2 — WorkbenchHttpServer 认证与路由权限守卫（进程内 
         body: { preset: 'LOW_RISK_FAST_TRACK' },
       });
       assert.equal(newUserProposal.statusCode, 403, '新创建员工不可被静默提权为管理员');
+    } finally {
+      fs.rmSync(persistDir, { recursive: true, force: true });
+      fs.rmSync(sandboxDir, { recursive: true, force: true });
+    }
+  });
+
+  it('3. P0-3：HTTP act-as 连续切换与 /api/auth/exit-act-as 可逆恢复，且业务审计自动记录 "(via <admin>)"', async () => {
+    setEnv('AUTH_REQUIRED', 'true');
+    setEnv('AUTH_DISABLED', undefined);
+    const persistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p03-srv-persist-'));
+    const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p03-srv-sb-'));
+
+    try {
+      const server = new WorkbenchHttpServer(0, {
+        persistenceDir: persistDir,
+        sandboxRootDir: sandboxDir,
+      });
+      await server.waitUntilReady();
+
+      // 1) Admin 与 PD 各自登录改密
+      const adminLogin = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/login',
+        body: { username: 'admin', password: 'admin' },
+      });
+      const adminCookie = `sdlc_session=${
+        String(adminLogin.headers['set-cookie'] ?? '').match(/sdlc_session=([^\s;]+)/)![1]
+      }`;
+      await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/change-password',
+        headers: { cookie: adminCookie },
+        body: { oldPassword: 'admin', newPassword: 'AdminNewPassword1' },
+      });
+
+      const pdLogin = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/login',
+        body: { username: 'pd', password: 'pd' },
+      });
+      const pdNormalCookie = `sdlc_session=${
+        String(pdLogin.headers['set-cookie'] ?? '').match(/sdlc_session=([^\s;]+)/)![1]
+      }`;
+      await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/change-password',
+        headers: { cookie: pdNormalCookie },
+        body: { oldPassword: 'pd', newPassword: 'PdNewPassword1' },
+      });
+
+      // 非管理员禁止 act-as
+      const pdTryActAs = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/act-as',
+        headers: { cookie: pdNormalCookie },
+        body: { targetUserId: 'user-pm-01' },
+      });
+      assert.equal(pdTryActAs.statusCode, 403);
+
+      // 2) Admin act-as -> PD -> 再连续切换至 PM（不再 403 锁死）
+      const actPdRes = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/act-as',
+        headers: { cookie: adminCookie },
+        body: { targetUserId: 'user-pd-01' },
+      });
+      assert.equal(actPdRes.statusCode, 200);
+      const actPdCookie = `sdlc_session=${
+        String(actPdRes.headers['set-cookie'] ?? '').match(/sdlc_session=([^\s;]+)/)![1]
+      }`;
+
+      const actPmRes = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/act-as',
+        headers: { cookie: actPdCookie },
+        body: { targetUserId: 'user-pm-01' },
+      });
+      assert.equal(actPmRes.statusCode, 200, '在非管理员替身态下管理员必须可以继续切换角色');
+      const actPmCookie = `sdlc_session=${
+        String(actPmRes.headers['set-cookie'] ?? '').match(/sdlc_session=([^\s;]+)/)![1]
+      }`;
+
+      // 旧替身 cookie 已失效
+      const stalePdMe = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/auth/me',
+        headers: { cookie: actPdCookie },
+      });
+      assert.equal(stalePdMe.statusCode, 401);
+
+      // 3) 替身态下发表评论、签核拍板、总管回退与立项均记录 "(via 王总管)"
+      const stateRes = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/state',
+        headers: { cookie: actPmCookie },
+      });
+      assert.equal(stateRes.statusCode, 200);
+      const stateData = stateRes.json.data as {
+        run: {
+          runId: string;
+          snapshots: Array<{ snapshotId: string; stageId: string; state: string }>;
+        };
+      };
+      const pendingSnap = stateData.run.snapshots.find((s) => s.state === 'PENDING_HUMAN_GATE');
+      assert.ok(pendingSnap, '默认演示运行应存在待签核快照');
+
+      const commentRes = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/comments',
+        headers: { cookie: actPmCookie },
+        body: {
+          runId: stateData.run.runId,
+          stageId: pendingSnap.stageId,
+          content: '代班评审确认交互规格',
+        },
+      });
+      assert.equal(commentRes.statusCode, 200);
+      const afterCommentData = commentRes.json.data as {
+        teamComments: Array<{ authorName: string; content: string }>;
+      };
+      const latestComment = afterCommentData.teamComments[afterCommentData.teamComments.length - 1];
+      assert.ok(latestComment.authorName.includes('(via 王总管)'));
+
+      const decisionRes = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/decisions',
+        headers: { cookie: actPmCookie },
+        body: {
+          runId: stateData.run.runId,
+          snapshotId: pendingSnap.snapshotId,
+          verdict: 'ARBITRATE_OPTION_A',
+          comment: '替身态签核拍板方案A',
+        },
+      });
+      assert.equal(decisionRes.statusCode, 200);
+      const afterDecisionData = decisionRes.json.data as {
+        humanDecisions: Array<{ reviewerActor: string; verdict: string }>;
+      };
+      const latestDecision =
+        afterDecisionData.humanDecisions[afterDecisionData.humanDecisions.length - 1];
+      assert.ok(latestDecision.reviewerActor.includes('(via 王总管)'));
+      assert.equal(
+        latestDecision.reviewerActor.match(/\(via 王总管\)/g)?.length,
+        1,
+        '归属标签不得重复追加',
+      );
+
+      const rollbackRes = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/supervisor/rollback',
+        headers: { cookie: actPmCookie },
+        body: {
+          runId: stateData.run.runId,
+          targetStageId: 'STAGE_2_PD',
+          dialogueInstruction: '回退到 PD 微调组件说明',
+        },
+      });
+      assert.equal(rollbackRes.statusCode, 200);
+      const afterRollbackData = rollbackRes.json.data as {
+        humanDecisions: Array<{ reviewerActor: string; verdict: string }>;
+      };
+      const rollbackDecision =
+        afterRollbackData.humanDecisions[afterRollbackData.humanDecisions.length - 1];
+      assert.equal(rollbackDecision.verdict, 'SUPERVISOR_ROLLBACK');
+      assert.ok(rollbackDecision.reviewerActor.includes('(via SupervisorAgent)'));
+      assert.ok(rollbackDecision.reviewerActor.includes('(via 王总管)'));
+
+      const propRes = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/proposals',
+        headers: { cookie: actPmCookie },
+        body: { preset: 'LOW_RISK_FAST_TRACK' },
+      });
+      assert.equal(propRes.statusCode, 200);
+      const propRun = (propRes.json.data as { run: { initiatorActor: string } }).run;
+      assert.ok(propRun.initiatorActor.includes('(via 王总管)'));
+
+      // 4) 调用 /api/auth/exit-act-as 退出替身恢复管理员，并清理旧替身令牌
+      const exitRes = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/exit-act-as',
+        headers: { cookie: actPmCookie },
+      });
+      assert.equal(exitRes.statusCode, 200);
+      const restoredCookie = `sdlc_session=${
+        String(exitRes.headers['set-cookie'] ?? '').match(/sdlc_session=([^\s;]+)/)![1]
+      }`;
+
+      const oldPmMe = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/auth/me',
+        headers: { cookie: actPmCookie },
+      });
+      assert.equal(oldPmMe.statusCode, 401);
+
+      const restoredMe = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/auth/me',
+        headers: { cookie: restoredCookie },
+      });
+      assert.equal(restoredMe.statusCode, 200);
+      const restoredData = restoredMe.json.data as {
+        user: { userId: string };
+        impersonating: unknown;
+      };
+      assert.equal(restoredData.user.userId, 'user-admin-01');
+      assert.equal(restoredData.impersonating, null);
+
+      const doubleExit = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/exit-act-as',
+        headers: { cookie: restoredCookie },
+      });
+      assert.equal(doubleExit.statusCode, 400);
+
+      const auditRes = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/admin/login-audit?limit=20',
+        headers: { cookie: restoredCookie },
+      });
+      assert.equal(auditRes.statusCode, 200);
+      const auditEntries = (auditRes.json.data as { entries: Array<{ reason: string }> }).entries;
+      assert.ok(auditEntries.some((e) => e.reason === 'EXIT_ACT_AS'));
+    } finally {
+      fs.rmSync(persistDir, { recursive: true, force: true });
+      fs.rmSync(sandboxDir, { recursive: true, force: true });
+    }
+  });
+
+  it('4. P1-2：HTTP 登录与会话续期采集来源 IP 与 User-Agent 并写入 auth_login_audit', async () => {
+    setEnv('AUTH_REQUIRED', 'true');
+    setEnv('AUTH_DISABLED', undefined);
+    const persistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p12-ip-persist-'));
+    const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'p12-ip-sb-'));
+
+    try {
+      const server = new WorkbenchHttpServer(0, {
+        persistenceDir: persistDir,
+        sandboxRootDir: sandboxDir,
+      });
+      await server.waitUntilReady();
+
+      const badLogin = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/login',
+        headers: {
+          'x-forwarded-for': '203.0.113.77, 10.0.0.1',
+          'user-agent': 'SecurityProbe/9.0',
+        },
+        body: { username: 'admin', password: 'wrong' },
+      });
+      assert.equal(badLogin.statusCode, 401);
+
+      const adminLogin = await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/login',
+        headers: {
+          'x-forwarded-for': '198.51.100.42',
+          'user-agent': 'EnterpriseChrome/130.0',
+        },
+        body: { username: 'admin', password: 'admin' },
+      });
+      assert.equal(adminLogin.statusCode, 200);
+      const adminCookie = `sdlc_session=${
+        String(adminLogin.headers['set-cookie'] ?? '').match(/sdlc_session=([^\s;]+)/)![1]
+      }`;
+
+      await dispatchInProcess(server, {
+        method: 'POST',
+        url: '/api/auth/change-password',
+        headers: {
+          cookie: adminCookie,
+          'x-forwarded-for': '198.51.100.42',
+          'user-agent': 'EnterpriseChrome/130.0',
+        },
+        body: { oldPassword: 'admin', newPassword: 'AdminNewPassword1' },
+      });
+
+      const auditRes = await dispatchInProcess(server, {
+        method: 'GET',
+        url: '/api/admin/login-audit?username=admin&limit=10',
+        headers: {
+          cookie: adminCookie,
+          'x-forwarded-for': '198.51.100.42',
+          'user-agent': 'EnterpriseChrome/130.0',
+        },
+      });
+      assert.equal(auditRes.statusCode, 200);
+      const entries = (
+        auditRes.json.data as {
+          entries: Array<{ reason: string; ip?: string | null }>;
+        }
+      ).entries;
+      assert.ok(entries.some((e) => e.reason === 'BAD_PASSWORD' && e.ip === '203.0.113.77'));
+      assert.ok(entries.some((e) => e.reason === 'OK' && e.ip === '198.51.100.42'));
     } finally {
       fs.rmSync(persistDir, { recursive: true, force: true });
       fs.rmSync(sandboxDir, { recursive: true, force: true });

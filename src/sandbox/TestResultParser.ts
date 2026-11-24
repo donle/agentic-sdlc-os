@@ -52,9 +52,20 @@ export class TestResultParser {
         { cwd, encoding: 'utf-8', timeout: timeoutMs, env },
       );
     } catch (err: unknown) {
-      const e = err as { stdout?: string; stderr?: string; killed?: boolean; message: string };
+      const e = err as {
+        stdout?: string;
+        stderr?: string;
+        killed?: boolean;
+        code?: string;
+        signal?: string;
+        message?: string;
+      };
       output = [e.stdout, e.stderr].filter(Boolean).join('\n');
-      timedOut = e.killed === true;
+      timedOut =
+        e.killed === true ||
+        e.code === 'ETIMEDOUT' ||
+        e.signal === 'SIGTERM' ||
+        /ETIMEDOUT/i.test(String(e.message ?? ''));
     }
     return TestResultParser.parseSuiteOutput(output, suiteName, timedOut);
   }

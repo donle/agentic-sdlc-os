@@ -83,6 +83,14 @@ export class DataAnalystAgent extends AbstractWorkerAgent<DataAnalysisArtifactCo
           targetValue: '< 5.0%',
         },
       ],
+      agentRationale: `DA 将 Stage 1 PRD 定义的 ${events.length} 个 Tracking Plan 事件逐条核对完毕，并结合数仓上下文推演上线后的交付周期与返工率基线投影。`,
+      keyDecisions: [
+        {
+          decision: `锁定 ${events.length} 项核心事件为上线后北极星归因指标来源`,
+          rationale: '确保产品诉求与线上转化漏斗 1:1 可观测映射',
+          tradeoffs: ['需保障客户端/网关稳定上报属性字段', '支撑发布后客观量化复盘'],
+        },
+      ],
     });
   }
 }

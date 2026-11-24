@@ -162,6 +162,26 @@ export class TechLeadAgent extends AbstractWorkerAgent<TechSpecArtifactContract>
         'Chain of Responsibility Pattern (RiskEvaluationPipeline)',
         'Mediator & Command Pattern (SupervisorAgent & BoundedNegotiationMediator)',
       ],
+      agentRationale:
+        ddlStatements.length > 0
+          ? `Tech Lead 先锁定 ${apiContracts.length} 组 API Schema 并规划 ${ddlStatements.length} 条幂等 DDL 变更（风险评级 ${declaredRiskLevel}），防止下游编码返工。`
+          : `Tech Lead 采用无破坏性无状态 API 契约（风险评级 ${declaredRiskLevel}），确保 3b 阶段可直接在隔离沙箱内并行实现。`,
+      keyDecisions: [
+        {
+          decision:
+            ddlStatements.length > 0
+              ? '引入向后兼容的幂等 DDL (`ADD COLUMN IF NOT EXISTS` + `CREATE INDEX CONCURRENTLY`)'
+              : '保持存储结构只读复用，仅通过新增 REST 契约端点扩展能力',
+          rationale:
+            ddlStatements.length > 0
+              ? '降低数据库锁表风险并确保跨分支回退快照 schema 兼容'
+              : '避免不可逆迁移脚本拖慢发布周期',
+          tradeoffs:
+            ddlStatements.length > 0
+              ? ['需经架构师人工门禁二次核验 DDL', '确保回退分支读写零破坏']
+              : ['新状态字段受限于既有表扩展列', '零数据库停机变更风险'],
+        },
+      ],
     });
   }
 }

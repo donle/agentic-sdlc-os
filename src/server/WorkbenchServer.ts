@@ -35,12 +35,25 @@ interface ResolvedAuthContext {
   readonly actorUserId: string;
   readonly user: AuthUserView | null;
   readonly rawToken: string | null;
+  readonly impersonatedBy: AuthUserView | null;
   readonly authSource: 'session' | 'invalid_token' | 'workbench_header' | 'none';
 }
 
 interface SseClientSubscription {
   readonly actorUserId: string;
   readonly subscribedRunId: string | null;
+}
+
+class HttpRequestError extends Error {
+  public readonly statusCode: number;
+  public readonly retryAfterSec?: number;
+
+  public constructor(statusCode: number, message: string, retryAfterSec?: number) {
+    super(message);
+    this.name = 'HttpRequestError';
+    this.statusCode = statusCode;
+    this.retryAfterSec = retryAfterSec;
+  }
 }
 
 export class WorkbenchHttpServer {
@@ -50,15 +63,38 @@ export class WorkbenchHttpServer {
   private readonly sseClients: Map<http.ServerResponse, SseClientSubscription>;
   public readonly sessionService: SessionService;
   private readonly sseBridge: SseBridge;
+  private readonly maxBodyBytes: number;
+  private readonly bodyTimeoutMs: number;
+  private readonly rateLimitWindowMs: number;
+  private readonly loginRateLimitMax: number;
+  private readonly expensiveRateLimitMax: number;
+  private readonly rateLimitBuckets = new Map<string, number[]>();
 
   public constructor(
     port = 4300,
     options?: {
       persistenceDir?: string;
       sandboxRootDir?: string;
+      maxBodyBytes?: number;
+      bodyTimeoutMs?: number;
+      rateLimits?: {
+        windowMs?: number;
+        loginMaxPerWindow?: number;
+        expensiveMaxPerWindow?: number;
+      };
     },
   ) {
     this.port = port;
+    this.maxBodyBytes =
+      options?.maxBodyBytes ?? (Number(process.env.HTTP_MAX_BODY_BYTES) || 1024 * 1024);
+    this.bodyTimeoutMs =
+      options?.bodyTimeoutMs ?? (Number(process.env.HTTP_BODY_TIMEOUT_MS) || 15000);
+    this.rateLimitWindowMs = options?.rateLimits?.windowMs ?? 60_000;
+    this.loginRateLimitMax =
+      options?.rateLimits?.loginMaxPerWindow ?? (Number(process.env.HTTP_LOGIN_RATE_LIMIT) || 20);
+    this.expensiveRateLimitMax =
+      options?.rateLimits?.expensiveMaxPerWindow ??
+      (Number(process.env.HTTP_EXPENSIVE_RATE_LIMIT) || 30);
     this.sseClients = new Map<http.ServerResponse, SseClientSubscription>();
     const orchestrator = new WorkflowOrchestratorFacade({
       maxNegotiationTurns: 3,
@@ -131,6 +167,7 @@ data: ${frame}
     await this.orchestrator.startProposalWorkflow({
       proposal: completedCodeProposal,
       initiatorActor: '陈工 (PM · 资深产品经理)',
+      initiatorUserId: 'user-pm-01',
     });
 
     // 项目 2（默认激活）：Stage 1 自愈达成 + Stage 2 PM/PD 3轮协商熔断等待拍板 + 后续含 DDL 高风险门禁
@@ -150,6 +187,7 @@ data: ${frame}
     const runState = await this.orchestrator.startProposalWorkflow({
       proposal: initialProposal,
       initiatorActor: '陈工 (PM · 资深产品经理)',
+      initiatorUserId: 'user-pm-01',
       scenarioHints: { forceNegotiationDeadlock: true, forceTransientRetry: true },
     });
 
@@ -167,6 +205,13 @@ data: ${frame}
     try {
       await this.routeRequest(req, res);
     } catch (err) {
+      if (err instanceof HttpRequestError) {
+        const extraHeaders = err.retryAfterSec
+          ? { 'Retry-After': String(err.retryAfterSec) }
+          : undefined;
+        this.sendJson(res, err.statusCode, { ok: false, error: err.message }, extraHeaders);
+        return;
+      }
       const message = err instanceof Error ? err.message : '未知服务器异常';
       const statusCode = message.includes('[RBAC') ? 403 : 400;
       this.sendJson(res, statusCode, { ok: false, error: message });
@@ -213,6 +258,7 @@ data: ${frame}
     body: Record<string, unknown> | undefined,
     rawToken: string | null,
     sessionUser: AuthUserView | null,
+    impersonatedBy: AuthUserView | null,
   ): ResolvedAuthContext {
     if (rawToken) {
       if (sessionUser) {
@@ -220,6 +266,7 @@ data: ${frame}
           actorUserId: sessionUser.userId,
           user: sessionUser,
           rawToken,
+          impersonatedBy,
           authSource: 'session',
         };
       }
@@ -227,6 +274,7 @@ data: ${frame}
         actorUserId: 'UNAUTHENTICATED',
         user: null,
         rawToken,
+        impersonatedBy: null,
         authSource: 'invalid_token',
       };
     }
@@ -236,6 +284,7 @@ data: ${frame}
         actorUserId: 'UNAUTHENTICATED',
         user: null,
         rawToken: null,
+        impersonatedBy: null,
         authSource: 'none',
       };
     }
@@ -255,6 +304,7 @@ data: ${frame}
           actorUserId: explicitId,
           user: this.sessionService.getUserById(explicitId),
           rawToken: null,
+          impersonatedBy: null,
           authSource: 'workbench_header',
         };
       }
@@ -263,6 +313,7 @@ data: ${frame}
           actorUserId: explicitId,
           user: this.sessionService.getUserById(explicitId),
           rawToken: null,
+          impersonatedBy: null,
           authSource: 'workbench_header',
         };
       }
@@ -270,6 +321,7 @@ data: ${frame}
         actorUserId: 'UNAUTHENTICATED',
         user: null,
         rawToken: null,
+        impersonatedBy: null,
         authSource: 'workbench_header',
       };
     }
@@ -279,6 +331,7 @@ data: ${frame}
         actorUserId: 'user-admin-01',
         user: this.sessionService.getUserById('user-admin-01'),
         rawToken: null,
+        impersonatedBy: null,
         authSource: 'none',
       };
     }
@@ -287,6 +340,7 @@ data: ${frame}
       actorUserId: 'UNAUTHENTICATED',
       user: null,
       rawToken: null,
+      impersonatedBy: null,
       authSource: 'none',
     };
   }
@@ -347,7 +401,10 @@ data: ${frame}
       const currentFileDir = path.dirname(fileURLToPath(import.meta.url));
       const htmlPath = path.resolve(currentFileDir, '../ui/index.html');
       const htmlContent = fs.readFileSync(htmlPath, 'utf-8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.writeHead(
+        200,
+        this.buildSecurityHeaders({ 'Content-Type': 'text/html; charset=utf-8' }, { isHtml: true }),
+      );
       res.end(htmlContent);
       return;
     }
@@ -356,10 +413,14 @@ data: ${frame}
       // 允许托管 /styles/*.css（宿主样式）与 /kit/*.css（Meridian UI 组件库样式）
       const currentFileDir = path.dirname(fileURLToPath(import.meta.url));
       const uiRoot = path.resolve(currentFileDir, '../ui');
+      const uiPrefix = uiRoot.endsWith(path.sep) ? uiRoot : uiRoot + path.sep;
       const cssPath = path.resolve(uiRoot, `.${pathname}`);
-      if (cssPath.startsWith(uiRoot) && fs.existsSync(cssPath) && fs.statSync(cssPath).isFile()) {
+      if (cssPath.startsWith(uiPrefix) && fs.existsSync(cssPath) && fs.statSync(cssPath).isFile()) {
         const cssContent = fs.readFileSync(cssPath, 'utf-8');
-        res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8' });
+        res.writeHead(
+          200,
+          this.buildSecurityHeaders({ 'Content-Type': 'text/css; charset=utf-8' }),
+        );
         res.end(cssContent);
         return;
       }
@@ -368,12 +429,54 @@ data: ${frame}
     if (method === 'GET' && pathname.startsWith('/dist/') && pathname.endsWith('.js')) {
       const currentFileDir = path.dirname(fileURLToPath(import.meta.url));
       const distRoot = path.resolve(currentFileDir, '../ui/dist');
+      const distPrefix = distRoot.endsWith(path.sep) ? distRoot : distRoot + path.sep;
       const relativeReqPath = pathname.slice('/dist/'.length);
       const resolvedJsPath = path.resolve(distRoot, relativeReqPath);
-      if (resolvedJsPath.startsWith(distRoot) && fs.existsSync(resolvedJsPath)) {
+      if (
+        resolvedJsPath.startsWith(distPrefix) &&
+        fs.existsSync(resolvedJsPath) &&
+        fs.statSync(resolvedJsPath).isFile()
+      ) {
         const jsContent = fs.readFileSync(resolvedJsPath, 'utf-8');
-        res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
+        res.writeHead(
+          200,
+          this.buildSecurityHeaders({ 'Content-Type': 'application/javascript; charset=utf-8' }),
+        );
         res.end(jsContent);
+        return;
+      }
+    }
+
+    if (method === 'GET' && pathname.startsWith('/assets/')) {
+      const currentFileDir = path.dirname(fileURLToPath(import.meta.url));
+      const assetsRoot = path.resolve(currentFileDir, '../ui/assets');
+      const assetsPrefix = assetsRoot.endsWith(path.sep) ? assetsRoot : assetsRoot + path.sep;
+      const relativeReqPath = pathname.slice('/assets/'.length);
+      const resolvedAssetPath = path.resolve(assetsRoot, relativeReqPath);
+      const ext = path.extname(resolvedAssetPath).toLowerCase();
+      const mimeByExt: Record<string, string> = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.webp': 'image/webp',
+        '.svg': 'image/svg+xml; charset=utf-8',
+      };
+      const contentType = mimeByExt[ext];
+      if (
+        contentType &&
+        resolvedAssetPath.startsWith(assetsPrefix) &&
+        fs.existsSync(resolvedAssetPath) &&
+        fs.statSync(resolvedAssetPath).isFile()
+      ) {
+        const assetBytes = fs.readFileSync(resolvedAssetPath);
+        res.writeHead(
+          200,
+          this.buildSecurityHeaders({
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=86400',
+          }),
+        );
+        res.end(assetBytes);
         return;
       }
     }
@@ -398,36 +501,40 @@ data: ${frame}
     }
 
     // ---- F1: 登录/登出端点（匿名放行） ----
+    const clientMeta = this.extractClientMetadata(req);
     if (method === 'POST' && pathname === '/api/auth/login') {
+      this.enforceRateLimit('login', req, this.loginRateLimitMax);
       const loginBody = await this.readJsonBody(req);
       const result = this.sessionService.login(
         String(loginBody.username ?? ''),
         String(loginBody.password ?? ''),
+        clientMeta,
       );
       if (!result.ok) {
         const statusCode =
           result.reason === 'LOCKED' ? 423 : result.reason === 'DISABLED' ? 403 : 401;
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json; charset=utf-8',
-        };
+        const extraHeaders: Record<string, string> = {};
         if (result.reason === 'LOCKED' && result.retryAfterSec) {
-          headers['Retry-After'] = String(result.retryAfterSec);
+          extraHeaders['Retry-After'] = String(result.retryAfterSec);
         }
-        res.writeHead(statusCode, headers);
-        res.end(
-          JSON.stringify({
+        this.sendJson(
+          res,
+          statusCode,
+          {
             ok: false,
             error: `认证失败: ${result.reason}`,
             retryAfterSec: (result as { retryAfterSec?: number }).retryAfterSec,
-          }),
+          },
+          extraHeaders,
         );
         return;
       }
-      res.writeHead(200, {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Set-Cookie': `sdlc_session=${result.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800`,
-      });
-      res.end(JSON.stringify({ ok: true, data: { user: result.user } }));
+      this.sendJson(
+        res,
+        200,
+        { ok: true, data: { user: result.user } },
+        { 'Set-Cookie': this.buildSessionCookie(result.token, 28800, req) },
+      );
       return;
     }
 
@@ -436,11 +543,7 @@ data: ${frame}
       if (logoutToken) {
         this.sessionService.logout(logoutToken);
       }
-      res.writeHead(200, {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Set-Cookie': 'sdlc_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
-      });
-      res.end(JSON.stringify({ ok: true }));
+      this.sendJson(res, 200, { ok: true }, { 'Set-Cookie': this.buildSessionCookie('', 0, req) });
       return;
     }
 
@@ -449,35 +552,82 @@ data: ${frame}
       return;
     }
 
-    // ---- F1: 全局 API 会话守卫与强制改密拦截 ----
+    // ---- F1: 全局 API 会话守卫与强制改密拦截（单次会话查询同时取 user 与 impersonating） ----
     const rawToken = this.extractSessionToken(req);
-    const sessionUser = rawToken ? this.sessionService.validate(rawToken) : null;
+    const validatedSession = rawToken
+      ? this.sessionService.validateWithMeta(rawToken, clientMeta)
+      : null;
+    const sessionUser = validatedSession?.user ?? null;
     if (rawToken && !sessionUser) {
       this.sendJson(res, 401, { ok: false, error: '会话已过期或令牌无效，请重新登录' });
       return;
     }
-    if (process.env.AUTH_REQUIRED === 'true') {
-      if (!sessionUser) {
-        this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
-        return;
-      }
-      if (
-        sessionUser.mustChangePassword &&
-        pathname !== '/api/auth/me' &&
-        pathname !== '/api/auth/change-password'
-      ) {
-        this.sendJson(res, 403, {
-          ok: false,
-          error: '首次登录或重置口令后必须先修改密码',
-          mustChangePassword: true,
-        });
-        return;
-      }
+    const impersonatedBy = validatedSession?.impersonatedBy ?? null;
+    if (process.env.AUTH_REQUIRED === 'true' && !sessionUser) {
+      this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
+      return;
+    }
+    // P0-5：强制改密拦截在 AUTH_REQUIRED=true 与默认模式下统一生效
+    if (
+      sessionUser &&
+      sessionUser.mustChangePassword &&
+      !impersonatedBy &&
+      pathname !== '/api/auth/me' &&
+      pathname !== '/api/auth/change-password'
+    ) {
+      this.sendJson(res, 403, {
+        ok: false,
+        error: '首次登录或重置口令后必须先修改密码',
+        mustChangePassword: true,
+      });
+      return;
     }
 
     const body = method === 'POST' || method === 'PATCH' ? await this.readJsonBody(req) : undefined;
-    const authCtx = this.resolveAuthContext(req, urlObj, body, rawToken, sessionUser);
+    const authCtx = this.resolveAuthContext(
+      req,
+      urlObj,
+      body,
+      rawToken,
+      sessionUser,
+      impersonatedBy,
+    );
     const actorUserId = authCtx.actorUserId;
+
+    if (method === 'GET' && pathname === '/api/events/history') {
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+        );
+      }
+      const targetRunId = this.resolveRequestRunId({
+        explicitRunId: urlObj.searchParams.get('runId'),
+      });
+      const stageId = urlObj.searchParams.get('stageId')?.trim() || undefined;
+      const sinceIso = urlObj.searchParams.get('since')?.trim() || undefined;
+      const untilIso = urlObj.searchParams.get('until')?.trim() || undefined;
+      const offsetParam = urlObj.searchParams.get('offset');
+      const limitParam = urlObj.searchParams.get('limit');
+      const offset = offsetParam ? Number(offsetParam) : 0;
+      const limit = limitParam ? Number(limitParam) : 40;
+      const page = this.orchestrator.eventBus.getEventHistoryPage({
+        runId: targetRunId,
+        stageId,
+        sinceIso,
+        untilIso,
+        offset: Number.isFinite(offset) ? offset : 0,
+        limit: Number.isFinite(limit) ? limit : 40,
+      });
+      this.sendJson(res, 200, {
+        ok: true,
+        data: {
+          runId: targetRunId,
+          ...page,
+        },
+      });
+      return;
+    }
 
     if (method === 'GET' && pathname === '/api/events/stream') {
       const streamActorId =
@@ -490,11 +640,14 @@ data: ${frame}
       }
       const subscribedRunId = urlObj.searchParams.get('runId')?.trim() || null;
       const initialRunId = subscribedRunId ?? this.resolveDefaultRunId();
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-      });
+      res.writeHead(
+        200,
+        this.buildSecurityHeaders({
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+        }),
+      );
       const initialState = this.orchestrator.buildWorkbenchDashboardState(
         initialRunId,
         streamActorId,
@@ -554,6 +707,12 @@ data: ${frame}
     }
 
     if (method === 'GET' && pathname === '/api/workflows/templates') {
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+        );
+      }
       const templates = WorkflowDslLoader.listAvailableTemplates().map((t) => ({
         fileName: t.fileName,
       }));
@@ -605,6 +764,7 @@ data: ${frame}
       const runState = await this.orchestrator.startProposalWorkflow({
         proposal,
         initiatorActor: `${user.displayName} (${user.jobTitle})`,
+        initiatorUserId: user.userId,
       });
       this.activeRunId = runState.runId;
 
@@ -619,6 +779,7 @@ data: ${frame}
 
     // ---- A4: 模型基线体检端点（admin-only）——两级端点各发 3 个固定 JSON 任务 ----
     if (method === 'POST' && pathname === '/api/admin/model-baseline') {
+      this.enforceRateLimit('expensive', req, this.expensiveRateLimitMax);
       if (process.env.AUTH_DISABLED !== 'true') {
         const user = this.sessionService.getUserById(actorUserId);
         if (!user || user.tier !== 'PROJECT_ADMIN' || user.status !== 'ACTIVE') {
@@ -636,10 +797,9 @@ data: ${frame}
         this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
         return;
       }
-      const impersonating = this.sessionService.isImpersonating(authCtx.rawToken);
       this.sendJson(res, 200, {
         ok: true,
-        data: { user: authCtx.user, impersonating },
+        data: { user: authCtx.user, impersonating: authCtx.impersonatedBy },
       });
       return;
     }
@@ -664,25 +824,49 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/auth/act-as') {
-      if (
-        authCtx.authSource !== 'session' ||
-        !authCtx.rawToken ||
-        !authCtx.user ||
-        authCtx.user.tier !== 'PROJECT_ADMIN'
-      ) {
+      const canActAs =
+        authCtx.authSource === 'session' &&
+        authCtx.rawToken !== null &&
+        authCtx.user !== null &&
+        (authCtx.user.tier === 'PROJECT_ADMIN' || authCtx.impersonatedBy?.tier === 'PROJECT_ADMIN');
+      if (!canActAs || !authCtx.rawToken) {
         this.sendJson(res, 403, { ok: false, error: '仅项目管理员可切换视角' });
         return;
       }
-      const result = this.sessionService.actAs(authCtx.rawToken, String(body?.targetUserId ?? ''));
+      const result = this.sessionService.actAs(
+        authCtx.rawToken,
+        String(body?.targetUserId ?? ''),
+        clientMeta,
+      );
       if (!result) {
         this.sendJson(res, 404, { ok: false, error: '目标成员不存在或已停用' });
         return;
       }
-      res.writeHead(200, {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Set-Cookie': `sdlc_session=${result.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800`,
-      });
-      res.end(JSON.stringify({ ok: true, data: { user: result.user } }));
+      this.sendJson(
+        res,
+        200,
+        { ok: true, data: { user: result.user, impersonating: result.impersonating } },
+        { 'Set-Cookie': this.buildSessionCookie(result.token, 28800, req) },
+      );
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/auth/exit-act-as') {
+      if (authCtx.authSource !== 'session' || !authCtx.rawToken || !authCtx.user) {
+        this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
+        return;
+      }
+      const result = this.sessionService.exitActAs(authCtx.rawToken, clientMeta);
+      if (!result) {
+        this.sendJson(res, 400, { ok: false, error: '当前会话未处于管理员视角切换状态' });
+        return;
+      }
+      this.sendJson(
+        res,
+        200,
+        { ok: true, data: { user: result.user, impersonating: null } },
+        { 'Set-Cookie': this.buildSessionCookie(result.token, 28800, req) },
+      );
       return;
     }
 
@@ -789,6 +973,7 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/proposals') {
+      this.enforceRateLimit('expensive', req, this.expensiveRateLimitMax);
       const user =
         process.env.AUTH_DISABLED === 'true'
           ? this.orchestrator.rbacService.getUserOrDefault(actorUserId)
@@ -888,9 +1073,17 @@ data: ${frame}
         });
       }
 
+      const baseInitiator = String(
+        body?.initiatorActor ?? `${user.displayName} (${user.jobTitle})`,
+      );
+      const attributedInitiator = authCtx.impersonatedBy
+        ? `${baseInitiator} (via ${authCtx.impersonatedBy.displayName})`
+        : baseInitiator;
+
       const runState = await this.orchestrator.startProposalWorkflow({
         proposal,
-        initiatorActor: String(body?.initiatorActor ?? `${user.displayName} (${user.jobTitle})`),
+        initiatorActor: attributedInitiator,
+        initiatorUserId: user.userId,
         scenarioHints,
       });
       this.activeRunId = runState.runId;
@@ -921,6 +1114,8 @@ data: ${frame}
       const extraTokenBudget =
         body?.extraTokenBudget !== undefined ? Number(body.extraTokenBudget) : undefined;
 
+      const impersonatedByLabel = authCtx.impersonatedBy?.displayName;
+
       await this.orchestrator.submitHumanGateDecision({
         runId: targetRunId,
         snapshotId,
@@ -932,6 +1127,7 @@ data: ${frame}
           extraTokenBudget !== undefined && Number.isFinite(extraTokenBudget)
             ? extraTokenBudget
             : undefined,
+        impersonatedByLabel,
       });
 
       const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
@@ -957,6 +1153,7 @@ data: ${frame}
       });
       const extraTokenBudget =
         body?.extraTokenBudget !== undefined ? Number(body.extraTokenBudget) : undefined;
+      const impersonatedByLabel = authCtx.impersonatedBy?.displayName;
 
       await this.orchestrator.retryAbortedStage({
         runId: targetRunId,
@@ -968,6 +1165,7 @@ data: ${frame}
           extraTokenBudget !== undefined && Number.isFinite(extraTokenBudget)
             ? extraTokenBudget
             : undefined,
+        impersonatedByLabel,
       });
 
       const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
@@ -992,6 +1190,7 @@ data: ${frame}
         ? (String(body.targetStageId) as WorkflowStageId)
         : undefined;
       const humanActor = String(body?.humanActor ?? '项目总负责人');
+      const impersonatedByLabel = authCtx.impersonatedBy?.displayName;
 
       await this.orchestrator.invokeSupervisorConversationalRollback({
         runId: targetRunId,
@@ -999,11 +1198,88 @@ data: ${frame}
         actorUserId,
         dialogueInstruction,
         explicitTargetStageId,
+        impersonatedByLabel,
       });
 
       const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
       this.broadcastSseStateUpdate(targetRunId);
       this.sendJson(res, 200, { ok: true, data: state });
+      return;
+    }
+
+    if (method === 'GET' && pathname === '/api/supervisor/tools') {
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.VIEW_SHARED_WORKFLOW,
+        );
+      }
+      this.sendJson(res, 200, {
+        ok: true,
+        data: { tools: this.orchestrator.supervisorAgent.getToolSchemas() },
+      });
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/supervisor/tools') {
+      const toolName = String(body?.toolName ?? '').trim();
+      const allowedTools = [
+        'get_run_overview',
+        'summarize_conflict',
+        'override_gate',
+        'rollback_and_fork',
+      ] as const;
+      if (!allowedTools.includes(toolName as (typeof allowedTools)[number])) {
+        this.sendJson(res, 400, { ok: false, error: `未知总管工具: ${toolName || '(empty)'}` });
+        return;
+      }
+      const typedTool = toolName as (typeof allowedTools)[number];
+      if (process.env.AUTH_DISABLED !== 'true') {
+        const requiredPermission =
+          typedTool === 'override_gate'
+            ? SystemPermissionCode.APPROVE_ASSIGNED_STAGE_GATE
+            : typedTool === 'rollback_and_fork'
+              ? SystemPermissionCode.INVOKE_SUPERVISOR_ROLLBACK
+              : SystemPermissionCode.VIEW_SHARED_WORKFLOW;
+        this.orchestrator.rbacService.assertHasPermission(actorUserId, requiredPermission);
+      }
+      const targetRunId = this.resolveRequestRunId({
+        explicitRunId: body?.runId,
+        snapshotId: typeof body?.snapshotId === 'string' ? body.snapshotId : undefined,
+      });
+      const rawResult = await this.orchestrator.supervisorAgent.executeTool(
+        this.orchestrator,
+        typedTool,
+        {
+          ...(body ?? {}),
+          runId: targetRunId,
+          actorUserId,
+          impersonatedByLabel: authCtx.impersonatedBy?.displayName,
+        },
+      );
+      if (typedTool === 'override_gate' || typedTool === 'rollback_and_fork') {
+        const updatedRun =
+          rawResult as import('../engine/DagWorkflowStateEngine.ts').WorkflowRunState;
+        const dashboardState = this.orchestrator.buildWorkbenchDashboardState(
+          targetRunId,
+          actorUserId,
+        );
+        this.broadcastSseStateUpdate(targetRunId);
+        this.sendJson(res, 200, {
+          ok: true,
+          data: {
+            toolName: typedTool,
+            result: {
+              runId: updatedRun.runId,
+              status: updatedRun.getStatus(),
+              activeBranchId: updatedRun.getActiveBranchId(),
+            },
+            dashboardState,
+          },
+        });
+        return;
+      }
+      this.sendJson(res, 200, { ok: true, data: { toolName: typedTool, result: rawResult } });
       return;
     }
 
@@ -1025,6 +1301,7 @@ data: ${frame}
         stageId,
         actorUserId,
         content,
+        impersonatedByLabel: authCtx.impersonatedBy?.displayName,
       });
       const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
       this.broadcastSseStateUpdate(targetRunId);
@@ -1033,7 +1310,7 @@ data: ${frame}
     }
 
     if (method === 'GET' && pathname === '/api/sandbox/file') {
-      if (process.env.AUTH_DISABLED !== 'true' && authCtx.authSource !== 'none') {
+      if (process.env.AUTH_DISABLED !== 'true') {
         this.orchestrator.rbacService.assertHasPermission(
           actorUserId,
           SystemPermissionCode.VIEW_SHARED_WORKFLOW,
@@ -1047,9 +1324,17 @@ data: ${frame}
         runState.runId,
         runState.getActiveBranchId(),
       );
+      const workspacePrefix = workspacePath.endsWith(path.sep)
+        ? workspacePath
+        : workspacePath + path.sep;
       const relativePath = String(urlObj.searchParams.get('path') ?? '').trim();
       const targetFull = path.resolve(workspacePath, relativePath);
-      if (!targetFull.startsWith(workspacePath) || !fs.existsSync(targetFull)) {
+      if (
+        !relativePath ||
+        !targetFull.startsWith(workspacePrefix) ||
+        !fs.existsSync(targetFull) ||
+        !fs.statSync(targetFull).isFile()
+      ) {
         throw new Error(`未找到沙箱文件: ${relativePath}`);
       }
       const content = fs.readFileSync(targetFull, 'utf-8');
@@ -1065,6 +1350,7 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/sandbox/verify') {
+      this.enforceRateLimit('expensive', req, this.expensiveRateLimitMax);
       if (process.env.AUTH_DISABLED !== 'true') {
         this.orchestrator.rbacService.assertHasPermission(
           actorUserId,
@@ -1092,7 +1378,7 @@ data: ${frame}
     }
 
     if (method === 'POST' && pathname === '/api/rag/query') {
-      if (process.env.AUTH_DISABLED !== 'true' && authCtx.authSource !== 'none') {
+      if (process.env.AUTH_DISABLED !== 'true') {
         this.orchestrator.rbacService.assertHasPermission(
           actorUserId,
           SystemPermissionCode.VIEW_SHARED_WORKFLOW,
@@ -1127,9 +1413,12 @@ data: ${frame}
       if (!rawLesson) {
         throw new Error('避坑经验内容不能为空');
       }
+      const ragActorLabel = authCtx.impersonatedBy
+        ? `${user.displayName} (via ${authCtx.impersonatedBy.displayName})`
+        : user.displayName;
       this.orchestrator.auditLedger.registerRejectionLesson(
         stageId,
-        `[${user.displayName} 录入企业红线] ${rawLesson}`,
+        `[${ragActorLabel} 录入企业红线] ${rawLesson}`,
       );
       const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
       this.broadcastSseStateUpdate(targetRunId);
@@ -1167,19 +1456,118 @@ data: ${frame}
     this.sendJson(res, 404, { ok: false, error: `未知路由: ${method} ${pathname}` });
   }
 
+  private buildSecurityHeaders(
+    extra: Record<string, string>,
+    options?: { isHtml?: boolean },
+  ): Record<string, string> {
+    const base: Record<string, string> = {
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'same-origin',
+    };
+    if (options?.isHtml) {
+      base['Content-Security-Policy'] =
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'";
+    }
+    return { ...base, ...extra };
+  }
+
+  private buildSessionCookie(token: string, maxAgeSec: number, req: http.IncomingMessage): string {
+    const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '')
+      .split(',')[0]
+      ?.trim()
+      .toLowerCase();
+    const isTlsSocket = Boolean((req.socket as { encrypted?: boolean } | undefined)?.encrypted);
+    const isSecure =
+      process.env.COOKIE_SECURE === 'true' || forwardedProto === 'https' || isTlsSocket;
+    return `sdlc_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}${isSecure ? '; Secure' : ''}`;
+  }
+
+  private extractClientMetadata(req: http.IncomingMessage): { ip: string; userAgent: string } {
+    const xff = req.headers['x-forwarded-for'];
+    const ip =
+      (typeof xff === 'string' && xff.split(',')[0]?.trim()) ||
+      req.socket?.remoteAddress ||
+      'in-process';
+    const uaRaw = req.headers['user-agent'];
+    const userAgent = typeof uaRaw === 'string' ? uaRaw.trim() : '';
+    return { ip, userAgent };
+  }
+
+  private enforceRateLimit(bucket: string, req: http.IncomingMessage, limit: number): void {
+    const clientIp = this.extractClientMetadata(req).ip;
+    const key = `${bucket}:${clientIp}`;
+    const now = Date.now();
+    const cutoff = now - this.rateLimitWindowMs;
+    const recent = (this.rateLimitBuckets.get(key) ?? []).filter((ts) => ts > cutoff);
+    if (recent.length >= limit) {
+      const retryAfterSec = Math.max(
+        1,
+        Math.ceil((recent[0] + this.rateLimitWindowMs - now) / 1000),
+      );
+      this.rateLimitBuckets.set(key, recent);
+      throw new HttpRequestError(429, '请求过于频繁，请稍后重试', retryAfterSec);
+    }
+    recent.push(now);
+    this.rateLimitBuckets.set(key, recent);
+  }
+
   private readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
-      req.on('data', (chunk: Buffer) => chunks.push(chunk));
-      req.on('end', () => {
+      let totalBytes = 0;
+      let settled = false;
+
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.off('error', onError);
+      };
+
+      const fail = (err: Error): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(err);
+      };
+
+      const onData = (chunk: Buffer): void => {
+        totalBytes += chunk.length;
+        if (totalBytes > this.maxBodyBytes) {
+          fail(new HttpRequestError(413, `请求体大小超过上限 (${this.maxBodyBytes} 字节)`));
+          return;
+        }
+        chunks.push(chunk);
+      };
+
+      const onEnd = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
         try {
           const raw = Buffer.concat(chunks).toString('utf-8').trim();
           resolve(raw ? (JSON.parse(raw) as Record<string, unknown>) : {});
         } catch (err) {
           reject(err);
         }
-      });
-      req.on('error', reject);
+      };
+
+      const onError = (err: Error): void => {
+        fail(err);
+      };
+
+      const timer = setTimeout(() => {
+        fail(new HttpRequestError(408, '请求体读取超时'));
+      }, this.bodyTimeoutMs);
+
+      req.on('data', onData);
+      req.on('end', onEnd);
+      req.on('error', onError);
     });
   }
 
@@ -1187,8 +1575,15 @@ data: ${frame}
     res: http.ServerResponse,
     statusCode: number,
     payload: Record<string, unknown>,
+    extraHeaders?: Record<string, string>,
   ): void {
-    res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.writeHead(
+      statusCode,
+      this.buildSecurityHeaders({
+        'Content-Type': 'application/json; charset=utf-8',
+        ...(extraHeaders ?? {}),
+      }),
+    );
     res.end(JSON.stringify(payload));
   }
 }

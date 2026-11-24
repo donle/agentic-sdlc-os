@@ -611,24 +611,26 @@ v1 原型里，所有角色看到的界面**完全一样**。管理员王总管�
 
 ## 14. v2 改造落地清单（后端 + 前端）
 
-### 后端（建议优先，先做 G1 / G2）
+> ✅ 以下后端 G1–G4/G6 与前端 v2 改造项已于第二十四轮（[`P2_2_MERIDIAN_UI_V2_MIGRATION.md`](./P2_2_MERIDIAN_UI_V2_MIGRATION.md)）全部落地并通过 `tests/ui-v2-contracts.spec.ts` 与实时浏览器验收。
 
-- [ ] G1：`ArtifactContract` 基类增加 `agentRationale?: string`、`keyDecisions?: {decision, rationale, tradeoffs}[]`；至少为 PM / TechLead / Engineer / QA 填充（PD 已有 `designChallengeNote`，改为基类字段并保留旧字段兼容）
-- [ ] G2：挂起 / 通过 / 驳回时广播的事件补 `detailPayload`（snapshotId / riskScore / riskLevel / gateAction / droppedRequirementIds）
-- [ ] G3：`liveInteractionStream` 支持按阶段与时间范围分页
-- [ ] G4：扩展 `BoundedNegotiationMediator` 调用点，让步骤 1 / 3a 也产生真实协商记录
-- [ ] G6：`artifactSummary` 升级为结构化 `{ headline, rationale, caveats[] }`（可先只新增字段、保留旧 `summary` 字符串兼容）
+### 后端（已全部完成 G1 / G2 / G3 / G4 / G6）
 
-### 前端（`src/ui/client/**`）
+- [x] G1：`ArtifactContract` 基类与 6 个阶段契约增加 `agentRationale?: string`、`keyDecisions?: {decision, rationale, tradeoffs}[]` 并为 6 大 Agent 填充（PD 保留 `designChallengeNote` 向后兼容）
+- [x] G2：挂起 / 自动放行 / 通过 / 驳回时广播的事件补 `detailPayload`（snapshotId / riskScore / riskLevel / gateAction / droppedRequirementIds）
+- [x] G3：`liveInteractionStream` 支持按阶段与时间范围分页（`GET /api/events/history` + `WorkflowEventBus.getEventHistoryPage`）
+- [x] G4：扩展 `BoundedNegotiationMediator` 调用点，让步骤 1 / 3a 可产生真实协商记录（DSL 声明或 `enableExtendedPeerNegotiation`）
+- [x] G6：`artifactSummary` 升级为结构化 `structuredSummary: { headline, rationale, caveats[] }`（保留旧 `summary` / `artifactSummary` 字符串兼容）
 
-- [ ] **删除 `lib/stageContent.tsx` 中的 `ACTIONS_BY_STAGE` 与 `STAGE_DISCUSSIONS`**（编造内容），改为按 `artifactType` 渲染真实 `artifactDetails`
-- [ ] 新增 `components/AgentDeliverableReview.tsx`：审阅面板（交付物 / 推演过程 / 团队评论 + 裁决区）
-- [ ] 新增 `lib/artifactParsers.ts`：六类 artifact 的运行时解析器 + 缺字段兜底（G5）
-- [ ] 新增 `lib/perspective.ts`：视角分级状态机（L1/L2/L3），单一数据源驱动全站
-- [ ] `views/GateCenterView.tsx`：改为队列 + 审阅面板双栏；移除全局共用意见框；补 A/B 对比卡
-- [ ] `views/WorkspaceView.tsx`：脊柱 + 审阅面板 + 事件链（每条可下钻）
-- [ ] `components/Topbar.tsx`：成员视角切换器改为读 `rbacContext.roster`（修掉漏周工 DA 的 bug），并接入视角状态机
-- [ ] `components/AgentFlowCanvas.tsx`：脊柱支持 L1 摘要节点形态，节点数按 `stagePipelineOrder` 动态
-- [ ] `components/DetailDrawer.tsx`：分级抽屉（420 速览 / 640 详情 / 960 审阅）
-- [ ] `styles/workbench.css`：整体替换为 v2 令牌与组件层；**浅色为默认主题**
-- [ ] `WorkbenchApiClient.ts`：新增 `GET /api/workflows/templates` 调用（去掉硬编码模板名）
+### 前端（`src/ui/client/**`，已全部完成）
+
+- [x] **删除 `lib/stageContent.tsx` 中的 `ACTIONS_BY_STAGE` 与 `STAGE_DISCUSSIONS`**（编造内容），改为基于真实 `structuredSummary`、`artifactDetails`、事件链与协商记录渲染
+- [x] 新增 `components/AgentDeliverableReview.tsx`：审阅面板（交付物 / 推演过程 / 团队评论 + 裁决区）
+- [x] 新增 `lib/artifactParsers.ts`：六类 artifact 的运行时解析器 + 缺字段兜底（G5）
+- [x] 新增 `lib/perspective.ts`：视角分级状态机（L1/L2/L3），单一数据源驱动全站
+- [x] `views/GateCenterView.tsx`：改为队列 + 审阅面板双栏；移除全局共用意见框；补 A/B 对比卡
+- [x] `views/WorkspaceView.tsx`：脊柱 + 审阅面板 + 事件链（每条可下钻）
+- [x] `components/Topbar.tsx`：成员视角切换器读 `rbacContext.roster` 并接入视角状态机 `StatusChip`
+- [x] `components/AgentFlowCanvas.tsx`：脊柱支持 L1 摘要节点形态，节点数按 `stagePipelineOrder` 动态
+- [x] `components/DetailDrawer.tsx`：分级抽屉（420 速览 / 640 详情 / 960 审阅）
+- [x] `styles/workbench.css`：对齐 Meridian v2 令牌与布局层（浅色默认 + 窄视口响应式修复）
+- [x] `WorkbenchApiClient.ts`：提供 `GET /api/workflows/templates` 与 `GET /api/events/history` 封装

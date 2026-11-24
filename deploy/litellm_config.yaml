@@ -1,0 +1,29 @@
+# LiteLLM 私有化统一模型网关配置 (BYOM: 本地 Ollama/vLLM + 脱敏云端高阶模型 + 本地向量嵌入)
+model_list:
+  - model_name: qwen2.5-coder-32b-instruct-int4
+    litellm_params:
+      model: ollama_chat/qwen2.5-coder:32b
+      api_base: os.environ/OLLAMA_API_BASE
+
+  - model_name: qwen2.5-coder-32b-instruct-local
+    litellm_params:
+      model: ollama_chat/qwen2.5-coder:32b
+      api_base: os.environ/OLLAMA_API_BASE
+
+  - model_name: claude-3-7-sonnet-enterprise
+    litellm_params:
+      model: anthropic/claude-3-7-sonnet-20250219
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: bge-m3-local
+    litellm_params:
+      model: ollama/bge-m3
+      api_base: os.environ/OLLAMA_API_BASE
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 60
+  num_retries: 2
+
+general_settings:
+  master_key: os.environ/LITELLM_API_KEY
