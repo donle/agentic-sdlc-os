@@ -604,7 +604,6 @@ export class WorkflowOrchestratorFacade {
    */
   public async continueExecutionUntilGateOrComplete(runId: string): Promise<WorkflowRunState> {
     const runState = this.stateEngine.getRunOrThrow(runId);
-    const tokenBudgetLimit = this.dslConfig.guardrails.tokenBudgetLimit;
 
     while (runState.getStatus() === 'RUNNING') {
       const currentStageId = runState.getCurrentStageId();
@@ -658,7 +657,10 @@ export class WorkflowOrchestratorFacade {
         historicalRejectionLessons: historicalLessons,
         humanFeedbackDirective: rollbackDirective,
         scenarioHints: runState.scenarioHints,
-        tokenBudgetRemaining: tokenBudgetLimit - runState.getTokensUsedTotal(),
+        tokenBudgetRemaining: Math.max(
+          0,
+          runState.getTokenBudget() - runState.getTokensUsedTotal(),
+        ),
         dynamicContextNeeds,
       });
 
@@ -707,7 +709,7 @@ export class WorkflowOrchestratorFacade {
             message:
               (err instanceof Error ? err.message : String(err)) +
               (violations.length > 0 ? `\n违规项：${violations.join('；')}` : ''),
-            relatedSnapshotId: 'ROOT',
+            relatedSnapshotId: `RETRY:${currentStageId}:${Date.now()}`,
             requiresHumanAction: true,
             actionOptions: [
               {
@@ -1012,6 +1014,79 @@ export class WorkflowOrchestratorFacade {
   }
 
   /**
+   * AUDIT-10：从契约失败（ABORTED）或预算超限（ABORTED_TOKEN_BUDGET）状态恢复重试当前阻塞阶段
+   */
+  public async retryAbortedStage(params: {
+    runId: string;
+    reviewerActor: string;
+    actorUserId?: string;
+    comment?: string;
+    targetSnapshotOrRetryId?: string;
+    extraTokenBudget?: number;
+  }): Promise<WorkflowRunState> {
+    const runState = this.stateEngine.getRunOrThrow(params.runId);
+    const status = runState.getStatus();
+    if (status !== 'ABORTED' && status !== 'ABORTED_TOKEN_BUDGET') {
+      throw new Error(`运行 [${params.runId}] 当前状态 [${status}] 无需熔断重试`);
+    }
+    const currentStageId = runState.getCurrentStageId();
+    if (!currentStageId) {
+      throw new Error(`运行 [${params.runId}] 无可重试的当前阶段`);
+    }
+
+    let effectiveReviewerLabel = params.reviewerActor;
+    if (params.actorUserId) {
+      const authResult = this.rbacService.assertCanApproveStageGate(
+        params.actorUserId,
+        currentStageId,
+      );
+      effectiveReviewerLabel = authResult.formattedActorLabel;
+    }
+
+    if (status === 'ABORTED_TOKEN_BUDGET') {
+      const topUp = params.extraTokenBudget ?? Math.max(20000, runState.getTokenBudget());
+      runState.increaseTokenBudget(topUp);
+    }
+
+    if (params.targetSnapshotOrRetryId) {
+      this.eventBus.resolveNotificationBySnapshotId(params.targetSnapshotOrRetryId);
+    }
+    this.eventBus.resolveFailureNotificationsForStage(params.runId, currentStageId);
+
+    const retryComment =
+      params.comment?.trim() ||
+      (status === 'ABORTED_TOKEN_BUDGET'
+        ? `追加 Token 预算至 ${runState.getTokenBudget()} 并重试阶段 ${currentStageId}`
+        : `已排查原因并重试阶段 ${currentStageId}`);
+
+    this.auditLedger.recordDecision(
+      new HumanDecisionRecord({
+        decisionId: `DEC-RETRY-${Date.now()}`,
+        runId: params.runId,
+        snapshotId: params.targetSnapshotOrRetryId ?? `RETRY:${currentStageId}`,
+        branchId: runState.getActiveBranchId(),
+        stageId: currentStageId,
+        reviewerActor: effectiveReviewerLabel,
+        verdict: DecisionVerdict.APPROVE,
+        comment: retryComment,
+      }),
+    );
+
+    this.addTeamComment({
+      runId: params.runId,
+      stageId: currentStageId,
+      actorUserId: params.actorUserId ?? 'user-admin-01',
+      content: `[熔断重试恢复] ${retryComment}`,
+      category: 'APPROVAL_NOTE',
+      persist: false,
+    });
+
+    runState.setStatus('RUNNING');
+    this.syncPersistenceState();
+    return await this.continueExecutionUntilGateOrComplete(params.runId);
+  }
+
+  /**
    * 人工在前端审核门禁或冲突裁决台提交决定（批准 / 选方案 A / 选方案 B / 驳回重做）
    * 若传入 actorUserId，强制执行 RBAC 阶段专长责任人或顶层管理员权限校验。
    */
@@ -1022,10 +1097,24 @@ export class WorkflowOrchestratorFacade {
     actorUserId?: string;
     verdict: DecisionVerdict;
     comment: string;
+    extraTokenBudget?: number;
   }): Promise<WorkflowRunState> {
     const runState = this.stateEngine.getRunOrThrow(params.runId);
     const snapshot = runState.findSnapshotById(params.snapshotId);
     if (!snapshot) {
+      const isRetryTarget = params.snapshotId === 'ROOT' || params.snapshotId.startsWith('RETRY:');
+      const status = runState.getStatus();
+      const isAborted = status === 'ABORTED' || status === 'ABORTED_TOKEN_BUDGET';
+      if (isRetryTarget && isAborted && params.verdict === DecisionVerdict.APPROVE) {
+        return await this.retryAbortedStage({
+          runId: params.runId,
+          reviewerActor: params.reviewerActor,
+          actorUserId: params.actorUserId,
+          comment: params.comment,
+          targetSnapshotOrRetryId: params.snapshotId,
+          extraTokenBudget: params.extraTokenBudget,
+        });
+      }
       throw new Error(`未找到待审核快照 [${params.snapshotId}]`);
     }
 

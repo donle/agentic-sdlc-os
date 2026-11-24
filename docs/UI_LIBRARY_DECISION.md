@@ -191,5 +191,5 @@ src/ui/kit/
 - [x] 42 个导出组件（TSX，含 50 枚内联 SVG 图标）
 - [x] 组件总览页 `#/gallery`：7 个分区，每个组件的全部状态并排展示，顶部实时切换主题 × 密度
 - [x] 主题与密度作用域限定在总览页自身，不干扰宿主应用
-- [x] `npm run check` 全绿（2026-11-22 验收快照为双端 typecheck + ESLint + Prettier + 19/19 测试；当前全库基线为 143 项测试 / 45 套件）
+- [x] `npm run check` 全绿（2026-11-22 验收快照为双端 typecheck + ESLint + Prettier + 19/19 测试；当前全库后端测试基线为 169 项 / 48 套件 / 28 文件，165 过 / 4 既有 skip；注：前端构建需先在工作区安装 `react`/`react-dom` 等依赖）
 - [x] 产物体积：kit CSS 约 43KB（`tokens.css` ~9KB + `primitives.css` ~34KB 源文件，未压缩；`workbench.css` ~40KB），JS 从 328KB → 379KB

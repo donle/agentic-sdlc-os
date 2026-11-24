@@ -436,13 +436,18 @@ export class GitWorktreeSandboxManager {
           );
           try {
             const dockerResult = this.dockerRuntime.runSuite(testFile, workspacePath, resultsDir);
-            suite = TestResultParser.parseSuiteOutput(
-              dockerResult.output,
-              suiteName,
-              dockerResult.timedOut,
-            );
-            if (suite.timedOut || (dockerResult.exitCode !== null && dockerResult.exitCode !== 0)) {
+            if (dockerResult.infrastructureFailure) {
               runtime = 'host-fallback';
+              console.warn(
+                `[Sandbox] docker 基础设施异常（exitCode=${dockerResult.exitCode}, timedOut=${dockerResult.timedOut}）→ 单套件降级宿主机`,
+              );
+              suite = TestResultParser.runSuite(testFile, workspacePath, 15000);
+            } else {
+              suite = TestResultParser.parseSuiteOutput(
+                dockerResult.output,
+                suiteName,
+                dockerResult.timedOut,
+              );
             }
           } catch (err) {
             runtime = 'host-fallback';

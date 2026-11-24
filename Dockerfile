@@ -2,8 +2,8 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# Install git for GitWorktreeSandboxManager
-RUN apk add --no-cache git
+# Install git for GitWorktreeSandboxManager and postgresql-client for psql-based PG sync/queries
+RUN apk add --no-cache git postgresql-client
 
 COPY package.json package-lock.json* ./
 RUN npm ci --ignore-scripts || npm install --ignore-scripts

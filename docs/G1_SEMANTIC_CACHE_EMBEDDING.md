@@ -60,7 +60,7 @@
 6. savedTokens 如实记账（A3 口径）
 7. `buildSemanticIntentText`：相同 ID 不同描述 → 文本不同
 
-**完成时测试基线**：95 项（91 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
+**完成时测试基线**：95 项（91 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：169 项 / 48 套件 / 28 文件，165 过 / 4 既有 skip）
 
 ## 遗留
 

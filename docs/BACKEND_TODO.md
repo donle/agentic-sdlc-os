@@ -6,8 +6,8 @@
 > 每个条目标注：现状代码位置 → 目标行为 → 验收标准 → 依赖关系。（§一至§四作为历史基线不再回勾，新进项以 §五复选框与 `BACKEND_TODO_IMPL_LOG.md` 为准。）
 
 > [!IMPORTANT]
-> **执行状态（2026-11-23 更新）**：本文第一至四章为**初始审计基线存档**（2026-11-22），该批 A/B/C/D/E/F/G1/G2/G10/I1/I2/I3/J2/G11/J 条目及 M1-M7 Mockup 替代已全部实现（其中 D1/D2/D3/E3/I1 等在深度复核中暴露的未闭环缺陷已转入文末 §五 `#8–#14` 跟踪；详见 `BACKEND_TODO_IMPL_LOG.md`；原遗留项 H1-H3 为 P2 外部集成，暂挂待业务范围决策，见 `P2_REMAINING_PLAN.md`）。
-> 2026-11-23 针对当前实现代码的深度复核新发现 **14 个具体工程问题（#1–#14）**：其中 **#1–#7 已完成修复与文档同步**（第八、九轮），**尚待修复的 #8–#14 已统一登记至文末第五章（§五）**（同步索引于 `BACKEND_TODO_IMPL_LOG.md` 的"待实现项"表）。新条目开工前请以本文第五章、`BACKEND_TODO_IMPL_LOG.md` 与 `P2_REMAINING_PLAN.md` 为准。
+> **执行状态（2026-11-24 更新）**：本文第一至四章为**初始审计基线存档**（2026-11-22），该批 A/B/C/D/E/F/G1/G2/G10/I1/I2/I3/J2/G11/J 条目及 M1-M7 Mockup 替代已全部实现；2026-11-23 针对实现代码深度复核发现的 **14 个工程问题（`#1–#14`）** 已在第八、九轮（`#1–#7`）及第十一至十四轮（`#8–#14`）**全部完成修复并清零**（另第十轮完成 Agent 质量治理 `DS-1~DS-4`，详见 [`BACKEND_TODO_IMPL_LOG.md`](./BACKEND_TODO_IMPL_LOG.md)）。
+> **当前最新待办**：原 P2 外部集成 `H1–H3` 暂挂于 [`P2_REMAINING_PLAN.md`](./P2_REMAINING_PLAN.md)；**2026-11-24 全项目（前端 + 后端 + 部署 + 验证）完整度复审新发现的剩余缺口已统一登记至文末第六章（§六）**，开工前请以本文第六章、`BACKEND_TODO_IMPL_LOG.md` 与 `P2_REMAINING_PLAN.md` 为准。
 
 ---
 
@@ -236,9 +236,9 @@
 
 ---
 
-## 五、2026-11-23 后端深度审计待修复 TODO（#8–#14）
+## 五、2026-11-23 后端深度审计修复清单（#8–#14，已全部清零）
 
-> 本章记录 2026-11-23 后端深度审计中识别、且在第八/九轮修复（#1–#7）后**仍未解决的 7 个具体工程问题**。执行状态同步索引于 [`BACKEND_TODO_IMPL_LOG.md`](./BACKEND_TODO_IMPL_LOG.md) 的"待实现项"表（编号 `AUDIT-8` 至 `AUDIT-14`）。
+> 本章记录 2026-11-23 后端深度审计中识别的 7 个关键工程问题（`AUDIT-8` 至 `AUDIT-14`），**已于第十一至十四轮（2026-11-23 ~ 2026-11-24）全部修复并验收通过**。执行明细同步记录于 [`BACKEND_TODO_IMPL_LOG.md`](./BACKEND_TODO_IMPL_LOG.md)。
 
 ### P0 阻断级（持久化与重启恢复可靠性）
 
@@ -260,38 +260,69 @@
 
 ### P1 核心工程缺陷（交互异常、沙箱真实性与并发安全）
 
-- [ ] **#10（AUDIT-10 / 关联 A2、B3）修复熔断通知 `RETRY_STAGE` 按钮点击报 400 的交互死路**
-  - **现状**：`src/engine/WorkflowOrchestratorFacade.ts` 的 `continueExecutionUntilGateOrComplete()` catch 块在捕获 `StageContractError` 或 `TokenBudgetExceededError` 时，发布 `STAGE_CONTRACT_FAILED` / `TOKEN_BUDGET_EXCEEDED` 通知，携带 `relatedSnapshotId: 'ROOT'` 与 `actionOptions`（其中 `RETRY_STAGE` 对应 `verdict: DecisionVerdict.APPROVE`）；但点击该按钮触发 `submitHumanGateDecision()` 时，代码调用 `runState.findSnapshotById('ROOT')` 并抛出 `未找到待审核快照 [ROOT]`，导致前端请求返回 400 错误。
-  - **目标**：为契约熔断 / 预算超限通知绑定真实可恢复的阶段标识或专属重试入口（或当 `RETRY_STAGE` 命中熔断恢复路径时由 `WorkflowOrchestratorFacade` 安全重启失败节点），确保用户点击通知动作可真正触发阶段重试而非 400。
-  - **验收**：新增测试模拟 `StageContractError`（及 `TokenBudgetExceededError`）触发通知后调用决策/重试接口，验证返回 200 且该阶段重新进入执行状态，不再抛出 `未找到待审核快照 [ROOT]`。
-
-- [ ] **#11（AUDIT-11）修复 `RealGitWorktree.remove()` 匹配逻辑错误导致无法清理或误删其他 Worktree**
-  - **现状**：`src/sandbox/RealGitWorktree.ts` 的 `remove(branchName)` 对 `git worktree list --porcelain` 输出按 `.find((line) => line.startsWith('worktree ') && line.includes('/worktree/'))` 匹配目录；实际磁盘路径（如 `.sandbox-worktrees/<runId>/<branchId>`）通常不包含 `/worktree/`（该前缀位于 `branch refs/heads/worktree/...` 行），且 `.find()` 未按 `branchName` 对应的 porcelain stanza 精确绑定，导致清理静默失败或误删同一仓库下的其他 worktree。
-  - **目标**：按 `git worktree list --porcelain` 的空行分段（stanza）解析每组 `worktree <path>` 与 `branch refs/heads/<branch>`，严格匹配目标 `branchName` 后再执行 `git worktree remove` 与分支清理。
-  - **验收**：在真实临时 Git 仓库创建至少 2 个不同 branch 的 worktree，调用 `remove(branchA)` 后仅 `branchA` 对应 worktree 与分支被移除，`branchB` 完整保留。
-
-- [ ] **#12（AUDIT-12 / 关联 E3）修复 `DockerTestRuntime` 管道吞没退出码与测试失败被误标为 `host-fallback`**
+- [x] **#10（AUDIT-10 / 关联 A2、B3）修复熔断通知 `RETRY_STAGE` 按钮点击报 400 的交互死路**（✅ 已于第十三轮修复）
   - **现状**：
-    - `src/sandbox/DockerTestRuntime.ts` 执行 `sh -c "node --test --test-reporter=spec --experimental-test-coverage ${containerTestPath} 2>&1 | tee /results/${resultsBasename}"` 时未开启 `pipefail`（Alpine BusyBox `sh` 亦需注意兼容性），管道返回的是 `tee` 的退出码 `0` 而非 `node --test` 的真实退出码。
-    - `src/sandbox/GitWorktreeSandboxManager.ts` 在 `dockerResult.exitCode !== 0` 时直接设置 `runtime = 'host-fallback'`，将单元测试用例失败混同为 Docker 容器启动/引擎故障；同时需核验 `node:22-alpine` 镜像内直接运行 TypeScript 测试文件的兼容性。
-  - **目标**：
-    - 使用不依赖管道掩码的方式保留容器内测试真实退出码（如文件重定向或显式保存 `$?`），并校验 `node:22-alpine` 下 TypeScript 测试执行链路。
-    - 在 `GitWorktreeSandboxManager.ts` 区分"Docker 引擎/容器基础设施不可用"与"容器内测试断言失败"，仅前者才触发 `host-fallback`。
-  - **验收**：单测验证容器内测试失败（退出码非 0）时 `runtime` 仍准确报告为 `docker` 且失败用例数正确解析；仅当 Docker daemon 不可用/超时/镜像缺失时才降级为 `host-fallback`。
+    - `WorkflowRunState`（`src/engine/DagWorkflowStateEngine.ts`）新增 `increaseTokenBudget()`；`WorkflowEventBus`（`src/patterns/EventBus.ts`）新增 `resolveFailureNotificationsForStage()`。
+    - `WorkflowOrchestratorFacade.continueExecutionUntilGateOrComplete()`（`src/engine/WorkflowOrchestratorFacade.ts`）在捕获 `StageContractError` / `TokenBudgetExceededError` 时改用可识别重试标识 `RETRY:<stageId>:<timestamp>`；新增 `retryAbortedStage()` 并在 `submitHumanGateDecision()` 识别 `RETRY:*` 与历史 `ROOT` 且处于 `ABORTED` / `ABORTED_TOKEN_BUDGET` 状态时自动走安全重启（预算熔断时支持按 `extraTokenBudget` 或默认额度扩容）。
+    - `WorkbenchHttpServer`（`src/server/WorkbenchServer.ts`）新增专属 `POST /api/runs/retry` 端点并令 `POST /api/decisions` 透传 `extraTokenBudget`。
+  - **验收**：已在 `tests/retry-and-concurrency-sse.spec.ts` Test 1–2 验证 `StageContractError` 与 `TokenBudgetExceededError` 经 `/api/decisions`（含 `RETRY:*` 与历史 `ROOT`）及 `/api/runs/retry` 均返回 200 且阶段恢复推进，通知标记已解决（详见 `BACKEND_TODO_IMPL_LOG.md` 第十三轮）。
 
-- [ ] **#13（AUDIT-13 / 关联 D3）消除 `WorkbenchServer` 全局单一 `activeRunId` 并发串台，并接线 SSE `Last-Event-ID` 重放**
-  - **现状**：
-    - `src/server/WorkbenchServer.ts` 使用单一实例级 `this.activeRunId`：`GET /api/state?runId=` 会修改全局 `this.activeRunId`；`/api/decisions`、`/api/supervisor/rollback`、`/api/comments`、`/api/sandbox/file`、`/api/sandbox/verify` 均直接读取 `this.activeRunId` 而非请求自带 `runId`；`broadcastSseStateUpdate()` 向全部 SSE 客户端广播当前全局 `this.activeRunId` 状态，多用户或多标签页查看不同 Run 时会互相覆盖甚至误操作错误 Run。
-    - `/api/events/stream` 未读取请求头 `last-event-id` 并调用 `this.sseBridge.replay()`（`src/server/SseBridge.ts` 已实现 `replay(clientLastId, write)` 但未接线）。
-  - **目标**：
-    - 所有读写接口优先以请求显式传入的 `runId`（query/body/path）定位目标 Run，不再用 `GET /api/state` 覆盖实例全局状态（仅无 `runId` 时回退默认最新 Run）；SSE 连接按订阅 `runId` 隔离推送或携带精确事件通道。
-    - `/api/events/stream` 读取 `req.headers['last-event-id']` 并调用 `this.sseBridge.replay()` 补发断线期间缺失事件。
-  - **验收**：并发打开两个不同 `runId` 的状态查询与审批请求互不串台；`GET /api/events/stream` 携带 `Last-Event-ID` 请求头时能够重放该 ID 之后的增量事件。
+- [x] **#11（AUDIT-11）修复 `RealGitWorktree.remove()` 匹配逻辑错误导致无法清理或误删其他 Worktree**（✅ 已于第十四轮修复）
+  - **现状**：`src/sandbox/RealGitWorktree.ts` 新增 `parsePorcelainWorktrees()` 按空行分段（stanza）解析 `git worktree list --porcelain` 中的 `worktree <path>` 与 `branch refs/heads/<branch>`，`remove(branchName)` 按 `refs/heads/<branchName>` 精确匹配对应 worktree 并执行 `git worktree remove --force` 与 `git branch -D`，不再因匹配 `/worktree/` 路径片段而清理失败或误删无关 worktree。
+  - **验收**：已在 `tests/sandbox-manager.spec.ts` Test 4 验证多 stanza porcelain 解析与真实临时 Git 仓库双 worktree 选择性清理（移除 `branchA` 后 `branchB` 目录、文件及分支完整保留）。
 
-- [ ] **#14（AUDIT-14 / 关联 I1）补全 `Dockerfile` 的 `postgresql-client` 与 `docker-compose.yml` 的 `LITELLM_ENABLE_LIVE_HTTP=true`**
+- [x] **#12（AUDIT-12 / 关联 E3）修复 `DockerTestRuntime` 管道吞没退出码与测试失败被误标为 `host-fallback`**（✅ 已于第十四轮修复）
   - **现状**：
-    - `Dockerfile` 仅执行 `apk add --no-cache git`，缺少 `postgresql-client`，导致容器化部署时 `PersistenceRepository` 与 `WarehouseQueryProvider` 调用 `execFileSync('psql', ...)` 抛出 `ENOENT`。
-    - `deploy/docker-compose.yml` 中 `agentic-workbench` 服务的 `environment` 缺少 `LITELLM_ENABLE_LIVE_HTTP=true`，导致通过 Compose 一键拉起后 LLM 调用仍停留在离线回退模式。
-  - **目标**：
-    - 在 `Dockerfile` 中补齐 `postgresql-client` 安装；在 `deploy/docker-compose.yml` 的 `agentic-workbench` 环境变量中默认启用 `LITELLM_ENABLE_LIVE_HTTP=true`（及检查镜像运行所需环境一致）。
-  - **验收**：容器内可执行 `psql --version` 且 `docker compose config` 校验 `agentic-workbench` 含 `LITELLM_ENABLE_LIVE_HTTP=true`。
+    - `src/sandbox/DockerTestRuntime.ts` 将容器执行命令改为 `node --experimental-strip-types --test --test-reporter=spec --experimental-test-coverage "${containerTestPath}" > "/results/${resultsBasename}" 2>&1; ec=$?; cat "/results/${resultsBasename}"; exit $ec`，不依赖管道即可留档输出并严格保留 `node --test` 真实退出码（同时兼容 `node:22-alpine` TypeScript 执行）；新增 `infrastructureFailure` 与 `DockerTestRuntime.isInfrastructureFailure()`（仅超时、`exitCode === null`、Docker CLI 引擎错误码 `125/126/127` 或守护进程/镜像错误文本判定为基础设施故障）。
+    - `src/sandbox/GitWorktreeSandboxManager.ts` 仅在 `dockerResult.infrastructureFailure === true`（或抛异常）时才降级 `host-fallback`；容器内测试断言失败（`exitCode=1`）准确保持 `runtime='docker'` 并如实解析失败用例数。
+  - **验收**：已在 `tests/docker-runtime.spec.ts` Test 1 与 Test 6–7 验证命令退出码保留、`exitCode=1` 单测失败保持 `runtime='docker'`、以及 `exitCode=125` 镜像缺失降级 `host-fallback`。
+
+- [x] **#13（AUDIT-13 / 关联 D3）消除 `WorkbenchServer` 全局单一 `activeRunId` 并发串台，并接线 SSE `Last-Event-ID` 重放**（✅ 已于第十三轮修复）
+  - **现状**：
+    - `WorkbenchHttpServer`（`src/server/WorkbenchServer.ts`）移除 `GET /api/state` 与 `POST /api/runs/select` 对全局 `this.activeRunId` 的篡改，新增 `resolveRequestRunId()`（优先显式 `runId`，`/api/decisions` 缺省 `runId` 时按 `snapshotId`/通知反向定位），覆盖 `/api/decisions`、`/api/runs/retry`、`/api/supervisor/rollback`、`/api/comments`、`/api/sandbox/file`、`/api/sandbox/verify`、`/api/rag/ingest` 与 `/api/admin/governance`。
+    - `SseBridge`（`src/server/SseBridge.ts`）缓存与广播携带 `runId` 并新增 `getLatestEventId()`；`GET /api/events/stream?runId=...` 按客户端订阅 `runId` 隔离推送，并读取请求头 `last-event-id`（或 `?lastEventId`）调用 `sseBridge.replay(..., subscribedRunId)` 精确增量重放；`WorkbenchApiClient`（`src/ui/client/WorkbenchApiClient.ts`）同步追踪当前页签 `activeRunId` 并在各类读写请求及 SSE 订阅中透传。
+  - **验收**：已在 `tests/retry-and-concurrency-sse.spec.ts` Test 3–4 验证多标签页并发查询/评论/签核严格隔离，以及 SSE 按 `runId` 隔离推送与 `Last-Event-ID` 断线重放，全数通过（详见 `BACKEND_TODO_IMPL_LOG.md` 第十三轮）。
+
+- [x] **#14（AUDIT-14 / 关联 I1）补全 `Dockerfile` 的 `postgresql-client` 与 `docker-compose.yml` 的 `LITELLM_ENABLE_LIVE_HTTP=true`**（✅ 已于第十四轮修复）
+  - **现状**：
+    - `Dockerfile` 的 `apk add --no-cache` 已补全 `git postgresql-client`，容器内具备 `psql` CLI 供 `PersistenceRepository` 与 `WarehouseQueryProvider` 调用。
+    - `deploy/docker-compose.yml` 中 `agentic-workbench.environment` 已默认加入 `LITELLM_ENABLE_LIVE_HTTP=true`。
+  - **验收**：已在 `tests/docker-runtime.spec.ts` Test 8 校验 `Dockerfile` 安装 `postgresql-client` 且 `deploy/docker-compose.yml` 配置 `LITELLM_ENABLE_LIVE_HTTP=true`（真实镜像构建/Compose 拉起随容器环境执行）。
+
+---
+
+## 六、2026-11-24 全项目完整度复审与下一阶段待办
+
+> 在 `#1–#14` 全部清零与 `169 项 / 48 套件` 测试全绿之后，2026-11-24 对**后端、前端、部署配置与验证覆盖面**进行了一次全仓完整度重审。以下为仍未补完的工程缺口（按 P0 / P1 / P2 排序，作为下一阶段施工清单）。
+
+### P0（阻断级：前后端联调、鉴权闭环、并发与安全边界）
+
+- [ ] **P0-1：恢复前端 React 构建链路并替换过期静态产物 `src/ui/dist/`**
+  - **现状**：`package.json` 已声明 `react`/`react-dom`/`@types/react`/`@types/react-dom`，但当前工作区 `node_modules/` 缺失上述依赖，`npm run typecheck:frontend` 与 `npm run build:ui` 无法通过；且 `src/ui/dist/main.js` 与 `WorkbenchViewController.js` 仍为 2026-11-22 旧版非 React DOM 控制器，与 `src/ui/index.html` 的 `<div id="root">` 入口不匹配，运行服务访问页面会白屏。
+- [ ] **P0-2：补齐前端 F1/F2 登录鉴权与用户管理 UI（解除 `AUTH_REQUIRED=true` 前端不可用）**
+  - **现状**：`src/ui/client/` 尚无 `LoginView.tsx`、首次登录强制改密弹窗及 401/403 拦截跳转；`WorkbenchApiClient.ts` 仅支持 `X-Actor-Id`，未封装 `/api/auth/login|logout|me|change-password|act-as` 与 `/api/admin/users*`；`App.tsx` 初始化未 `.catch()` 401 响应；`AdminGovernanceView.tsx` 仅展示只读花名册，尚未接入后端已就绪的成员 CRUD 与登录审计接口。
+- [ ] **P0-3：修复 `act-as` 不可逆切换陷阱与业务审计 `"via <admin>"` 归属**
+  - **现状**：`POST /api/auth/act-as` 切换为 `STAGE_SPECIALIST` 后，由于无 `/api/auth/exit-act-as` 端点且再次调用 `act-as` 校验 `tier === 'PROJECT_ADMIN'` 会返回 403，管理员陷入单向锁定直到退出重登；同时 `ResolvedAuthContext` 未透传 `impersonatedBy`，人工裁决/回退/评论与审计账本暂未自动记录 `"via <admin>"` 归属。
+- [ ] **P0-4：加装同 `runId` 异步并发互斥锁，消除共享单例 Agent 可变状态竞态**
+  - **现状**：`WorkflowOrchestratorFacade` 对同一 `runId` 的异步执行/裁决/回退/重试缺少串行锁，并发写请求可能交错改写快照状态；`SoftwareEngineerAgent.lastPreparedSandbox` 与 `QualityAssuranceAgent.lastPreparedVerification` 以实例字段保存单次准备结果，并发跑不同 `runId` 时会互相覆盖，导致 `validateStageSpecificConstraints()` 因 key 不匹配而静默跳过防谎报校验。
+- [ ] **P0-5：`WorkbenchServer` HTTP 安全加固与默认模式越权收敛**
+  - **现状**：`readJsonBody` 无请求体字节上限（大载荷可致内存膨胀）且缺少超时保护；静态/API 响应缺少 `X-Content-Type-Options` / `X-Frame-Options` / `CSP` 安全头，`Set-Cookie` 缺少 `Secure` 标志（HTTPS/代理场景），登录及高开销接口无速率限制；`/styles/*.css`、`/dist/*.js` 与 `/api/sandbox/file` 的 `startsWith` 路径检查未补 `path.sep` 后缀存在兄弟目录前缀边角问题；非 `AUTH_REQUIRED=true` 默认模式下 `GET /api/workflows/templates` 匿名放行、`GET /api/sandbox/file` 与 `POST /api/rag/query` 对 `authSource === 'none'` 跳过 RBAC、且未拦截 `mustChangePassword=true` 会话。
+- [ ] **P0-6：修复 `src/retrospective/runRetrospective.ts` 6 处漏写 `await` 并改为评估真实历史运行**
+  - **现状**：第 53/65/75/85/97/127 行调用 `submitHumanGateDecision()` / `invokeSupervisorConversationalRollback()` 时遗漏 `await`（紧随其后的快照读取与异步推进竞态）；基准脚本直接向默认 `.runtime-data/` 写入合成 `PROP-BENCH-001/002` 而未调用 `restoreFromPersistence()` 读取真实历史运行；第 141 行主模块判定未使用 `pathToFileURL`（Windows 不可直启）。
+
+### P1（高优：前端交互修复、PG/持久化一致性、Agent 真实代码落盘与实网 E2E）
+
+- [ ] **P1-1：修复前端多 Run SSE 重连串台与若干视图交互缺陷**
+  - **现状**：`App.tsx` SSE `useEffect` 依赖缺失 `state?.run?.runId`，切项目或新立项后旧 `EventSource` 仍推送旧项目状态造成界面覆盖，且卸载未关闭 `EventSource`；`WorkbenchApiClient` 尚未消费后端已推送的 `run_event`/`user_notification` 增量帧，也未封装 `POST /api/runs/retry` 与 `extraTokenBudget`；`submitDecision` 漏传 `notif.runId`；另存在 `Topbar` 硬编码 6 角色（漏周工 DA）与 2 模板名、`SandboxExplorerView` 硬编码 `通过率 100%` 弹窗且不回写 `dashboardState`、`AuditRagView` 展开后收起按钮条件不可达、`ProjectsHubView` 将 `ABORTED*` 渲染为 `⏳ 推进中`、`Sidebar` 嵌套 `<svg>` 等缺陷。
+- [ ] **P1-2：补齐 PG / JSON 双模式持久化一致性与 `psql` 阻塞优化**
+  - **现状**：`auth_sessions.ip` / `user_agent` 与 `auth_login_audit.ip` 尚未在登录/校验时采集写入；`workflow_runs.created_by_user_id` 与 `human_decisions.reviewer_user_id` 双轨外键列尚未在 upsert/recovery 中赋值；PG 侧暂缺 `notifications`、`live_events` 与 `audit_entries` 表（纯 PG 容器无本地 `.runtime-data/` 时重启会丢失通知卡与审计时间轴）；JSON 模式下 `JsonUserStore` 将会话与登录审计仅存内存（重启全部失效）；`updateAdminGovernanceConfig()`、缓存与复盘统计重启不保留；`rejected_history_rag` 建表为 `vector(1536)` 而默认 `bge-m3-local` 输出 1024 维（实网升级入库会触发整事务回滚）；`PgUserStore`/`PgPersistenceDriver` 每次调用同步 `execFileSync('psql')`，鉴权路径每请求两次阻塞事件循环。
+- [ ] **P1-3：打通 Agent / 上下文预算裁剪 / 沙箱深层闭环**
+  - **现状**：Stage 3b `SoftwareEngineerAgent` 先调用 `provisionWorktreeAndWriteCode()` 写入模板代码并完成测试，再调 LLM 生成 JSON 摘要——LLM 编写的真实代码与 QA 修复补丁尚未实际写回 Worktree；`WorkflowOrchestratorFacade` 调用 `contextRegistry.resolve()` 丢弃了 `TrimmedContext`，Agent 仍从未裁剪的 `runCache` 取数且 `clearRunCache()` 从未调用；`STAGE_3B_ENGINEER` 声明的必填 `dependency_versions` 暂无 Provider；`SupervisorAgent` 冲突升级文案硬编码 PD 选项且 `explicitTargetStageId` 未校验 `allowedStages`；`supervisorTools.ts` 4 个工具函数尚未接入 `SupervisorAgent`/`WorkbenchServer`；I3 `COMPLETED` 终态钩子不可达且 `docker-results/` 未从清理扫描排除；全库 4 项既有 `it.skip` 用例（含 `a1-llm-integration.spec.ts` test 5 内联 YAML 误传问题）待清理/收口。
+- [ ] **P1-4：实网 Docker Compose + PG + 本地大模型 + Playwright UI 端到端验证与部署配置修正**
+  - **现状**：当前 165 项通过测试均运行于进程内 dispatch / Mock SQL / Fake Docker CLI；尚无面向真实 `pgvector`、真实 Docker daemon、真实 Ollama/vLLM/LiteLLM 推理端点与浏览器 Playwright 的 E2E 自动化验证；同时 `Dockerfile`（`--ignore-scripts` 风险、启动脚本重复 `build:ui`、root 权限、`HEALTHCHECK` 缺失）、`deploy/docker-compose.yml`（缺 `service_healthy`、工作区持久化卷与 `litellm_config.yaml` 挂载）及 `deploy/.env.example`（漏列 12 个新增环境变量）需随实网联调一并完善。
+
+### P2（架构演进、外部集成与工程卫生）
+
+- [ ] **P2-1：H1–H3 企业真实外部系统接入**（待业务侧明确凭证与字段映射语义后实施，见 [`P2_REMAINING_PLAN.md`](./P2_REMAINING_PLAN.md)）。
+- [ ] **P2-2：Meridian UI Kit (`src/ui/kit/`) 实际接入 7 个业务视图**（当前仅 `ComponentGalleryView` 引用）。
+- [ ] **P2-3：测试隔离卫生清理**：为未传隔离目录的既有测试统一使用临时 `persistenceDir`/`sandboxRootDir`，清理仓库残留的 `.sandbox-worktrees/` 与测试膨胀的 `.runtime-data/` WAL。

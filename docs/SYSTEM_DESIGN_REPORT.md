@@ -4,11 +4,11 @@
 > 本报告基于“多智能体协商 + 全流程可控状态机 + 人类交叉审核 + 总管异常接管与回退 + 全链路审计追溯”的核心理念，系统性地梳理了端到端研发工作流、潜在遗漏补全以及核心技术子系统设计。
 
 > [!IMPORTANT]
-> **当前实现状态说明（2026-11-23 更新）**：本报告概念模型与六阶段工作流均已落地，工程栈实际采用 **Node 22 + TypeScript 单进程 + React 19 / Meridian UI（`:4300`）**：
+> **当前实现状态说明（2026-11-24 更新）**：本报告概念模型与六阶段工作流均已落地，工程栈实际采用 **Node 22 + TypeScript 单进程 + React 19 / Meridian UI（`:4300`）**：
 >
-> - **已实现核心能力**：Stage 0–5 全流水线（含 Stage 5 DA）、DAG 分叉回退、受限协商（B1/B2）、4 规则风险评估链、BYOM 混合路由与 A4 体检、Git Worktree / Docker CLI 沙箱、WAL/RAG 审计记忆、RBAC 与会话鉴权（JSON 路径）。
+> - **已实现核心能力**：Stage 0–5 全流水线（含 Stage 5 DA）、DAG 分叉回退、受限协商（B1/B2）与跨模型质量/防迎合治理（DS-1~DS-4）、4 规则风险评估链、BYOM 混合路由与 A4 体检、Git Worktree / Docker CLI 沙箱、WAL/RAG 审计记忆（含 PG 驱动全量恢复）、RBAC 与会话鉴权（JSON / PG 双路径，`JsonUserStore` + `PgUserStore`）。
 > - **P2 挂起项**：外部系统集成（H1 Worktree Git 上下文 / H2 Jira·飞书双向同步 / H3 Figma REST API）见 [`P2_REMAINING_PLAN.md`](./P2_REMAINING_PLAN.md)。
-> - **待修审计缺陷**：2 项 P0 + 5 项 P1（`#8–#14`）见 [`BACKEND_TODO.md`](./BACKEND_TODO.md) §五与 [`BACKEND_TODO_IMPL_LOG.md`](./BACKEND_TODO_IMPL_LOG.md)。
+> - **审计进度与剩余待办**：2026-11-23 深度审计 `#1–#14` 已在第八至十四轮**全部清零**；**2026-11-24 全项目完整度复审剩余待办**（前端 React 构建恢复与登录 UI、并发锁/HTTP 安全加固、PG 双轨外键与异步化、Stage 3b 真实代码落盘、实网与 Playwright E2E 等）统一记录于 [`BACKEND_TODO.md`](./BACKEND_TODO.md) §六（历史执行明细见 [`BACKEND_TODO_IMPL_LOG.md`](./BACKEND_TODO_IMPL_LOG.md)）。
 
 ---
 
@@ -152,7 +152,7 @@ flowchart LR
 | **1. 技术方案前置门禁** | 直接让 AI 写代码，一旦表结构或 API 设计不合理，下游全盘返工。           | 增加 **Stage 3a（Tech Spec Gate）**，先审接口契约与数据库变更，再写代码。                                                                                                                               |
 | **2. 埋点设计前置**     | 若等到上线后才让 DA Agent 分析数据，往往发现关键行为根本没埋点。        | 在 **Stage 1（PRD 阶段）** 由 `ProductManagerAgent` 在 `PrdArtifactContract` 内强制前置输出《埋点规划（`trackingPlanEvents`）》，Stage 5 由 `DataAnalystAgent` 核验。                                   |
 | **3. 防“虚假共识”守卫** | 大模型有“讨好倾向”，PM 和 PD 为了达成一致可能悄悄砍掉核心需求绕过审核。 | 强制要求**结构化契约输出**；凡协商过程中修改/删减原始需求，必须触发 **Scope Diff 红线告警**。                                                                                                           |
-| **4. 沙箱与分支隔离**   | 多个任务并行或回退重做时，直接修改主干代码会导致环境污染与冲突。        | 每个任务分配独立的 **Git Worktree 沙箱与分支**（可选开启 `SANDBOX_RUNTIME=docker` 容器运行测试，见 `#11`/`#12`），互不干扰。                                                                            |
+| **4. 沙箱与分支隔离**   | 多个任务并行或回退重做时，直接修改主干代码会导致环境污染与冲突。        | 每个任务分配独立的 **Git Worktree 沙箱与分支**（可选开启 `SANDBOX_RUNTIME=docker` 容器运行测试），互不干扰。                                                                                            |
 | **5. 外部工具双向同步** | 企业不会为了用你的系统而抛弃现有的 Jira、飞书项目、GitLab。             | 提供可扩展上下游适配骨架；当前已实现本地 `GitContextProvider`、`McpContextProvider`、`WarehouseQueryProvider` 与确定性 Stub，Jira/飞书双向 Webhook（`H2`）规划为 P2 挂起（见 `P2_REMAINING_PLAN.md`）。 |
 | **6. 审批疲劳控制**     | 小改一个小按钮也要点 5 次人工确认，团队会很快放弃使用。                 | 支持**分级门禁策略**：高风险变更（DB/核心逻辑）强制阻塞，低风险变更支持默认放行+事后抽检。                                                                                                              |
 
@@ -190,7 +190,7 @@ flowchart LR
 
 ### 4.4 全链路不可变审计与追责系统（Audit Trail）
 
-每一次流转均写入只读追加（Append-Only）的审计日志库，确保任何生产事故都可精准反向追查（下表为概念模型，实际实现模型见 `src/domain/models.ts` 与 `deploy/init-pgvector-schema.sql` 的 5 张核心表——含 `rejected_history_rag` 负向经验向量表；PG 同步缺 `negotiation_logs` 与 `PgPersistenceDriver` 接线问题见 `BACKEND_TODO.md` §五 `#8`）：
+每一次流转均写入只读追加（Append-Only）的审计日志库，确保任何生产事故都可精准反向追查（下表为概念模型，实际实现模型见 `src/domain/models.ts` 与 `deploy/init-pgvector-schema.sql` 共 **10 张表**——5 张核心流水线与向量表含 `rejected_history_rag`、`negotiation_logs`，以及 5 张用户/认证/评论表含 `team_comments`；`PgPersistenceDriver` 与 PG 全量恢复已于第十二轮 `#8` 接线，双轨 FK 列写入与 PG 缺失运行态表跟踪见 `BACKEND_TODO.md` §六）：
 
 | 核心数据实体         | 关键字段设计                                                                                                                       | 业务与审计价值                                             |
 | :------------------- | :--------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------- |
@@ -316,8 +316,8 @@ workflow:
 
 1. **全栈本地化组件**：
    - **编排与服务层**：**Node 22 + TypeScript 单进程引擎与 HTTP/SSE 工作台（`:4300`）**，以及 React 19 + esbuild + Meridian UI 静态前端产物（替代早期 FastAPI + LangGraph 构想）。
-   - **数据与审计存储**：默认采用零依赖本地 JSON（`.runtime-data/`）+ 按月分片 JSONL WAL 持久化，同时可选通过 `psql` CLI 同步至本地 **PostgreSQL + `pgvector`**（`deploy/init-pgvector-schema.sql`；`negotiation_logs` 同步、用户体系 PG 表、`PgPersistenceDriver` 接线及容器内 `psql` 缺失待 `#8`/`#14` 补齐）。
-   - **隔离代码沙箱**：基于 **Git Worktree** 隔离各任务分支工作区（`#11` 待修清理匹配），默认宿主机运行 `node:test`，可选开启 `SANDBOX_RUNTIME=docker` 通过 Docker CLI 拉起一次性容器（`#12` 待修管道退出码与降级口径）。
+   - **数据与审计存储**：默认采用零依赖本地 JSON（`.runtime-data/`）+ 按月分片 JSONL WAL 持久化，同时可选通过 `psql` CLI 同步及恢复至本地 **PostgreSQL + `pgvector`**（`deploy/init-pgvector-schema.sql` 共 10 张表；`PgPersistenceDriver`、`PgUserStore`、容器内 `postgresql-client` 与 `LITELLM_ENABLE_LIVE_HTTP=true` 已于 `#8`/`#14` 补齐，异步优化与实网 E2E 见 `BACKEND_TODO.md` §六）。
+   - **隔离代码沙箱**：基于 **Git Worktree** 隔离各任务分支工作区（porcelain 分段精确清理已于 `#11` 修复），默认宿主机运行 `node:test`，可选开启 `SANDBOX_RUNTIME=docker` 通过 Docker CLI 拉起一次性容器（已于 `#12` 改用输出重定向 + `exit $ec` 并以 `infrastructureFailure` 严格区分单测失败与引擎故障）。
    - **本地模型直连**：默认适配客户内网的 **Ollama / vLLM / SGLang** 推理端点（或 `deploy/docker-compose.yml` 伴生 `litellm-router`），同时也保留加密配置项与脱敏中间件以支持按需接入外部合规 API Key。
 2. **闭环交付范围**：
    - 现行默认模板 `enterprise_sdlc.yaml` 已包含 **`Stage 0（提案） -> Stage 1（PM） -> Stage 2（PD） -> Stage 3a（Tech Spec） -> Stage 3b（Engineer 沙箱编码） -> Stage 4（QA 自动化验证） -> Stage 5（DA 埋点核验与 G11 数仓查询闭环）`** 全链路，以及全局 `总管 Agent 对话回退` 与 `全链路审计台`。

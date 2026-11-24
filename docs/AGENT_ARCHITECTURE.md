@@ -37,7 +37,7 @@
    - 若命中缓存，广播 `CACHE_HIT` 事件，零 Token 消耗直接返回已验证契约产物，并在复盘追踪器记为 `FULFILLED_VIA_CACHE`。
 4. **步骤 4：物理沙箱准备、混合模型路由与自愈重试循环 (Sandbox Prep, BYOM Routing & Self-Healing Loop)**
    - 先调用 `prepareStageEnvironment()` 执行阶段物理环境准备（Stage 3b 真实创建 Git Worktree 沙箱、落盘代码并自测；Stage 4 真实执行 `node:test`/Docker 测试与安全扫描），将真实结果作为 `sandboxVerification` 注入阶段 Prompt（离线模板降级复用同一准备结果，避免重复执行子进程）。
-   - **B3 预算前置守卫**：每次模型尝试前检查 `tokenBudgetRemaining`，不足时不再重试——直接记入 `FAILED_CONTRACT` 追踪并抛出 `TokenBudgetExceededError`（由 Facade 捕获并置为 `ABORTED_TOKEN_BUDGET`；当前熔断通知中的 `RETRY_STAGE` 见 `BACKEND_TODO.md` §五 `#10`）。
+   - **B3 预算前置守卫**：每次模型尝试前检查 `tokenBudgetRemaining`，不足时不再重试——直接记入 `FAILED_CONTRACT` 追踪并抛出 `TokenBudgetExceededError`（由 Facade 捕获并置为 `ABORTED_TOKEN_BUDGET`；熔断通知使用 `RETRY:<stageId>:<ts>`，支持经 `POST /api/runs/retry` 或 `POST /api/decisions` 触发 `retryAbortedStage()` 并按需扩容预算，见 `#10`）。
    - 按 `activeTier` 解析端点 `ModelCapabilityProfile`：支持 `json_schema` 时下发严格 JSON Schema 约束（不支持回落 `json_object`），按 `preferFewShotExample` 为小模型注入 1-shot 示例，并记录提供商侧 `cachedPromptTokens`；重试时携带 `priorViolations`、`repairMode: 'TARGETED_PATCH'` 与 `previousValidKeys` 局部修补。
    - LLM 输出经 `JsonExtractor` → `ArtifactContractFactory` 构造强类型契约；对产物同时执行 `validateContractIntegrity()` 与 `validateStageSpecificConstraints()`（PM/PD/TechLead 拦截占位符/非法 HTTP 与 DDL/高危低报；QA/Engineer 拦截谎报测试与漏洞）；连续两轮相同违规签名时，本地小模型自动升舱 `HIGH_REASONING_HYBRID`，高阶模型则提前触发 `STAGNATION_CIRCUIT_BREAKER` 避免空转。
 5. **步骤 5：防“虚假共识”与范围篡改校验 (False Consensus Guard)**

@@ -10,6 +10,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, it, afterEach } from 'node:test';
+import { parse as parseYaml } from 'yaml';
 
 import { DockerTestRuntime } from '../src/sandbox/DockerTestRuntime.ts';
 import { TestResultParser } from '../src/sandbox/TestResultParser.ts';
@@ -39,7 +40,7 @@ describe('E3 — DockerTestRuntime（一次性容器执行）', () => {
     }
   });
 
-  it('1. 命令构造：--network none + worktree 只读挂载 + 结果目录读写挂载 + tee 留档', () => {
+  it('1. 命令构造：--network none + worktree 只读挂载 + 结果目录读写挂载 + 重定向留档与真实退出码', () => {
     const workspace = path.join(os.tmpdir(), 'e3-workspace');
     const resultsDir = path.join(os.tmpdir(), 'e3-results');
     const testFile = path.join(workspace, 'tests', 'r1.sandbox.spec.ts');
@@ -67,8 +68,11 @@ describe('E3 — DockerTestRuntime（一次性容器执行）', () => {
     assert.equal(capturedArgs[indexOf('-w') + 1], '/workspace');
     assert.ok(capturedArgs.includes('node:22-alpine'));
     const shCommand = capturedArgs[capturedArgs.indexOf('-c') + 1];
+    assert.ok(shCommand.includes('--experimental-strip-types'), '开启 TS strip-types 兼容 Alpine');
     assert.ok(shCommand.includes('--test-reporter=spec'), '容器内使用 spec reporter');
-    assert.ok(shCommand.includes('| tee /results/'), '输出 tee 到结果目录留档');
+    assert.equal(shCommand.includes('| tee'), false, '禁止无 pipefail 管道吞没测试退出码');
+    assert.ok(shCommand.includes('> "/results/'), '输出重定向到结果目录留档');
+    assert.ok(shCommand.includes('ec=$?; cat "/results/') && shCommand.includes('exit $ec'));
     assert.ok(shCommand.includes('/workspace/tests/r1.sandbox.spec.ts'), '容器内测试路径正确');
 
     // 宿主侧复用同一解析口径
@@ -220,5 +224,105 @@ describe('E3 — 沙箱验证运行时切换与降级链', () => {
     } finally {
       fs.rmSync(tempSandboxRoot, { recursive: true, force: true });
     }
+  });
+
+  it('6. AUDIT-12：容器内单测断言失败 (exitCode=1) → 仍报告 runtime=docker 且如实解析失败用例数（不误标 host-fallback）', () => {
+    saveEnv(['SANDBOX_RUNTIME']);
+    process.env.SANDBOX_RUNTIME = 'docker';
+    const tempSandboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-audit12-fail-'));
+    try {
+      const failingSpecOutput = [
+        '▶ 套件',
+        '    ✔ 主路径 (1.1ms)',
+        '    ✖ 失败断言 (0.9ms)',
+        'ℹ tests 2',
+        'ℹ suites 1',
+        'ℹ pass 1',
+        'ℹ fail 1',
+        'ℹ duration_ms 10',
+      ].join('\n');
+
+      const dockerRuntime = new DockerTestRuntime({
+        probeCommand: () => true,
+        runCommand: () => ({ output: failingSpecOutput, timedOut: false, exitCode: 1 }),
+      });
+
+      const rawDockerRes = dockerRuntime.runSuite(
+        path.join(os.tmpdir(), 'dummy', 'r1.sandbox.spec.ts'),
+        path.join(os.tmpdir(), 'dummy'),
+        path.join(tempSandboxRoot, 'direct-results'),
+      );
+      assert.equal(rawDockerRes.exitCode, 1);
+      assert.equal(rawDockerRes.infrastructureFailure, false, '单测失败不得视为容器基础设施故障');
+
+      const manager = new GitWorktreeSandboxManager(tempSandboxRoot, { dockerRuntime });
+      const p = provisionSmallSandbox(manager);
+      const result = manager.executeSandboxVerification({
+        runId: p.runId,
+        branchId: p.branchId,
+        requirementIds: p.requirementIds,
+        runSubprocessNodeTest: true,
+      });
+
+      assert.equal(result.runtime, 'docker', '容器内单测失败时 runtime 必须保持 docker');
+      assert.equal(result.totalTestCases, 2);
+      assert.equal(result.passedTestCases, 1);
+      assert.equal(result.failedTestCases, 1);
+      assert.ok(result.executionLog.includes('[Sandbox Runtime] docker'));
+    } finally {
+      fs.rmSync(tempSandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('7. AUDIT-12：Docker 引擎故障 / 镜像缺失 (exitCode=125) → infrastructureFailure=true 并降级 host-fallback', () => {
+    saveEnv(['SANDBOX_RUNTIME']);
+    process.env.SANDBOX_RUNTIME = 'docker';
+    const tempSandboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-audit12-infra-'));
+    try {
+      const dockerRuntime = new DockerTestRuntime({
+        probeCommand: () => true,
+        runCommand: () => ({
+          output: 'docker: Error response from daemon: Unable to find image node:22-alpine locally',
+          timedOut: false,
+          exitCode: 125,
+        }),
+      });
+      const manager = new GitWorktreeSandboxManager(tempSandboxRoot, { dockerRuntime });
+      const p = provisionSmallSandbox(manager);
+      const result = manager.executeSandboxVerification({
+        runId: p.runId,
+        branchId: p.branchId,
+        requirementIds: p.requirementIds,
+        runSubprocessNodeTest: true,
+      });
+
+      assert.equal(result.runtime, 'host-fallback', 'Docker 引擎/镜像失败应准确降级 host-fallback');
+      assert.equal(result.totalTestCases, 2);
+      assert.equal(result.passedTestCases, 2);
+      assert.ok(result.executionLog.includes('[Sandbox Runtime] host-fallback'));
+    } finally {
+      fs.rmSync(tempSandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('8. AUDIT-14：Dockerfile 安装 postgresql-client 且 docker-compose.yml 默认启用 LITELLM_ENABLE_LIVE_HTTP=true', () => {
+    const dockerfileContent = fs.readFileSync(path.resolve(process.cwd(), 'Dockerfile'), 'utf-8');
+    assert.ok(dockerfileContent.includes('apk add'), 'Dockerfile 应包含 apk add 命令');
+    assert.ok(dockerfileContent.includes('git'), 'Dockerfile 应安装 git');
+    assert.ok(
+      dockerfileContent.includes('postgresql-client'),
+      'Dockerfile 应安装 postgresql-client 以支持 psql CLI',
+    );
+
+    const composePath = path.resolve(process.cwd(), 'deploy', 'docker-compose.yml');
+    const composeDoc = parseYaml(fs.readFileSync(composePath, 'utf-8')) as {
+      services?: Record<string, { environment?: string[] | Record<string, unknown> }>;
+    };
+    const workbenchEnv = composeDoc.services?.['agentic-workbench']?.environment;
+    assert.ok(Array.isArray(workbenchEnv), 'agentic-workbench 应配置 environment 列表');
+    assert.ok(
+      workbenchEnv.includes('LITELLM_ENABLE_LIVE_HTTP=true'),
+      'docker-compose.yml agentic-workbench 必须配置 LITELLM_ENABLE_LIVE_HTTP=true',
+    );
   });
 });

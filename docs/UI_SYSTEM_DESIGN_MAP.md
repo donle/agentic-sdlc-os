@@ -37,18 +37,18 @@
 
 **关键约束（直接影响 UI 形态）：**
 
-| 约束                                                                | 来源                               | 对 UI 的强制要求                                                                                                                                            |
-| ------------------------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 单例 `activeRunId` 存在于服务端内存（待 `#13` 按请求 `runId` 隔离） | `WorkbenchServer.activeRunId`      | 当前前端"切换项目"影响全局 `activeRunId`，顶栏保留全局项目切换器                                                                                            |
-| 每次状态变更服务端都会 `broadcastSseStateUpdate()`                  | 同上                               | 所有写操作返回**完整 DashboardStateDto**，前端无需乐观更新                                                                                                  |
-| SSE 连接按 `actorId` 区分，每条推送按接收者身份重新计算 RBAC        | `broadcastSseStateUpdate`          | 切换身份必须**重连 SSE**，否则会收到越权视角的数据                                                                                                          |
-| 后端 SSE 现推送 3 类事件，前端目前仅消费 `state_updated`            | `SseBridge` + `WorkbenchApiClient` | 后端已按 `id: <seq>` 推 `run_event`、`user_notification` 与 `state_updated`（断线 `Last-Event-ID` 重放待 `#13` 接线）；当前前端仍靠整树替换 `state_updated` |
-| 后端已落地 `SessionService`，前端尚未迁移登录流                     | `resolveAuthContext` / `App.tsx`   | 后端支持 Cookie/Bearer 与 `AUTH_REQUIRED=true`，默认模式下写接口与未知 `X-Actor-Id` 已被严格拦截；前端目前仍通过 `X-Actor-Id` 与身份切换条演示              |
-| 静态资源由自研 Node 服务托管，无 CDN                                | `routeRequest`                     | 不能引入外部字体/图标 CDN，离线内网可用是硬需求 → **必须内联 SVG 图标，系统字体栈**                                                                         |
+| 约束                                                                       | 来源                               | 对 UI 的强制要求                                                                                                                                                                          |
+| -------------------------------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 服务端已按请求 `runId` 隔离（`#13`），不再以全局 `activeRunId` 串台        | `resolveRequestRunId` / `App.tsx`  | `GET /api/state` 与 `POST /api/runs/select` 仅返回对应 `runId` 状态；`WorkbenchApiClient` 维护当前页签 `activeRunId`（注：`App.tsx` SSE 重连暂缺 `runId` 依赖，见 `BACKEND_TODO.md` §六） |
+| 每次状态变更服务端仅向对应 `runId` 订阅者 `broadcastSseStateUpdate(runId)` | 同上                               | 所有写操作返回**完整 DashboardStateDto**，前端无需乐观更新                                                                                                                                |
+| SSE 连接按 `actorId` + `runId` 区分，每条推送按接收者身份重新计算 RBAC     | `broadcastSseStateUpdate`          | 切换身份或切换 `runId` 都必须**重连 SSE**，否则会收到越权视角或旧项目状态                                                                                                                 |
+| 后端 SSE 推 3 类事件并已接线 `Last-Event-ID` 重放，前端暂只消费全量帧      | `SseBridge` + `WorkbenchApiClient` | 后端按 `id: <seq>` 与 `runId` 推送 `run_event`、`user_notification`、`state_updated` 并支持 `Last-Event-ID` 断线重放（`#13`）；前端仍靠整树替换 `state_updated`                           |
+| 后端已落地 `SessionService`，前端尚未迁移登录流                            | `resolveAuthContext` / `App.tsx`   | 后端支持 Cookie/Bearer 与 `AUTH_REQUIRED=true`，默认模式下写接口与未知 `X-Actor-Id` 已被严格拦截；前端目前仍通过 `X-Actor-Id` 与身份切换条演示                                            |
+| 静态资源由自研 Node 服务托管，无 CDN                                       | `routeRequest`                     | 不能引入外部字体/图标 CDN，离线内网可用是硬需求 → **必须内联 SVG 图标，系统字体栈**                                                                                                       |
 
 ---
 
-## 2. API 契约全表（26 个 `/api/*` 端点）
+## 2. API 契约全表（27 个 `/api/*` 端点）
 
 ### 2.1 统一约定
 
@@ -61,26 +61,27 @@
 
 ### 2.2 端点明细
 
-| #     | 方法 | 路径                                                                                                                     | 请求                                                                                            | 响应 `data`                                                 | 副作用 / 说明                                                                   |
-| ----- | ---- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| 1     | GET  | `/api/health`                                                                                                            | —                                                                                               | 健康/配置/运行摘要                                          | 豁免鉴权（`AUTH_REQUIRED=true` 亦可访问）                                       |
-| 2     | GET  | `/api/state`                                                                                                             | query: `actorId`, `runId?`                                                                      | `DashboardStateDto`                                         | 切换 `activeRunId`（待 `#13` 解耦）                                             |
-| 3     | POST | `/api/runs/select`                                                                                                       | `{runId, actorUserId}`                                                                          | `DashboardStateDto`                                         | 切换 `activeRunId` + SSE 广播                                                   |
-| 4     | POST | `/api/proposals`                                                                                                         | preset 或自定义，见 §2.3                                                                        | `DashboardStateDto`                                         | **新建运行实例** + SSE 广播                                                     |
-| 5     | GET  | `/api/workflows/templates`                                                                                               | —                                                                                               | `{activeTemplateFile, templates[]}`                         | 无（**前端目前未使用**，可作动态模板列表源）                                    |
-| 6     | POST | `/api/workflows/template`                                                                                                | `{templateFileName, actorUserId}`                                                               | `DashboardStateDto`                                         | 重载 YAML DSL + **新建运行实例** + SSE 广播                                     |
-| 7     | POST | `/api/decisions`                                                                                                         | `{snapshotId, verdict, comment, actorUserId}`                                                   | `DashboardStateDto`                                         | 写 `HumanDecision` → 推进/驳回/拍板 + SSE 广播                                  |
-| 8     | POST | `/api/comments`                                                                                                          | `{stageId, content, actorUserId}`                                                               | `DashboardStateDto`                                         | 写 `TeamComment`（全员可见）+ SSE 广播                                          |
-| 9     | POST | `/api/supervisor/rollback`                                                                                               | `{targetStageId?, dialogueInstruction, actorUserId}`                                            | `DashboardStateDto`                                         | **Fork 新分支**，旧分支标 `SUPERSEDED` + SSE 广播                               |
-| 10    | GET  | `/api/sandbox/file`                                                                                                      | query: `path`, `actorId`                                                                        | `{relativePath, branchId, content}`                         | 无（路径穿越有防护）                                                            |
-| 11    | POST | `/api/sandbox/verify`                                                                                                    | `{actorUserId}`                                                                                 | `{verification:{executionLog}, dashboardState}`             | 子进程跑真实单测 + 安全扫描 + SSE 广播                                          |
-| 12    | POST | `/api/rag/query`                                                                                                         | `{stageId, queryText}`                                                                          | `{matches: RagQueryMatchDto[]}`                             | 无（Top-K 余弦检索）                                                            |
-| 13    | POST | `/api/rag/ingest`                                                                                                        | `{stageId, lessonText, actorUserId}`                                                            | `DashboardStateDto`                                         | 写负向经验向量库 + SSE 广播                                                     |
-| 14    | POST | `/api/admin/governance`                                                                                                  | `{maxNegotiationTurns, highRiskScoreThreshold, allowSpecialistCrossStageRollback, actorUserId}` | `DashboardStateDto`                                         | 改全局风控阈值（**仅 PROJECT_ADMIN**）+ SSE 广播                                |
-| 15    | POST | `/api/admin/model-baseline`                                                                                              | —                                                                                               | `ModelBaselineReportDto`                                    | 两级端点 × 3 任务模型体检（**仅 PROJECT_ADMIN**；`AdminGovernanceView` 已接入） |
-| 16    | GET  | `/api/events/stream`                                                                                                     | query: `actorId`                                                                                | SSE 流                                                      | 建连推全量 `state_updated` + 增量 `run_event`/`user_notification`               |
-| 17–21 | *    | `/api/auth/login` \| `logout` \| `me` \| `change-password` \| `act-as`                                                   | 会话认证与视角切换                                                                              | `{ user, impersonating }` / 状态                            | F1 会话体系（前端登录 UI 待迁移，见 `USER_SYSTEM_DESIGN.md`）                   |
-| 22–26 | *    | `GET/POST /api/admin/users` \| `PATCH /api/admin/users/:id` \| `POST .../reset-password` \| `GET /api/admin/login-audit` | 成员 CRUD、重设口令与登录审计                                                                   | `{ users[] }` / `{ user, tempPassword? }` / `{ entries[] }` | F2 用户管理与登录审计（**需 `MANAGE_RBAC_POLICY`**, 前端 UI 待迁移）            |
+| #     | 方法 | 路径                                                                                                                     | 请求                                                                                                    | 响应 `data`                                                 | 副作用 / 说明                                                                        |
+| ----- | ---- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| 1     | GET  | `/api/health`                                                                                                            | —                                                                                                       | 健康/配置/运行摘要                                          | 豁免鉴权（`AUTH_REQUIRED=true` 亦可访问）                                            |
+| 2     | GET  | `/api/state`                                                                                                             | query: `actorId`, `runId?`                                                                              | `DashboardStateDto`                                         | 返回指定或默认 `runId` 状态，不再改写全局 `activeRunId`（`#13`）                     |
+| 3     | POST | `/api/runs/select`                                                                                                       | `{runId, actorUserId}`                                                                                  | `DashboardStateDto`                                         | 仅返回所选 `runId` 状态，不篡改全局 `activeRunId` 且不触发全量 SSE 广播（`#13`）     |
+| 4     | POST | `/api/proposals`                                                                                                         | preset 或自定义，见 §2.3                                                                                | `DashboardStateDto`                                         | **新建运行实例** + 按 `runId` 定向 SSE 广播                                          |
+| 5     | GET  | `/api/workflows/templates`                                                                                               | —                                                                                                       | `{activeTemplateFile, templates[]}`                         | 无（**前端目前未使用**，可作动态模板列表源）                                         |
+| 6     | POST | `/api/workflows/template`                                                                                                | `{templateFileName, actorUserId}`                                                                       | `DashboardStateDto`                                         | 重载 YAML DSL + **新建运行实例** + 按 `runId` 定向 SSE 广播                          |
+| 7     | POST | `/api/decisions`                                                                                                         | `{runId?, snapshotId, verdict, comment, extraTokenBudget?, actorUserId}`                                | `DashboardStateDto`                                         | 写 `HumanDecision` → 推进/驳回/拍板；兼容 `RETRY:*`/旧 `ROOT` 熔断恢复（`#10`）      |
+| 8     | POST | `/api/runs/retry`                                                                                                        | `{runId?, snapshotId?, extraTokenBudget?, comment?, reviewerActor?, actorUserId}`                       | `DashboardStateDto`                                         | **熔断专属恢复端点**（`#10`）：重启 `ABORTED`/`ABORTED_TOKEN_BUDGET` 阶段 + SSE 广播 |
+| 9     | POST | `/api/comments`                                                                                                          | `{runId?, stageId, content, actorUserId}`                                                               | `DashboardStateDto`                                         | 写 `TeamComment`（全员可见）+ 按 `runId` 定向 SSE 广播                               |
+| 10    | POST | `/api/supervisor/rollback`                                                                                               | `{runId?, targetStageId?, dialogueInstruction, actorUserId}`                                            | `DashboardStateDto`                                         | **Fork 新分支**，旧分支标 `SUPERSEDED` + 按 `runId` 定向 SSE 广播                    |
+| 11    | GET  | `/api/sandbox/file`                                                                                                      | query: `path`, `runId?`, `actorId`                                                                      | `{relativePath, branchId, content}`                         | 按 `runId` 隔离读取沙箱文件（路径穿越有防护）                                        |
+| 12    | POST | `/api/sandbox/verify`                                                                                                    | `{runId?, actorUserId}`                                                                                 | `{verification:{executionLog}, dashboardState}`             | 子进程跑真实单测 + 安全扫描 + 按 `runId` 定向 SSE 广播                               |
+| 13    | POST | `/api/rag/query`                                                                                                         | `{stageId, queryText}`                                                                                  | `{matches: RagQueryMatchDto[]}`                             | 无（Top-K 余弦检索）                                                                 |
+| 14    | POST | `/api/rag/ingest`                                                                                                        | `{runId?, stageId, lessonText, actorUserId}`                                                            | `DashboardStateDto`                                         | 写负向经验向量库 + 按 `runId` 定向 SSE 广播                                          |
+| 15    | POST | `/api/admin/governance`                                                                                                  | `{runId?, maxNegotiationTurns, highRiskScoreThreshold, allowSpecialistCrossStageRollback, actorUserId}` | `DashboardStateDto`                                         | 改全局风控阈值（**仅 PROJECT_ADMIN**）+ 按 `runId` 定向 SSE 广播                     |
+| 16    | POST | `/api/admin/model-baseline`                                                                                              | —                                                                                                       | `ModelBaselineReportDto`                                    | 两级端点 × 3 任务模型体检（**仅 PROJECT_ADMIN**；`AdminGovernanceView` 已接入）      |
+| 17    | GET  | `/api/events/stream`                                                                                                     | query: `actorId`, `runId?`, `lastEventId?`; header: `Last-Event-ID?`                                    | SSE 流                                                      | 按 `runId` 过滤推送全量 `state_updated` + 增量重放与 `run_event`/`user_notification` |
+| 18–22 | *    | `/api/auth/login` \| `logout` \| `me` \| `change-password` \| `act-as`                                                   | 会话认证与视角切换                                                                                      | `{ user, impersonating }` / 状态                            | F1 会话体系（前端登录 UI 待迁移，见 `USER_SYSTEM_DESIGN.md`）                        |
+| 23–27 | *    | `GET/POST /api/admin/users` \| `PATCH /api/admin/users/:id` \| `POST .../reset-password` \| `GET /api/admin/login-audit` | 成员 CRUD、重设口令与登录审计                                                                           | `{ users[] }` / `{ user, tempPassword? }` / `{ entries[] }` | F2 用户管理与登录审计（**需 `MANAGE_RBAC_POLICY`**, 前端 UI 待迁移）                 |
 
 > ⚠️ **设计发现 1**：`/api/workflows/templates` 存在但前端把两个模板名**硬编码**在 `Topbar.tsx` 的 `<select>` 里。
 > 重设计时应改为调用该端点动态渲染，否则新增 YAML 模板前端不会同步。
@@ -146,31 +147,31 @@
 
 ### 3.3 其它枚举 → 界面文案对照表
 
-| 枚举                         | 取值                                             | 界面标签                         |
-| ---------------------------- | ------------------------------------------------ | -------------------------------- |
-| `WorkflowRunStatus`          | `RUNNING`                                        | 推进中                           |
-|                              | `PAUSED_AT_HUMAN_GATE`                           | 等待人工裁决                     |
-|                              | `COMPLETED`                                      | 已交付                           |
-|                              | `ABORTED`                                        | 已中止                           |
-|                              | `ABORTED_TOKEN_BUDGET`                           | Token 预算耗尽中止               |
-| `BusinessRiskLevel`          | `LOW` / `MEDIUM` / `HIGH` / `CRITICAL`           | 低 / 中 / 高 / 极高风险          |
-| `GateActionType`             | `AUTO_PASS_WITH_AUDIT`                           | 自动放行（留痕）                 |
-|                              | `BLOCK_FOR_HUMAN_VERIFICATION`                   | 阻塞人工确认                     |
-|                              | `BLOCK_FOR_CONFLICT_ARBITRATION`                 | 阻塞冲突裁决                     |
-| `DecisionVerdict`            | `APPROVE` / `REJECT`                             | 确认通过 / 驳回重做              |
-|                              | `ARBITRATE_OPTION_A` / `_B`                      | 拍板方案 A / 方案 B              |
-|                              | `AUTO_PASS_LOW_RISK`                             | 低风险自动放行                   |
-|                              | `SUPERVISOR_ROLLBACK`                            | 总管对话回退                     |
-| `NotificationCategory`       | `PENDING_VERIFICATION`                           | 待人工确认                       |
-|                              | `CONFLICT_ARBITRATION_REQUIRED`                  | 冲突裁决                         |
-|                              | `SCOPE_DIFF_WARNING`                             | 需求范围红线                     |
-|                              | `AUTO_PASSED_TRACE`                              | 自动放行留痕                     |
-|                              | `ROLLBACK_EXECUTED`                              | 回退已执行                       |
-|                              | `STAGE_PROGRESS`                                 | 阶段推进                         |
-|                              | `TOKEN_BUDGET_EXCEEDED`                          | Token 预算超限（见 `#10`）       |
-|                              | `STAGE_CONTRACT_FAILED`                          | 契约校验熔断（见 `#10`）         |
-| `TeamComment.category`       | `COMMENT` / `APPROVAL_NOTE` / `REVISION_REQUEST` | 团队评论 / 步骤签核 / 修改建议   |
-| `AuditEntry.actionType` 前缀 | `AGENT_` / `NOTIFICATION_` / `VERDICT_`          | Agent 动作 / 系统通知 / 人工裁决 |
+| 枚举                         | 取值                                             | 界面标签                                                     |
+| ---------------------------- | ------------------------------------------------ | ------------------------------------------------------------ |
+| `WorkflowRunStatus`          | `RUNNING`                                        | 推进中                                                       |
+|                              | `PAUSED_AT_HUMAN_GATE`                           | 等待人工裁决                                                 |
+|                              | `COMPLETED`                                      | 已交付                                                       |
+|                              | `ABORTED`                                        | 已中止                                                       |
+|                              | `ABORTED_TOKEN_BUDGET`                           | Token 预算耗尽中止                                           |
+| `BusinessRiskLevel`          | `LOW` / `MEDIUM` / `HIGH` / `CRITICAL`           | 低 / 中 / 高 / 极高风险                                      |
+| `GateActionType`             | `AUTO_PASS_WITH_AUDIT`                           | 自动放行（留痕）                                             |
+|                              | `BLOCK_FOR_HUMAN_VERIFICATION`                   | 阻塞人工确认                                                 |
+|                              | `BLOCK_FOR_CONFLICT_ARBITRATION`                 | 阻塞冲突裁决                                                 |
+| `DecisionVerdict`            | `APPROVE` / `REJECT`                             | 确认通过 / 驳回重做                                          |
+|                              | `ARBITRATE_OPTION_A` / `_B`                      | 拍板方案 A / 方案 B                                          |
+|                              | `AUTO_PASS_LOW_RISK`                             | 低风险自动放行                                               |
+|                              | `SUPERVISOR_ROLLBACK`                            | 总管对话回退                                                 |
+| `NotificationCategory`       | `PENDING_VERIFICATION`                           | 待人工确认                                                   |
+|                              | `CONFLICT_ARBITRATION_REQUIRED`                  | 冲突裁决                                                     |
+|                              | `SCOPE_DIFF_WARNING`                             | 需求范围红线                                                 |
+|                              | `AUTO_PASSED_TRACE`                              | 自动放行留痕                                                 |
+|                              | `ROLLBACK_EXECUTED`                              | 回退已执行                                                   |
+|                              | `STAGE_PROGRESS`                                 | 阶段推进                                                     |
+|                              | `TOKEN_BUDGET_EXCEEDED`                          | Token 预算超限（`RETRY:*` 与 `/api/runs/retry` 恢复，`#10`） |
+|                              | `STAGE_CONTRACT_FAILED`                          | 契约校验熔断（`RETRY:*` 与 `/api/runs/retry` 恢复，`#10`）   |
+| `TeamComment.category`       | `COMMENT` / `APPROVAL_NOTE` / `REVISION_REQUEST` | 团队评论 / 步骤签核 / 修改建议                               |
+| `AuditEntry.actionType` 前缀 | `AGENT_` / `NOTIFICATION_` / `VERDICT_`          | Agent 动作 / 系统通知 / 人工裁决                             |
 
 ---
 
@@ -431,7 +432,7 @@
 
 ## 10. 改造时必须保持的契约（不可破坏）
 
-1. `WorkbenchApiClient` 的 15 个公开 API/SSE 方法（14 个 REST 方法含 A4 `runModelBaseline` + `subscribeRealtimeEventStream`；另有 actor getter/setter）与 `ApiResponseEnvelope` 拆包逻辑不变。
+1. `WorkbenchApiClient` 的 15 个公开 API/SSE 方法（14 个 REST 方法含 A4 `runModelBaseline` + `subscribeRealtimeEventStream`；另有 `getActiveActorUserId`/`setActiveActorUserId` 与 `getActiveRunId`/`setActiveRunId`）与 `ApiResponseEnvelope` 拆包逻辑不变（后续需补 `POST /api/runs/retry`、`extraTokenBudget` 与 `/api/auth/*`）。
 2. `types.ts` 的 DTO 定义不变（只允许新增可选字段，不允许改字段语义）。
 3. `stagePipelineOrder` 动态长度 —— 所有阶段轨道必须按数组长度渲染，不能写死 6。
 4. RBAC 判定**只读** `accessEvaluation.canApproveOrArbitrate`，禁止前端自行推断权限。
@@ -439,7 +440,7 @@
 6. 无外部 CDN 依赖（内网私有化部署硬约束）。
 7. 主题通过 `document.documentElement.dataset.theme` 切换（服务端不感知，纯前端）；**默认 `light`**（v2 评审结论），深色为等价完整实现。
 8. `prefers-reduced-motion` 降级必须保留。
-9. 现有 `npm run check`（双端 typecheck + eslint + prettier + 全库测试：2026-11-22 基线为 19 项，当前全库已演进至 143 项 / 45 套件，139 过 / 4 既有 skip）必须全绿。
+9. 现有 `npm run check`（双端 typecheck + eslint + prettier + 全库测试：2026-11-22 基线为 19 项，当前后端测试已演进至 169 项 / 48 套件 / 28 文件，165 过 / 4 既有 skip；注：本地执行 `npm run typecheck:frontend` / `build:ui` 需先安装 `package.json` 已声明的 `react`/`react-dom`/`@types/react` 依赖，见 `BACKEND_TODO.md` §六）必须全绿。
 10. 产物仍由 `esbuild` 打包为 `src/ui/dist/main.js`，不引入 Vite/webpack 等新构建链。
 
 ---

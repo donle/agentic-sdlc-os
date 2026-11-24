@@ -72,7 +72,7 @@ WAREHOUSE_MCP_URL / STRING  → createAnalyticsProvider() 三级工厂（G11）�
 6. 数仓 stub：指标基线/目标派生 + `isReal=false`
 7. ToolRegistry 集成：stub 补位后 STAGE_2_PD required 需求不再 blocked
 
-**完成时测试基线**：105 项（101 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
+**完成时测试基线**：105 项（101 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：169 项 / 48 套件 / 28 文件，165 过 / 4 既有 skip）
 
 ## 遗留
 

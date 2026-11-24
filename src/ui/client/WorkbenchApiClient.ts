@@ -13,6 +13,7 @@ interface ApiResponseEnvelope<T> {
 
 export class WorkbenchApiClient {
   private activeActorUserId = 'user-admin-01';
+  private activeRunId: string | null = null;
   private activeEventSource: EventSource | null = null;
 
   public getActiveActorUserId(): string {
@@ -23,6 +24,26 @@ export class WorkbenchApiClient {
     this.activeActorUserId = userId;
   }
 
+  public getActiveRunId(): string | null {
+    return this.activeRunId;
+  }
+
+  public setActiveRunId(runId: string | null): void {
+    this.activeRunId = runId;
+  }
+
+  private trackActiveRun(state: DashboardStateDto): DashboardStateDto {
+    if (state.run?.runId) {
+      this.activeRunId = state.run.runId;
+    }
+    return state;
+  }
+
+  private resolveRunIdPayload(runId?: string): { runId?: string } {
+    const target = runId ?? this.activeRunId ?? undefined;
+    return target ? { runId: target } : {};
+  }
+
   private buildHeaders(): Record<string, string> {
     return {
       'Content-Type': 'application/json',
@@ -31,9 +52,10 @@ export class WorkbenchApiClient {
   }
 
   public async fetchDashboardState(runId?: string): Promise<DashboardStateDto> {
+    const targetRunId = runId ?? this.activeRunId ?? undefined;
     const query = new URLSearchParams({ actorId: this.activeActorUserId });
-    if (runId) {
-      query.set('runId', runId);
+    if (targetRunId) {
+      query.set('runId', targetRunId);
     }
     const res = await fetch(`/api/state?${query.toString()}`, {
       headers: this.buildHeaders(),
@@ -42,7 +64,7 @@ export class WorkbenchApiClient {
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '加载状态失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
   public async selectRun(runId: string): Promise<DashboardStateDto> {
@@ -55,7 +77,7 @@ export class WorkbenchApiClient {
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '切换项目运行实例失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
   public async launchPresetProposal(preset: string): Promise<DashboardStateDto> {
@@ -68,7 +90,7 @@ export class WorkbenchApiClient {
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '启动提案失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
   public async createCustomProposal(params: {
@@ -92,7 +114,7 @@ export class WorkbenchApiClient {
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '创建自定义研发提案失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
   public async switchWorkflowTemplate(templateFileName: string): Promise<DashboardStateDto> {
@@ -108,18 +130,20 @@ export class WorkbenchApiClient {
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '切换工作流 YAML 模板失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
   public async submitGateDecision(
     snapshotId: string,
     verdict: string,
     comment: string,
+    runId?: string,
   ): Promise<DashboardStateDto> {
     const res = await fetch('/api/decisions', {
       method: 'POST',
       headers: this.buildHeaders(),
       body: JSON.stringify({
+        ...this.resolveRunIdPayload(runId),
         snapshotId,
         verdict,
         actorUserId: this.activeActorUserId,
@@ -130,14 +154,19 @@ export class WorkbenchApiClient {
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '提交审核决定失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
-  public async postTeamComment(stageId: string, content: string): Promise<DashboardStateDto> {
+  public async postTeamComment(
+    stageId: string,
+    content: string,
+    runId?: string,
+  ): Promise<DashboardStateDto> {
     const res = await fetch('/api/comments', {
       method: 'POST',
       headers: this.buildHeaders(),
       body: JSON.stringify({
+        ...this.resolveRunIdPayload(runId),
         stageId,
         content,
         actorUserId: this.activeActorUserId,
@@ -147,17 +176,19 @@ export class WorkbenchApiClient {
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '发表团队评论失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
   public async sendSupervisorRollback(
     targetStageId: string,
     dialogueInstruction: string,
+    runId?: string,
   ): Promise<DashboardStateDto> {
     const res = await fetch('/api/supervisor/rollback', {
       method: 'POST',
       headers: this.buildHeaders(),
       body: JSON.stringify({
+        ...this.resolveRunIdPayload(runId),
         targetStageId: targetStageId || undefined,
         dialogueInstruction,
         actorUserId: this.activeActorUserId,
@@ -167,18 +198,25 @@ export class WorkbenchApiClient {
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '回退执行失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
-  public async fetchSandboxFileContent(relativePath: string): Promise<{
+  public async fetchSandboxFileContent(
+    relativePath: string,
+    runId?: string,
+  ): Promise<{
     readonly relativePath: string;
     readonly branchId: string;
     readonly content: string;
   }> {
+    const targetRunId = runId ?? this.activeRunId ?? undefined;
     const query = new URLSearchParams({
       path: relativePath,
       actorId: this.activeActorUserId,
     });
+    if (targetRunId) {
+      query.set('runId', targetRunId);
+    }
     const res = await fetch(`/api/sandbox/file?${query.toString()}`, {
       headers: this.buildHeaders(),
     });
@@ -193,14 +231,17 @@ export class WorkbenchApiClient {
     return json.data;
   }
 
-  public async triggerLiveSandboxVerification(): Promise<{
+  public async triggerLiveSandboxVerification(runId?: string): Promise<{
     readonly executionLog: string;
     readonly dashboardState: DashboardStateDto;
   }> {
     const res = await fetch('/api/sandbox/verify', {
       method: 'POST',
       headers: this.buildHeaders(),
-      body: JSON.stringify({ actorUserId: this.activeActorUserId }),
+      body: JSON.stringify({
+        ...this.resolveRunIdPayload(runId),
+        actorUserId: this.activeActorUserId,
+      }),
     });
     const json = (await res.json()) as ApiResponseEnvelope<{
       verification: { executionLog: string };
@@ -211,7 +252,7 @@ export class WorkbenchApiClient {
     }
     return {
       executionLog: json.data.verification.executionLog,
-      dashboardState: json.data.dashboardState,
+      dashboardState: this.trackActiveRun(json.data.dashboardState),
     };
   }
 
@@ -250,11 +291,13 @@ export class WorkbenchApiClient {
   public async ingestNegativeExperienceLesson(
     stageId: string,
     lessonText: string,
+    runId?: string,
   ): Promise<DashboardStateDto> {
     const res = await fetch('/api/rag/ingest', {
       method: 'POST',
       headers: this.buildHeaders(),
       body: JSON.stringify({
+        ...this.resolveRunIdPayload(runId),
         stageId,
         lessonText,
         actorUserId: this.activeActorUserId,
@@ -264,32 +307,36 @@ export class WorkbenchApiClient {
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '录入避坑经验失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
   public async updateAdminGovernanceConfig(params: {
     maxNegotiationTurns: number;
     highRiskScoreThreshold: number;
     allowSpecialistCrossStageRollback: boolean;
+    runId?: string;
   }): Promise<DashboardStateDto> {
+    const { runId, ...rest } = params;
     const res = await fetch('/api/admin/governance', {
       method: 'POST',
       headers: this.buildHeaders(),
       body: JSON.stringify({
+        ...this.resolveRunIdPayload(runId),
         actorUserId: this.activeActorUserId,
-        ...params,
+        ...rest,
       }),
     });
     const json = (await res.json()) as ApiResponseEnvelope<DashboardStateDto>;
     if (!json.ok || !json.data) {
       throw new Error(json.error ?? '更新管理员治理策略失败');
     }
-    return json.data;
+    return this.trackActiveRun(json.data);
   }
 
   public subscribeRealtimeEventStream(
     onStateUpdate: (state: DashboardStateDto) => void,
     onConnectionChange?: (connected: boolean) => void,
+    runId?: string,
   ): EventSource | null {
     if (typeof EventSource === 'undefined') {
       return null;
@@ -297,9 +344,12 @@ export class WorkbenchApiClient {
     if (this.activeEventSource) {
       this.activeEventSource.close();
     }
-    const source = new EventSource(
-      `/api/events/stream?actorId=${encodeURIComponent(this.activeActorUserId)}`,
-    );
+    const query = new URLSearchParams({ actorId: this.activeActorUserId });
+    const targetRunId = runId ?? this.activeRunId ?? undefined;
+    if (targetRunId) {
+      query.set('runId', targetRunId);
+    }
+    const source = new EventSource(`/api/events/stream?${query.toString()}`);
     this.activeEventSource = source;
 
     source.addEventListener('open', () => {

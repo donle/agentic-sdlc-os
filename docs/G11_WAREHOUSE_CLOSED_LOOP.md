@@ -19,7 +19,7 @@ DA Agent 的 `analytics_metrics`（required）此前只有确定性 stub（G10�
   - `metrics_by_requirement`：按 runId 查指标基线（`pipeline_metric_baselines`）
   - `tracking_events_coverage`：按 runId 查埋点核验状态（`tracking_event_verification`）
 - **三层只读防线**：①每条查询前置 `SET default_transaction_read_only = on`；②模板白名单（模板名不在表内即抛错）；③runId 字符白名单净化（引号/分号等一律替换为下划线，字面量无法逃逸）+ 64 字符截断。
-- **查询 runner 注入口**（测试零 psql 依赖）；默认 runner = `psql --csv` CLI（与 PgPersistenceDriver 零依赖先例一致；宿主机需安装 `psql`，容器镜像缺 `postgresql-client` 见 `BACKEND_TODO.md` §五 `#14`），行数上限 50。
+- **查询 runner 注入口**（测试零 psql 依赖）；默认 runner = `psql --csv` CLI（与 PgPersistenceDriver 零依赖先例一致；宿主机需安装 `psql`，容器镜像已于第十四轮 `#14` 在 `Dockerfile` 中补齐 `postgresql-client`），行数上限 50。
 - **降级链**：查询失败（连接拒绝/无结果）→ 回落确定性 stub（`isReal:false` + `source: warehouse-query:query-failed→stub`）——DA 永不空手，且降级显式可见。
 
 ### 2. Provider 工厂与注册（`createAnalyticsProvider`）
@@ -56,10 +56,10 @@ Facade 预取（STAGE_5_DA）→ analytics_metrics（required）
 4. 查询失败 → stub 兜底 `isReal:false` + `query-failed` 显式降级标注
 5. 工厂 env 选择：MCP > 直连 > stub 三级
 
-**完成时测试基线**：127 项（123 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
+**完成时测试基线**：127 项（123 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：169 项 / 48 套件 / 28 文件，165 过 / 4 既有 skip）
 
 ## 遗留（等真实数仓环境）
 
-- **容器 `psql` 缺失**：直连 `WAREHOUSE_CONNECTION_STRING` 依赖 `PATH` 中存在 `psql`，但当前 `Dockerfile` 仅安装了 `git` 未安装 `postgresql-client`，容器部署下直连将因 `ENOENT` 回落 `stub`（已登记 `BACKEND_TODO.md` §五 `#14`；容器环境可改走 `WAREHOUSE_MCP_URL` 或补齐 `postgresql-client`）。
+- `Dockerfile` 缺少 `postgresql-client` 已于第十四轮 `#14` 补齐（见 `BACKEND_TODO.md` §五 `#14`）；容器直接连通真库仍依赖 `WAREHOUSE_CONNECTION_STRING` 或 `WAREHOUSE_MCP_URL` 实网凭证与联调。
 - `pipeline_metric_baselines` / `tracking_event_verification` 表结构与真实数仓 schema 对齐（表名可在 SQL_TEMPLATES 处按客户环境调整）。
 - 真实 psql 联调（含 `--csv` 对复杂类型的输出形态）。

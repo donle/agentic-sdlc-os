@@ -41,7 +41,7 @@
 `deploy/init-pgvector-schema.sql`：`rejected_history_rag.embedding vector(64)` → `vector(1536)`。
 `PgPersistenceDriver` 的向量字面量生成是维度无关的（`[${embedding.join(',')}]`），但现行 PG 同步存在两项实操边界需注意：
 
-1. **升级后向量尚未回写已有 PG 行**：`PersistenceRepository` 与 `PgPersistenceDriver` 对 `rejected_history_rag` 均生成 `INSERT ... ON CONFLICT (id) DO NOTHING`，因此后台队列把哈希记录升级为 `REAL_EMBEDDING` 后不会覆写已落 PG 的旧哈希向量（且 `PgPersistenceDriver` 本身尚未接线，见 `BACKEND_TODO.md` §五 `#8`）。
+1. **PG `ON CONFLICT` 向量覆盖已补齐（第十二轮 `#8`）**：`src/engine/pg/PgPersistenceDriver.ts` 中的 `buildPgUpsertSql()` 对 `rejected_history_rag` 已生成 `INSERT ... ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding;`，且 `PgPersistenceDriver` 已接入 `PersistenceRepository` 生产同步链路（并支持 `loadFullState()` 回读），因此后台队列将哈希记录升级为 `REAL_EMBEDDING` 后会在下次同步时覆盖 PG 中旧哈希向量。
 2. **模型默认维度需与建表维度一致**：`ModelRouterGateway` 默认 `EMBEDDING_MODEL` 为 `'bge-m3-local'`（1024 维），若对接真实 PG `vector(1536)` 列，需保证部署模型输出维度与建表维度一致（否则写入报错）。
 
 ## 边界处理
@@ -60,9 +60,9 @@
 4. 恢复的旧格式记录自动入升级队列（跨重启收敛）
 5. 持久化 round-trip + pgvector SQL 脚本生成（原 test 2 不变，仍通过）
 
-**完成时测试基线**：98 项（94 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
+**完成时测试基线**：98 项（94 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：169 项 / 48 套件 / 28 文件，165 过 / 4 既有 skip）
 
 ## 遗留
 
 - 已有 `needsReembedding` 记录的重试调度（当前仅在恢复/新沉淀时入队；可用定时任务兜底，暂无必要）。
-- PG `rejected_history_rag` 的 `ON CONFLICT` 更新语义与模型输出维度对齐（随 `#8`/`#14` 真实 PG 联调一并完善）。
+- 模型输出维度（默认 `bge-m3-local` 1024 维）与 PG 建表 `vector(1536)` 的对齐策略及真实 PostgreSQL 16 + pgvector 联调（跟踪见 `BACKEND_TODO.md` §六）。

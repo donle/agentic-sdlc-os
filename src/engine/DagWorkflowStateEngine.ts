@@ -42,7 +42,7 @@ export class WorkflowRunState {
   private currentStageIndex: number;
   private runStatus: WorkflowRunStatus;
   private pendingRollbackDirective: string | null;
-  private readonly tokenBudget: number;
+  private tokenBudget: number;
   private tokensUsedTotal = 0;
   private readonly allSnapshots: StageSnapshotMemento[];
   private readonly branchHistory: string[];
@@ -161,6 +161,14 @@ export class WorkflowRunState {
   }
 
   public getTokenBudget(): number {
+    return this.tokenBudget;
+  }
+
+  /** AUDIT-10：追加当前运行的 Token 预算上限（供预算熔断恢复 RETRY_STAGE 使用） */
+  public increaseTokenBudget(extraTokens: number): number {
+    if (Number.isFinite(extraTokens) && extraTokens > 0) {
+      this.tokenBudget += Math.floor(extraTokens);
+    }
     return this.tokenBudget;
   }
 

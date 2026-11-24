@@ -38,11 +38,16 @@ interface ResolvedAuthContext {
   readonly authSource: 'session' | 'invalid_token' | 'workbench_header' | 'none';
 }
 
+interface SseClientSubscription {
+  readonly actorUserId: string;
+  readonly subscribedRunId: string | null;
+}
+
 export class WorkbenchHttpServer {
   private readonly orchestrator: WorkflowOrchestratorFacade;
   private readonly port: number;
   private activeRunId: string;
-  private readonly sseClients: Map<http.ServerResponse, string>;
+  private readonly sseClients: Map<http.ServerResponse, SseClientSubscription>;
   public readonly sessionService: SessionService;
   private readonly sseBridge: SseBridge;
 
@@ -54,7 +59,7 @@ export class WorkbenchHttpServer {
     },
   ) {
     this.port = port;
-    this.sseClients = new Map<http.ServerResponse, string>();
+    this.sseClients = new Map<http.ServerResponse, SseClientSubscription>();
     const orchestrator = new WorkflowOrchestratorFacade({
       maxNegotiationTurns: 3,
       highRiskThreshold: 60,
@@ -65,10 +70,13 @@ export class WorkbenchHttpServer {
     const userStore = selectUserStore({ usersFilePath });
     this.sessionService = new SessionService(userStore, orchestrator.rbacService);
     this.orchestrator = orchestrator;
-    this.sseBridge = new SseBridge((frame, eventName, seqId) => {
-      this.sseClients.forEach((_clientData: string, clientRes: http.ServerResponse) => {
+    this.sseBridge = new SseBridge((frame, eventName, seqId, eventRunId) => {
+      this.sseClients.forEach((sub: SseClientSubscription, clientRes: http.ServerResponse) => {
+        if (sub.subscribedRunId !== null && eventRunId && sub.subscribedRunId !== eventRunId) {
+          return;
+        }
         try {
-          // C1/D3：逐事件帧（run_event / user_notification）
+          // C1/D3/AUDIT-13：逐事件帧（run_event / user_notification），按订阅 runId 隔离
           clientRes.write(`id: ${seqId}
 event: ${eventName}
 data: ${frame}
@@ -283,13 +291,46 @@ data: ${frame}
     };
   }
 
-  private broadcastSseStateUpdate(): void {
+  private resolveDefaultRunId(): string {
+    const runs = this.orchestrator.stateEngine.getAllRuns();
+    if (this.activeRunId && runs.some((r) => r.runId === this.activeRunId)) {
+      return this.activeRunId;
+    }
+    return runs[runs.length - 1]?.runId ?? this.activeRunId;
+  }
+
+  private resolveRequestRunId(params: { explicitRunId?: unknown; snapshotId?: string }): string {
+    if (typeof params.explicitRunId === 'string' && params.explicitRunId.trim().length > 0) {
+      return params.explicitRunId.trim();
+    }
+    if (params.snapshotId) {
+      for (const run of this.orchestrator.stateEngine.getAllRuns()) {
+        if (run.findSnapshotById(params.snapshotId)) {
+          return run.runId;
+        }
+      }
+      const matchingNotif = this.orchestrator.eventBus
+        .getNotificationInbox()
+        .find((n) => n.relatedSnapshotId === params.snapshotId);
+      if (matchingNotif) {
+        return matchingNotif.runId;
+      }
+    }
+    return this.resolveDefaultRunId();
+  }
+
+  private broadcastSseStateUpdate(changedRunId?: string): void {
     if (this.sseClients.size === 0) {
       return;
     }
-    for (const [clientRes, actorUserId] of this.sseClients.entries()) {
+    const fallbackRunId = changedRunId ?? this.resolveDefaultRunId();
+    for (const [clientRes, sub] of this.sseClients.entries()) {
+      if (sub.subscribedRunId !== null && changedRunId && sub.subscribedRunId !== changedRunId) {
+        continue;
+      }
+      const targetRunId = sub.subscribedRunId ?? fallbackRunId;
       try {
-        const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
+        const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, sub.actorUserId);
         clientRes.write(`event: state_updated\ndata: ${JSON.stringify(state)}\n\n`);
       } catch {
         this.sseClients.delete(clientRes);
@@ -343,7 +384,7 @@ data: ${frame}
         ok: true,
         data: {
           status: 'healthy',
-          activeRunId: this.activeRunId,
+          activeRunId: this.resolveDefaultRunId(),
           sseClients: this.sseClients.size,
           persistenceDir: process.env.LOCAL_PERSISTENCE_DIR ?? '.runtime-data',
           authDisabled: process.env.AUTH_DISABLED === 'true',
@@ -447,17 +488,34 @@ data: ${frame}
         this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
         return;
       }
+      const subscribedRunId = urlObj.searchParams.get('runId')?.trim() || null;
+      const initialRunId = subscribedRunId ?? this.resolveDefaultRunId();
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
       });
       const initialState = this.orchestrator.buildWorkbenchDashboardState(
-        this.activeRunId,
+        initialRunId,
         streamActorId,
       );
       res.write(`event: state_updated\ndata: ${JSON.stringify(initialState)}\n\n`);
-      this.sseClients.set(res, streamActorId);
+
+      const rawLastId = req.headers['last-event-id'] ?? urlObj.searchParams.get('lastEventId');
+      if (rawLastId !== undefined && rawLastId !== null && String(rawLastId).trim() !== '') {
+        const lastEventId = Number(String(rawLastId).trim());
+        if (Number.isFinite(lastEventId) && lastEventId >= 0) {
+          this.sseBridge.replay(
+            lastEventId,
+            (frame, eventName, id) => {
+              res.write(`id: ${id}\nevent: ${eventName}\ndata: ${frame}\n\n`);
+            },
+            subscribedRunId ?? undefined,
+          );
+        }
+      }
+
+      this.sseClients.set(res, { actorUserId: streamActorId, subscribedRunId });
       req.on('close', () => {
         this.sseClients.delete(res);
       });
@@ -473,9 +531,10 @@ data: ${frame}
         this.sendJson(res, 401, { ok: false, error: '未登录或会话已过期' });
         return;
       }
-      const requestedRunId = urlObj.searchParams.get('runId') ?? this.activeRunId;
-      this.activeRunId = requestedRunId;
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, stateActorId);
+      const targetRunId = this.resolveRequestRunId({
+        explicitRunId: urlObj.searchParams.get('runId'),
+      });
+      const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, stateActorId);
       this.sendJson(res, 200, { ok: true, data: state });
       return;
     }
@@ -489,9 +548,7 @@ data: ${frame}
       }
       const targetRunId = String(body?.runId ?? '').trim();
       const runState = this.orchestrator.stateEngine.getRunOrThrow(targetRunId);
-      this.activeRunId = runState.runId;
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
+      const state = this.orchestrator.buildWorkbenchDashboardState(runState.runId, actorUserId);
       this.sendJson(res, 200, { ok: true, data: state });
       return;
     }
@@ -552,10 +609,10 @@ data: ${frame}
       this.activeRunId = runState.runId;
 
       const state = this.orchestrator.buildWorkbenchDashboardState(
-        this.activeRunId,
+        runState.runId,
         effectiveActorId,
       );
-      this.broadcastSseStateUpdate();
+      this.broadcastSseStateUpdate(runState.runId);
       this.sendJson(res, 200, { ok: true, data: state });
       return;
     }
@@ -838,8 +895,8 @@ data: ${frame}
       });
       this.activeRunId = runState.runId;
 
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
+      const state = this.orchestrator.buildWorkbenchDashboardState(runState.runId, actorUserId);
+      this.broadcastSseStateUpdate(runState.runId);
       this.sendJson(res, 200, { ok: true, data: state });
       return;
     }
@@ -852,23 +909,69 @@ data: ${frame}
         );
       }
       const snapshotId = String(body?.snapshotId ?? '');
+      const targetRunId = this.resolveRequestRunId({
+        explicitRunId: body?.runId,
+        snapshotId,
+      });
       const verdict = String(body?.verdict ?? DecisionVerdict.APPROVE) as DecisionVerdict;
       const reviewerActor = String(body?.reviewerActor ?? '领域专家审核员');
       const comment = String(
         body?.comment ?? '经人工交叉核验，当前阶段 Agent 契约产出符合质量标准，准予放行',
       );
+      const extraTokenBudget =
+        body?.extraTokenBudget !== undefined ? Number(body.extraTokenBudget) : undefined;
 
       await this.orchestrator.submitHumanGateDecision({
-        runId: this.activeRunId,
+        runId: targetRunId,
         snapshotId,
         reviewerActor,
         actorUserId,
         verdict,
         comment,
+        extraTokenBudget:
+          extraTokenBudget !== undefined && Number.isFinite(extraTokenBudget)
+            ? extraTokenBudget
+            : undefined,
       });
 
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
+      const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
+      this.broadcastSseStateUpdate(targetRunId);
+      this.sendJson(res, 200, { ok: true, data: state });
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/api/runs/retry') {
+      if (process.env.AUTH_DISABLED !== 'true') {
+        this.orchestrator.rbacService.assertHasPermission(
+          actorUserId,
+          SystemPermissionCode.APPROVE_ASSIGNED_STAGE_GATE,
+        );
+      }
+      const targetSnapshotOrRetryId =
+        typeof body?.snapshotId === 'string' && body.snapshotId.trim().length > 0
+          ? body.snapshotId.trim()
+          : undefined;
+      const targetRunId = this.resolveRequestRunId({
+        explicitRunId: body?.runId,
+        snapshotId: targetSnapshotOrRetryId,
+      });
+      const extraTokenBudget =
+        body?.extraTokenBudget !== undefined ? Number(body.extraTokenBudget) : undefined;
+
+      await this.orchestrator.retryAbortedStage({
+        runId: targetRunId,
+        reviewerActor: String(body?.reviewerActor ?? '领域专家审核员'),
+        actorUserId,
+        comment: body?.comment ? String(body.comment) : undefined,
+        targetSnapshotOrRetryId,
+        extraTokenBudget:
+          extraTokenBudget !== undefined && Number.isFinite(extraTokenBudget)
+            ? extraTokenBudget
+            : undefined,
+      });
+
+      const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
+      this.broadcastSseStateUpdate(targetRunId);
       this.sendJson(res, 200, { ok: true, data: state });
       return;
     }
@@ -880,6 +983,7 @@ data: ${frame}
           SystemPermissionCode.INVOKE_SUPERVISOR_ROLLBACK,
         );
       }
+      const targetRunId = this.resolveRequestRunId({ explicitRunId: body?.runId });
       const dialogueInstruction = String(
         body?.dialogueInstruction ??
           '回退到 PD Agent，将弹窗改为双栏折叠侧边抽屉并重新执行下游阶段',
@@ -890,15 +994,15 @@ data: ${frame}
       const humanActor = String(body?.humanActor ?? '项目总负责人');
 
       await this.orchestrator.invokeSupervisorConversationalRollback({
-        runId: this.activeRunId,
+        runId: targetRunId,
         humanActor,
         actorUserId,
         dialogueInstruction,
         explicitTargetStageId,
       });
 
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
+      const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
+      this.broadcastSseStateUpdate(targetRunId);
       this.sendJson(res, 200, { ok: true, data: state });
       return;
     }
@@ -910,19 +1014,20 @@ data: ${frame}
           SystemPermissionCode.VIEW_SHARED_WORKFLOW,
         );
       }
+      const targetRunId = this.resolveRequestRunId({ explicitRunId: body?.runId });
       const stageId = String(body?.stageId ?? WorkflowStageId.STAGE_1_PM) as WorkflowStageId;
       const content = String(body?.content ?? '').trim();
       if (!content) {
         throw new Error('评论内容不能为空');
       }
       this.orchestrator.addTeamComment({
-        runId: this.activeRunId,
+        runId: targetRunId,
         stageId,
         actorUserId,
         content,
       });
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
+      const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
+      this.broadcastSseStateUpdate(targetRunId);
       this.sendJson(res, 200, { ok: true, data: state });
       return;
     }
@@ -934,7 +1039,10 @@ data: ${frame}
           SystemPermissionCode.VIEW_SHARED_WORKFLOW,
         );
       }
-      const runState = this.orchestrator.stateEngine.getRunOrThrow(this.activeRunId);
+      const targetRunId = this.resolveRequestRunId({
+        explicitRunId: urlObj.searchParams.get('runId'),
+      });
+      const runState = this.orchestrator.stateEngine.getRunOrThrow(targetRunId);
       const workspacePath = this.orchestrator.sandboxManager.resolveWorkspacePath(
         runState.runId,
         runState.getActiveBranchId(),
@@ -963,15 +1071,16 @@ data: ${frame}
           SystemPermissionCode.EXECUTE_SANDBOX_VERIFICATION,
         );
       }
-      const runState = this.orchestrator.stateEngine.getRunOrThrow(this.activeRunId);
+      const targetRunId = this.resolveRequestRunId({ explicitRunId: body?.runId });
+      const runState = this.orchestrator.stateEngine.getRunOrThrow(targetRunId);
       const verifyResult = this.orchestrator.sandboxManager.executeSandboxVerification({
         runId: runState.runId,
         branchId: runState.getActiveBranchId(),
         requirementIds: runState.proposal.coreRequirementIds,
         runSubprocessNodeTest: true,
       });
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
+      const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
+      this.broadcastSseStateUpdate(targetRunId);
       this.sendJson(res, 200, {
         ok: true,
         data: {
@@ -1010,6 +1119,7 @@ data: ${frame}
               actorUserId,
               SystemPermissionCode.VIEW_SHARED_WORKFLOW,
             );
+      const targetRunId = this.resolveRequestRunId({ explicitRunId: body?.runId });
       const stageId = String(
         body?.stageId ?? WorkflowStageId.STAGE_3A_TECH_SPEC,
       ) as WorkflowStageId;
@@ -1021,8 +1131,8 @@ data: ${frame}
         stageId,
         `[${user.displayName} 录入企业红线] ${rawLesson}`,
       );
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
+      const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
+      this.broadcastSseStateUpdate(targetRunId);
       this.sendJson(res, 200, { ok: true, data: state });
       return;
     }
@@ -1034,6 +1144,7 @@ data: ${frame}
           SystemPermissionCode.MANAGE_WORKFLOW_DSL_AND_GUARDRAILS,
         );
       }
+      const targetRunId = this.resolveRequestRunId({ explicitRunId: body?.runId });
       this.orchestrator.updateAdminGovernanceConfig({
         actorUserId,
         maxNegotiationTurns:
@@ -1047,8 +1158,8 @@ data: ${frame}
             ? Boolean(body.allowSpecialistCrossStageRollback)
             : undefined,
       });
-      const state = this.orchestrator.buildWorkbenchDashboardState(this.activeRunId, actorUserId);
-      this.broadcastSseStateUpdate();
+      const state = this.orchestrator.buildWorkbenchDashboardState(targetRunId, actorUserId);
+      this.broadcastSseStateUpdate(targetRunId);
       this.sendJson(res, 200, { ok: true, data: state });
       return;
     }

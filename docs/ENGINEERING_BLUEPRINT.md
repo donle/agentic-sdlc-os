@@ -4,12 +4,12 @@
 > 本文档为后续正式进入研发阶段的**工程落地参考蓝图**，聚焦“单机私有化优先、B 端可配置、提案到 QA 全闭环、全链路可回退审计”的技术实现方案。
 
 > [!WARNING]
-> **实现偏差说明（2026-11-23 补记）**：本文保留为**立项时蓝图存档**，§一–§五正文未改写。实际落地有意偏离了多处选型与契约：
+> **实现偏差说明（2026-11-24 补记）**：本文保留为**立项时蓝图存档**，§一–§五正文未改写。实际落地有意偏离了多处选型与契约：
 >
-> - **后端与网关**：未采用 Python FastAPI + LangGraph + Redis/Celery，而是 **Node 22 + TypeScript 单进程**（`yaml@^2.9.1`）；自研进程内 OpenAI 兼容网关 `ModelRouterGateway`（直连 Ollama/vLLM 或通过 `deploy/docker-compose.yml` 可选的 `litellm-router` `:4000`），异步事件流采用进程内 EventBus + `SseBridge`。
-> - **前端工作台**：未采用 Next.js `:3000` + React Flow + Shadcn/UI，而是 **React `19.3.1` + esbuild + 自研 Meridian UI (`src/ui/kit/`)**，打包至 `src/ui/dist/main.js` 并由 `WorkbenchHttpServer` 在 `:4300` 同进程托管。
-> - **持久化与沙箱**：默认无外部依赖——以本地 `.runtime-data/` JSON + 按月分片 JSONL WAL 为主，可选通过 **`psql` CLI** 同步 PostgreSQL + `pgvector`（未引 `pg` npm 驱动；`PgPersistenceDriver` 接线与 `Dockerfile` `psql` 补全尚在 `BACKEND_TODO.md` §五 `#8`/`#14`）；代码沙箱基于 `git worktree`，默认 `host` 执行 `node:test`，可选 `SANDBOX_RUNTIME=docker` 通过 **Docker CLI**（非 Docker SDK）拉起容器（`#11`/`#12` 待修复）。
-> - **目录与 Schema**：实际目录为 `src/{agents,domain,engine,patterns,retrospective,sandbox,server,telemetry,ui}` + `tests/` + `configs/workflows/{enterprise_sdlc.yaml,backend_api_only.yaml}`（无 `backend/`/`frontend/`/`configs/risk_policies/`）；`deploy/init-pgvector-schema.sql` 主键为 `VARCHAR`（非 `UUID`），`human_decisions` 含 `run_id`，并新增第 5 张表 `rejected_history_rag`（`vector(1536)`）。
+> - **后端与网关**：未采用 Python FastAPI + LangGraph + Redis/Celery，而是 **Node 22 + TypeScript 单进程**（`yaml@^2.9.1`）；自研进程内 OpenAI 兼容网关 `ModelRouterGateway`（直连 Ollama/vLLM 或通过 `deploy/docker-compose.yml` 可选的 `litellm-router` `:4000` 并开启 `LITELLM_ENABLE_LIVE_HTTP=true`），异步事件流采用进程内 EventBus + `SseBridge`。
+> - **前端工作台**：未采用 Next.js `:3000` + React Flow + Shadcn/UI，而是 **React `19.3.1` + esbuild + 自研 Meridian UI (`src/ui/kit/`)**，打包至 `src/ui/dist/main.js` 并由 `WorkbenchHttpServer` 在 `:4300` 同进程托管（注：本地前端构建与登录 UI 补齐跟踪见 `BACKEND_TODO.md` §六）。
+> - **持久化与沙箱**：默认无外部依赖——以本地 `.runtime-data/` JSON + 按月分片 JSONL WAL 为主，可选通过 **`psql` CLI** 同步与恢复 PostgreSQL + `pgvector`（未引 `pg` npm 驱动；`PgPersistenceDriver` 接线、`Dockerfile` `postgresql-client` 与 `PgUserStore` 已于 `#8`/`#14` 补全）；代码沙箱基于 `git worktree`（`RealGitWorktree` porcelain 分段精确清理已于 `#11` 修复），默认 `host` 执行 `node:test`，可选 `SANDBOX_RUNTIME=docker` 通过 **Docker CLI**（非 Docker SDK）拉起一次性容器（POSIX 重定向保留退出码 + `infrastructureFailure` 区分单测失败与引擎故障已于 `#12` 完成）。
+> - **目录与 Schema**：实际目录为 `src/{agents,domain,engine,patterns,retrospective,sandbox,server,telemetry,ui}` + `tests/` + `configs/workflows/{enterprise_sdlc.yaml,backend_api_only.yaml}`（无 `backend/`/`frontend/`/`configs/risk_policies/`）；`deploy/init-pgvector-schema.sql` 主键为 `VARCHAR`（非 `UUID`），`human_decisions` 含 `run_id`，共 **10 张表**（5 张核心流水线与向量表含 `rejected_history_rag` `vector(1536)`，以及 `users` / `user_owned_stages` / `auth_sessions` / `auth_login_audit` / `team_comments` 与双轨关联外键）。
 > - **总管工具签名（`src/agents/supervisorTools.ts`）**：4 工具均已实现，`rollbackAndFork` 参数为 `{ runId, directive, actorUserId?, targetStageId? }`，`overrideGate` 参数为 `{ runId, snapshotId, reviewerActor, actorUserId?, verdict, reason }`。
 >   详细设计演进与当前架构见 `AGENT_ARCHITECTURE.md`、`UI_SYSTEM_DESIGN_MAP.md` 与 `BACKEND_TODO_IMPL_LOG.md`。
 

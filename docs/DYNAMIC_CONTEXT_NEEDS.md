@@ -48,7 +48,7 @@ Facade
    注入类型被白名单丢弃。
 2. **离线回归**：`LITELLM_ENABLE_LIVE_HTTP` 未开启 → 规划器零调用（transport 捕获 0 次规划请求），静态流水线照常执行。
 
-**完成时测试基线**：107 项（103 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
+**完成时测试基线**：107 项（103 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：169 项 / 48 套件 / 28 文件，165 过 / 4 既有 skip）
 
 ## 遗留
 

@@ -14,6 +14,11 @@ export interface WorktreeAddResult {
   readonly simulated: boolean;
 }
 
+export interface PorcelainWorktreeEntry {
+  readonly worktreePath: string;
+  readonly branchRef: string | null;
+}
+
 export class WorktreeError extends Error {
   constructor(message: string) {
     super(message);
@@ -82,35 +87,58 @@ export class RealGitWorktree {
     return { workspacePath: target, branchName, simulated: false };
   }
 
-  /** 回退/终止后清理 worktree 与本地分支 */
+  /**
+   * AUDIT-11：按空行分段解析 `git worktree list --porcelain` 输出，严格绑定每个 worktree 路径与分支 ref
+   */
+  public static parsePorcelainWorktrees(porcelainOutput: string): PorcelainWorktreeEntry[] {
+    const entries: PorcelainWorktreeEntry[] = [];
+    const blocks = porcelainOutput
+      .split(/\r?\n\r?\n+/)
+      .map((block) => block.trim())
+      .filter((block) => block.length > 0);
+
+    for (const block of blocks) {
+      let worktreePath: string | null = null;
+      let branchRef: string | null = null;
+      for (const line of block.split(/\r?\n/)) {
+        if (line.startsWith('worktree ')) {
+          worktreePath = line.slice('worktree '.length).trim();
+        } else if (line.startsWith('branch ')) {
+          branchRef = line.slice('branch '.length).trim();
+        }
+      }
+      if (worktreePath) {
+        entries.push({ worktreePath, branchRef });
+      }
+    }
+    return entries;
+  }
+
+  /** 回退/终止后按 porcelain stanza 精确匹配目标分支并清理 worktree 与本地分支 */
   public remove(branchName: string): void {
+    const targetBranch = branchName.replace(/^refs\/heads\//, '');
+    const targetRef = `refs/heads/${targetBranch}`;
     try {
       const list = execFileSync('git', ['-C', this.repoPath, 'worktree', 'list', '--porcelain'], {
         encoding: 'utf-8',
         timeout: 10000,
       });
-      const worktreePath = list
-        .split('\n')
-        .find((line) => line.startsWith('worktree ') && line.includes('/worktree/'));
-      if (worktreePath) {
+      const entries = RealGitWorktree.parsePorcelainWorktrees(list);
+      const matched = entries.find((entry) => entry.branchRef === targetRef);
+      if (matched) {
         execFileSync(
           'git',
-          [
-            '-C',
-            this.repoPath,
-            'worktree',
-            'remove',
-            '--force',
-            worktreePath.slice('worktree '.length),
-          ],
-          {
-            timeout: 15000,
-          },
+          ['-C', this.repoPath, 'worktree', 'remove', '--force', matched.worktreePath],
+          { timeout: 15000 },
         );
       }
-      execFileSync('git', ['-C', this.repoPath, 'branch', '-D', branchName], { timeout: 10000 });
     } catch {
-      // 清理失败不阻塞主流程（I3 定期 prune 兜底）
+      // worktree 移除失败不阻塞分支清理（I3 定期 prune 兜底）
+    }
+    try {
+      execFileSync('git', ['-C', this.repoPath, 'branch', '-D', targetBranch], { timeout: 10000 });
+    } catch {
+      // 分支清理失败不阻塞主流程
     }
   }
 

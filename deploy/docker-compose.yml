@@ -13,6 +13,7 @@ services:
       - PORT=4300
       - DATABASE_URL=postgresql://sdlc_admin:sdlc_secret@postgres-pgvector:5432/agentic_sdlc
       - LITELLM_GATEWAY_URL=http://litellm-router:4000
+      - LITELLM_ENABLE_LIVE_HTTP=true
       - SANDBOX_WORKTREE_ROOT=/var/lib/agentic-sdlc/worktrees
     depends_on:
       - postgres-pgvector

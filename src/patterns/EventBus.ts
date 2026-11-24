@@ -141,4 +141,17 @@ export class WorkflowEventBus {
       }
     }
   }
+
+  /** AUDIT-10：按 runId + stageId 消解熔断/预算超限通知 */
+  public resolveFailureNotificationsForStage(runId: string, stageId: WorkflowStageId): void {
+    for (const item of this.notificationInbox) {
+      if (
+        item.runId === runId &&
+        item.stageId === stageId &&
+        (item.category === 'STAGE_CONTRACT_FAILED' || item.category === 'TOKEN_BUDGET_EXCEEDED')
+      ) {
+        item.markResolved();
+      }
+    }
+  }
 }

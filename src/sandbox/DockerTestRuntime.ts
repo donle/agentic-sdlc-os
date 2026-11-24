@@ -18,10 +18,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 export interface DockerSuiteResult {
-  /** 容器内 spec 输出（含 tee 到结果目录的同一份内容） */
+  /** 容器内 spec 输出（重定向写入结果目录后再标准输出打印的同一份内容） */
   readonly output: string;
   readonly timedOut: boolean;
   readonly exitCode: number | null;
+  /** AUDIT-12：仅超时 / 引擎错误 (125/126/127) / 守护进程或镜像不可用才为 true；单测失败返回 false */
+  readonly infrastructureFailure: boolean;
   readonly image: string;
   /** 完整 docker 命令（审计日志用） */
   readonly containerCommand: string;
@@ -89,9 +91,24 @@ export class DockerTestRuntime {
   }
 
   /**
+   * AUDIT-12：区分"Docker 引擎/镜像基础设施故障"与"容器内测试断言失败 (如 exitCode=1)"
+   */
+  public static isInfrastructureFailure(outcome: DockerRunOutcome): boolean {
+    if (outcome.timedOut || outcome.exitCode === null) {
+      return true;
+    }
+    if (outcome.exitCode === 125 || outcome.exitCode === 126 || outcome.exitCode === 127) {
+      return true;
+    }
+    return /cannot connect to the docker daemon|error response from daemon|unable to find image|no such image|pull access denied|permission denied.*docker/i.test(
+      outcome.output,
+    );
+  }
+
+  /**
    * 在一次性容器内执行单个 spec 套件：
    * - worktree 以只读挂载（容器内代码不可被篡改）
-   * - 结果目录以读写挂载（tee 留档，供审计）
+   * - 结果目录以读写挂载（重定向写入日志并回显内容，严格保留退出码）
    * - `--network none`（被测代码无法外联）
    * - 超时 kill 宿主 docker CLI + best-effort 强制移除容器
    */
@@ -128,7 +145,7 @@ export class DockerTestRuntime {
       this.image,
       'sh',
       '-c',
-      `node --test --test-reporter=spec --experimental-test-coverage ${containerTestPath} 2>&1 | tee /results/${resultsBasename}`,
+      `node --experimental-strip-types --test --test-reporter=spec --experimental-test-coverage "${containerTestPath}" > "/results/${resultsBasename}" 2>&1; ec=$?; cat "/results/${resultsBasename}"; exit $ec`,
     ];
 
     const outcome = this.runCommand(args, timeoutMs);
@@ -145,6 +162,7 @@ export class DockerTestRuntime {
       output: outcome.output,
       timedOut: outcome.timedOut,
       exitCode: outcome.exitCode,
+      infrastructureFailure: DockerTestRuntime.isInfrastructureFailure(outcome),
       image: this.image,
       containerCommand: `docker ${args.join(' ')}`,
     };

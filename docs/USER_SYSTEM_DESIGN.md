@@ -6,11 +6,11 @@
 > 代码基线：React 前端 + `RbacGovernanceService`（权限码体系已存在但服务端未消费）+ 无认证的 `WorkbenchServer`。
 
 > [!NOTE]
-> **实现状态（2026-11-23 更新）**：
+> **实现状态（2026-11-24 更新）**：
 >
 > - **后端 JSON 与 PG 双驱动路径（F1/F2 + 第九轮鉴权加固 + 第十二轮 AUDIT-8/D2）已落地**：`SessionService.ts`、`RbacGovernanceService.ts`、`UserStore.ts`（`JsonUserStore` + `PgUserStore` + `selectUserStore`）与 `WorkbenchServer.ts` 已实现 **10 个认证与用户管理/审计端点**（`POST /api/auth/login|logout|change-password|act-as`、`GET /api/auth/me`、`GET/POST /api/admin/users`、`PATCH /api/admin/users/:id`、`POST /api/admin/users/:id/reset-password`、`GET /api/admin/login-audit`），并配齐 §2.2 `deploy/init-pgvector-schema.sql` 用户体系 4 张表、双轨关联外键及 `team_comments`；通过 `session-service.spec.ts`（23 项）、`rbac-governance.spec.ts`（4 项）与 `pg-persistence-driver.spec.ts` Test 4–5。
-> - **尚未落地部分**：前端 `LoginView.tsx` 与 Cookie/401 权限驱动界面（`src/ui/client/**` 目前仍用 `X-Actor-Id` 与硬编码角色切换条）。
-> - **相对下述设计正文的实现差异**：① `WorkbenchServer` 采用三模式鉴权开关（`AUTH_REQUIRED=true` 全量会话校验 / 默认模式下写操作与未知 `X-Actor-Id` 严格拦截仅只读投影回落 `user-admin-01` / `AUTH_DISABLED=true` 跳过权限码校验）；② `GET /api/auth/me` 返回嵌套结构 `{ ok: true, data: { user, impersonating } }`；③ `change-password` 旧口令错与口令策略不满足均返回 `400`，管理员建人随机临时口令为 8 位 `base64url`；④ `SessionService.login()` 暂未采集 `ip`/`user_agent`，`act-as` 已写入 `loginAudit` 与 `/api/auth/me` 但暂未自动追加 `"via <admin>"` 到业务裁决记录展示名；⑤ `EnterpriseUserAccount` 暂由 `SessionService.syncSingleUserToRbac()` 直接构造（未定义 `fromAuthUserView`）。
+> - **尚未落地部分**：前端 `LoginView.tsx` 与 Cookie/401 权限驱动界面（`src/ui/client/**` 目前仍用 `X-Actor-Id` 与硬编码角色切换条，见 `BACKEND_TODO.md` §六）。
+> - **相对下述设计正文的实现差异**：① `WorkbenchServer` 采用三模式鉴权开关（`AUTH_REQUIRED=true` 全量会话校验 / 默认模式下写操作与未知 `X-Actor-Id` 严格拦截仅只读投影回落 `user-admin-01` / `AUTH_DISABLED=true` 跳过权限码校验）；② `GET /api/auth/me` 返回嵌套结构 `{ ok: true, data: { user, impersonating } }`；③ `change-password` 旧口令错与口令策略不满足均返回 `400`，管理员建人随机临时口令为 8 位 `base64url`；④ `SessionService.login()` 暂未采集 `ip`/`user_agent`，`act-as` 已写入 `loginAudit` 与 `/api/auth/me`，但尚无 `/api/auth/exit-act-as` 退出切换路径且暂未自动追加 `"via <admin>"` 到业务裁决记录展示名（见 `BACKEND_TODO.md` §六）；⑤ `EnterpriseUserAccount` 暂由 `SessionService.syncSingleUserToRbac()` 直接构造（未定义 `fromAuthUserView`）。
 
 ---
 
@@ -29,7 +29,7 @@
 1. 无登录：`WorkbenchServer.resolveActor()` 从 `X-Actor-Id` 头/`?actorId` 读取，**未知用户静默回落 admin**（`WorkbenchServer.ts:127-144`）；
 2. 花名册硬编码 7 人（`RbacGovernanceService.seedEnterpriseRoster()`），不可增删改；
 3. 权限码（`SystemPermissionCode` 8 个）在 `EnterpriseUserAccount.hasPermission()` 已实现，但**服务端所有端点均未消费**；
-4. 持久化中 `workflow_runs.created_by` / `human_decisions.reviewer_id` 是无 FK 的展示字符串（含"陈工 (PM · 资深产品经理)"这类自由文本），无法与账号关联。
+4. 持久化中 `workflow_runs.created_by` / `human_decisions.reviewer_id` 原本是无 FK 的展示字符串（含"陈工 (PM · 资深产品经理)"这类自由文本）；第十二轮 `#8` 已在 `deploy/init-pgvector-schema.sql` 补齐 `created_by_user_id` / `reviewer_user_id` 可空 FK 列，业务 upsert 填充待续见 `BACKEND_TODO.md` §六。
 
 ---
 
@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS auth_login_audit (
 -- 10. 既有业务表的用户关联（双轨迁移：新列可空 FK + 旧展示列保留）
 ALTER TABLE workflow_runs  ADD COLUMN IF NOT EXISTS created_by_user_id  VARCHAR(64) REFERENCES users(id);
 ALTER TABLE human_decisions ADD COLUMN IF NOT EXISTS reviewer_user_id    VARCHAR(64) REFERENCES users(id);
--- team_comments 尚未入 PG（D2 建表时直接带）：author_user_id VARCHAR(64) REFERENCES users(id)
+-- team_comments 已于第十二轮 #8 落地于 deploy/init-pgvector-schema.sql（表 10，含 author_user_id VARCHAR(64) REFERENCES users(id)）
 ```
 
 **JSON 降级模式**（D-2 全局决策，无 DATABASE_URL 时）：`users.json` / `sessions.json` 存等价结构于 `.runtime-data/`，字段一一对应；`UserService` 以存储驱动接口屏蔽差异。

@@ -7,13 +7,13 @@
 > 审计基线日期：2026-11-22（React 前端 + TypeScript 仿真内核版本）。
 
 > [!NOTE]
-> **执行状态（2026-11-23 更新）**：§一~§三（M1-A/B/C + M2）与 §四（M3 中的 E3/I3/J2/G11 及部分 D3）均已实现并测试通过；2026-11-23 第八/九轮继续完成审计修复 `#1–#7`。主要实现与本设计的偏差如下（逐条详见 `BACKEND_TODO_IMPL_LOG.md` 与对应模块文档）：
+> **执行状态（2026-11-24 更新）**：§一~§三（M1-A/B/C + M2）、§四（M3 中的 E3/I3/J2/G11/D3）、2026-11-23 第八/九轮 `#1–#7`、第十轮 Agent 质量治理 `DS-1~DS-4`，以及第十一至十四轮深度审计 **`#8–#14` 已全部完成并测试通过**。主要实现与本设计的偏差如下（逐条详见 `BACKEND_TODO_IMPL_LOG.md` 与对应模块文档）：
 >
-> - **D2**：未引入 `pg` npm 原生驱动，改用零依赖 `psql` CLI 同步；`PgPersistenceDriver` 尚未在生产链路接线且 `loadFullState()` 仍返回 `null`（见 `BACKEND_TODO.md` §五 `#8`）。
-> - **E2**：采用 `node --test --test-reporter=spec --experimental-test-coverage` 与 `TestResultParser`，而非 `--test-reporter=tap`。
-> - **F1**：`SessionService` 使用 `SHA-256(token)` 会话键；`WorkbenchServer` 采用三模式鉴权开关（`AUTH_REQUIRED=true` / 默认写严格拦截 / `AUTH_DISABLED=true`）；前端 `LoginView.tsx` 尚未迁移。
+> - **D2**：未引入 `pg` npm 原生驱动，改用零依赖 `psql` CLI 同步；第十四轮前的接线与 `loadFullState()` 缺口已于第十二轮 `#8` 补齐——`PgPersistenceDriver` 已通过 `selectPersistenceDriver()` 接入 `PersistenceRepository`，`buildPgUpsertSql()` 覆盖 6 张业务表（含 `negotiation_logs`、`team_comments` 与真实 `token_budget`），`loadFullState()` 执行完整 PG 恢复，且 `PgUserStore` + 4 张用户表已落地；遗留双轨外键字段填充、PG 缺失运行态表及异步化跟踪于 `BACKEND_TODO.md` §六。
+> - **E2 / E3**：采用 `node --test --test-reporter=spec --experimental-test-coverage` 与 `TestResultParser`（而非 `--test-reporter=tap`）；E3 改用 `docker CLI` + POSIX 重定向与 `exit $ec` 并以 `infrastructureFailure` 区分单测失败与引擎故障（而非 `dockerode`）。
+> - **F1**：`SessionService` 使用 `SHA-256(token)` 会话键；`WorkbenchServer` 采用三模式鉴权开关（`AUTH_REQUIRED=true` / 默认写严格拦截 / `AUTH_DISABLED=true`）；前端 `LoginView.tsx` 与 React 构建恢复尚未完成（见 `BACKEND_TODO.md` §六）。
 > - **G1/G2**：新增抽象 `EmbeddingProvider` 与后台串行向量升级。
-> - **M3 & 待办**：`H1–H3` 外部集成挂起于 `P2_REMAINING_PLAN.md`；深度复核新定位的 **7 项未修复缺陷（`#8–#14`，涉及 D1/D2/D3/E3/A2/B3/I1）** 跟踪于 `BACKEND_TODO.md` §五。
+> - **M3 & 待办**：`H1–H3` 外部集成挂起于 `P2_REMAINING_PLAN.md`；2026-11-23 深度审计 `#8–#14` 已全部清零；**2026-11-24 全项目完整度复审新发现的前后端联调、安全与并发待办统一跟踪于 `BACKEND_TODO.md` §六**。
 
 ---
 

@@ -53,7 +53,7 @@
 4. 体检端点在线（mock transport）→ 2 层级 × 3 任务 = 6 份报告全通过、含 taskName
 5. 默认模式下无会话 → 403
 
-**完成时测试基线**：112 项（108 过 / 4 既有 skip / 0 失败）；typecheck（含前端）+ eslint + prettier 全绿；UI bundle 已构建。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
+**完成时测试基线**：112 项（108 过 / 4 既有 skip / 0 失败）；typecheck（含前端）+ eslint + prettier 全绿；UI bundle 已构建。（当前全库基线：169 项 / 48 套件 / 28 文件，165 过 / 4 既有 skip）
 
 ## 遗留
 

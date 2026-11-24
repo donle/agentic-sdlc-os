@@ -5,6 +5,7 @@
  */
 
 import * as assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -13,6 +14,7 @@ import { describe, it } from 'node:test';
 import { ProjectProposalContract } from '../src/domain/contracts.ts';
 import { WorkflowOrchestratorFacade } from '../src/engine/WorkflowOrchestratorFacade.ts';
 import { GitWorktreeSandboxManager } from '../src/sandbox/GitWorktreeSandboxManager.ts';
+import { RealGitWorktree } from '../src/sandbox/RealGitWorktree.ts';
 
 describe('Block 4 — Git Worktree 隔离代码与测试沙箱管理器测试套件', () => {
   it('1. 应在隔离沙箱目录中真实生成面向对象业务类与单测文件，并通过子进程 node --test 真实执行通过', async () => {
@@ -151,6 +153,68 @@ describe('Block 4 — Git Worktree 隔离代码与测试沙箱管理器测试套
     } finally {
       fs.rmSync(tempSandboxRoot, { recursive: true, force: true });
       fs.rmSync(tempPersistDir, { recursive: true, force: true });
+    }
+  });
+
+  it('4. AUDIT-11：RealGitWorktree.remove() 按 porcelain stanza 精确绑定分支，仅清理目标 worktree 并保留其他 worktree', () => {
+    // 1. 验证多 stanza porcelain 解析逻辑
+    const samplePorcelain = [
+      'worktree /repo/main',
+      'HEAD 1111111',
+      'branch refs/heads/main',
+      '',
+      'worktree /sandbox/.worktrees/RUN-A/branch-a',
+      'HEAD 2222222',
+      'branch refs/heads/worktree/RUN-A/branch-a',
+      '',
+      'worktree /sandbox/.worktrees/RUN-B/branch-b',
+      'HEAD 3333333',
+      'branch refs/heads/worktree/RUN-B/branch-b',
+      '',
+    ].join('\n');
+    const parsedEntries = RealGitWorktree.parsePorcelainWorktrees(samplePorcelain);
+    assert.equal(parsedEntries.length, 3);
+    assert.equal(parsedEntries[1].worktreePath, '/sandbox/.worktrees/RUN-A/branch-a');
+    assert.equal(parsedEntries[1].branchRef, 'refs/heads/worktree/RUN-A/branch-a');
+
+    // 2. 在真实临时 Git 仓库创建 2 个 worktree，精确移除 branchA 并保留 branchB
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'audit11-wt-'));
+    const repoDir = path.join(tempRoot, 'repo');
+    const wtRoot = path.join(tempRoot, 'sandboxes');
+    try {
+      fs.mkdirSync(repoDir, { recursive: true });
+      execFileSync('git', ['init'], { cwd: repoDir });
+      execFileSync('git', ['config', 'user.email', 'ci@example.com'], { cwd: repoDir });
+      execFileSync('git', ['config', 'user.name', 'CI Bot'], { cwd: repoDir });
+      fs.writeFileSync(path.join(repoDir, 'README.md'), 'init\n', 'utf-8');
+      execFileSync('git', ['add', 'README.md'], { cwd: repoDir });
+      execFileSync('git', ['commit', '-m', 'init'], { cwd: repoDir });
+
+      const realGit = new RealGitWorktree(repoDir, wtRoot);
+      const wtA = realGit.add('RUN-A', 'branch-a');
+      const wtB = realGit.add('RUN-B', 'branch-b');
+
+      assert.equal(fs.existsSync(wtA.workspacePath), true);
+      assert.equal(fs.existsSync(wtB.workspacePath), true);
+      fs.writeFileSync(path.join(wtB.workspacePath, 'keep.txt'), 'keep-b\n', 'utf-8');
+
+      // 执行 remove(wtA.branchName)：路径不含 "/worktree/"，必须按 stanza 仅移除 wtA
+      realGit.remove(wtA.branchName);
+
+      assert.equal(fs.existsSync(wtA.workspacePath), false, '目标 worktree 目录应已被移除');
+      assert.equal(fs.existsSync(wtB.workspacePath), true, '非目标 worktree 目录绝不可被误删');
+      assert.equal(
+        fs.readFileSync(path.join(wtB.workspacePath, 'keep.txt'), 'utf-8').trim(),
+        'keep-b',
+      );
+
+      const remainingBranches = execFileSync('git', ['-C', repoDir, 'branch', '--list'], {
+        encoding: 'utf-8',
+      });
+      assert.equal(remainingBranches.includes(wtA.branchName), false, '目标分支应已被删除');
+      assert.equal(remainingBranches.includes(wtB.branchName), true, '其他分支必须完整保留');
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
 });

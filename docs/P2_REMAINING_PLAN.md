@@ -1,6 +1,6 @@
 # P2 剩余任务计划与 H 系列分析（决策记录）
 
-> 记录日期：2026-11-23。前置状态：首轮 M1-M7 Mockup 替代与初始 P0/P1 清单已清零；2026-11-23 深度审计新增 **2 项 P0（`#8–#9`）+ 5 项 P1（`#10–#14`）** 待修复（详见 `BACKEND_TODO.md` §五与 `BACKEND_TODO_IMPL_LOG.md`），**优先级高于本文 P2 项**。
+> 记录日期：2026-11-24。前置状态：首轮 M1-M7 Mockup 替代、初始 P0/P1 清单，以及 2026-11-23 深度审计 **2 项 P0（`#8–#9`）+ 5 项 P1（`#10–#14`）** 已于第十一至十四轮全部清零（详见 `BACKEND_TODO.md` §五与 `BACKEND_TODO_IMPL_LOG.md`）；**2026-11-24 全项目完整度复审新发现的前后端联调、安全与并发待办已登记至 `BACKEND_TODO.md` §六，优先级高于本文挂起的 H 系列。**
 > 本文是 H1-H3 / I3 / J2 / G11 的**目的与核心逻辑分析 + 实施决策**，开工前按此执行，勿重复分析。
 
 ---
@@ -65,17 +65,17 @@ G10 已建成摄取**框架**（ToolRegistry + ContextProvider 接口 + stub 补
 
 ## 三、原 P2 候选任务现状与边界
 
-| 编号             | 状态      | 实现要点与现状边界                                                                                                                                                                                                             |
-| :--------------- | :-------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| I3 数据保留      | ✅ 已实现 | `PersistenceRepository` 审计 WAL 按月分片；`GitWorktreeSandboxManager.enforceWorktreeRetention` 默认保留最近 `N=10` 个 run；详见 `I3_DATA_RETENTION.md`（含终态钩子与 `docker-results` 边界说明）                              |
-| J2 可插拔节点    | ✅ 已实现 | 通过 `AgentRegistry.registerCustomStage(descriptor)` 动态注册元数据、RBAC 角色映射配置化，并接入 `isValidStageId()`/`isValidAgentRole()`（替代单纯枚举白名单）；当前自定义节点按检查点语义执行，详见 `J2_PLUGGABLE_NODES.md`   |
-| G11 Stage 5 闭环 | ✅ 已实现 | `WarehouseQueryProvider` + `createAnalyticsProvider()` 三级选择（`WAREHOUSE_MCP_URL` → `WAREHOUSE_CONNECTION_STRING` 只读 SQL → `WarehouseStubProvider`）；详见 `G11_WAREHOUSE_CLOSED_LOOP.md`（容器直连 `psql` 缺口见 `#14`） |
+| 编号             | 状态      | 实现要点与现状边界                                                                                                                                                                                                                                   |
+| :--------------- | :-------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| I3 数据保留      | ✅ 已实现 | `PersistenceRepository` 审计 WAL 按月分片；`GitWorktreeSandboxManager.enforceWorktreeRetention` 默认保留最近 `N=10` 个 run；详见 `I3_DATA_RETENTION.md`（含终态钩子与 `docker-results` 边界说明）                                                    |
+| J2 可插拔节点    | ✅ 已实现 | 通过 `AgentRegistry.registerCustomStage(descriptor)` 动态注册元数据、RBAC 角色映射配置化，并接入 `isValidStageId()`/`isValidAgentRole()`（替代单纯枚举白名单）；当前自定义节点按检查点语义执行，详见 `J2_PLUGGABLE_NODES.md`                         |
+| G11 Stage 5 闭环 | ✅ 已实现 | `WarehouseQueryProvider` + `createAnalyticsProvider()` 三级选择（`WAREHOUSE_MCP_URL` → `WAREHOUSE_CONNECTION_STRING` 只读 SQL → `WarehouseStubProvider`）；详见 `G11_WAREHOUSE_CLOSED_LOOP.md`（容器内 `postgresql-client` 已于第十四轮 `#14` 补齐） |
 
-## 四、建议实施顺序（2026-11-23 用户决策更新）
+## 四、建议实施顺序（2026-11-24 用户决策更新）
 
 > **用户决策：H 系列的实际接入信息打问号**——外部系统凭证、字段映射语义需业务侧再思考，
 > **H1/H2/H3 整体挂起**，等业务输入后按本文件第二节的范围决策执行。
-> **I3 → G11 → J2** 已全部完成，当前更高优先级为 `BACKEND_TODO.md` §五中的 `#8–#14`（P0/P1 审计缺陷）。
+> **I3 → G11 → J2** 与 **`#8–#14`（2026-11-23 深度审计全部 P0/P1 缺陷）已全部清零**，当前更高优先级为 `BACKEND_TODO.md` §六（2026-11-24 全项目完整度复审：前端 React 构建/鉴权联调、安全与并发加固等）。
 
 | 顺序 | 任务                                                                   | 状态                                                   |
 | :--- | :--------------------------------------------------------------------- | :----------------------------------------------------- |
@@ -86,12 +86,12 @@ G10 已建成摄取**框架**（ToolRegistry + ContextProvider 接口 + stub 补
 
 ## 五、挂起项与全库 4 项 `skip` 明细（有意不做或待清理，勿当遗漏）
 
-| 项                                                          | 状态                 | 原因                                                                                                                                                                                                              |
-| :---------------------------------------------------------- | :------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| L3 增量缓存                                                 | 暂缓（已与用户确认） | 需产物粒度依赖追踪，等真实回退频率数据再决策                                                                                                                                                                      |
-| B3 预算熔断精确阈值测试（`a1-llm-integration.spec` test 5） | skip                 | **当前全库无活跃 `ABORTED_TOKEN_BUDGET` 断言**；根因在于 test 5 传内联 YAML 字符串给 `reloadWorkflowDsl()`（`Facade` 误作文件路径传入 `loadFromFile()` 而非 `parseFromString()`）及 Prompt Token 估算阈值需重标定 |
-| `a1-llm-integration.spec` test 2（缺字段自愈按阶段路由）    | skip                 | `full-pipeline-llm.spec.ts` test 3 已覆盖同一行为                                                                                                                                                                 |
-| `test-result-parser.spec` test 3（Windows 进程超时标记）    | skip                 | Node `child_process` 在不同 OS 下对超时进程的 `killed` 标志表现不一致（Windows 兼容保留）                                                                                                                         |
-| `test-result-parser.spec` test 5（空输出文件解析兼容）      | skip                 | 不同 Node 次版本在 `--test-reporter=spec` 遇到空测试文件时的输出格式存在差异                                                                                                                                      |
-| Agent 降级路径独立单测                                      | 低优                 | 降级路径由离线集成测试间接覆盖                                                                                                                                                                                    |
-| H2 完整字段映射 / H3 真实 Figma 拉取 / G11 真实数仓         | 等部署环境           | 需外部系统凭证                                                                                                                                                                                                    |
+| 项                                                          | 状态                 | 原因                                                                                                                                                                                                                                       |
+| :---------------------------------------------------------- | :------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| L3 增量缓存                                                 | 暂缓（已与用户确认） | 需产物粒度依赖追踪，等真实回退频率数据再决策                                                                                                                                                                                               |
+| B3 预算熔断精确阈值测试（`a1-llm-integration.spec` test 5） | skip（已另测覆盖）   | **`ABORTED_TOKEN_BUDGET` 与追加预算扩容重启已在 `tests/retry-and-concurrency-sse.spec.ts` Test 2 活跃覆盖**；该既有 skip 源于向 `reloadWorkflowDsl()` 传内联 YAML 字符串（`Facade` 误作文件路径传入 `loadFromFile()` 而非直接传 DSL 对象） |
+| `a1-llm-integration.spec` test 2（缺字段自愈按阶段路由）    | skip                 | `full-pipeline-llm.spec.ts` test 3 已覆盖同一行为                                                                                                                                                                                          |
+| `test-result-parser.spec` test 3（Windows 进程超时标记）    | skip                 | Node `child_process` 在不同 OS 下对超时进程的 `killed` 标志表现不一致（Windows 兼容保留）                                                                                                                                                  |
+| `test-result-parser.spec` test 5（空输出文件解析兼容）      | skip                 | 不同 Node 次版本在 `--test-reporter=spec` 遇到空测试文件时的输出格式存在差异                                                                                                                                                               |
+| Agent 降级路径独立单测                                      | 低优                 | 降级路径由离线集成测试间接覆盖                                                                                                                                                                                                             |
+| H2 完整字段映射 / H3 真实 Figma 拉取 / G11 真实数仓         | 等部署环境           | 需外部系统凭证                                                                                                                                                                                                                             |

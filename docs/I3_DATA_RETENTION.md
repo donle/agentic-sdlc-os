@@ -17,7 +17,7 @@
   `audit-trail.jsonl` 兼容读取**（历史数据不丢，排在其后）。
 - `getWalFileNames()` 公开分片清单（观测/测试用）。
 - 非法时间戳回落当前月份（不产生畸形文件名）。
-- D1 无影响：恢复走 `ledger-store.json` 快照，JSONL 从不重放。
+- D1 恢复（第十一轮 `#9` 修复后）：`StateReconstructor.restore()` 通过 `PersistenceRepository.readAuditWalEntries()` 合并全部月度分片与旧单文件 `audit-trail.jsonl`，调用 `ImmutableAuditLedger.restoreAuditEntry()` 仅在内存重建 `auditEntries`（不重复写回 WAL，也不触发二次 RAG 沉淀）。
 
 ### 2. worktree 保留策略（`GitWorktreeSandboxManager.enforceWorktreeRetention`）
 
@@ -48,7 +48,7 @@
 4. 保留策略：5 目录 N=2 → 清理 3 个最旧的；`protectRunIds` 无视新旧存活
 5. Facade 终态钩子：散文输出 → ABORTED → 钩子自动清理最旧 run（N=1，端到端）
 
-**完成时测试基线**：122 项（118 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：143 项 / 45 套件，139 过 / 4 既有 skip）
+**完成时测试基线**：122 项（118 过 / 4 既有 skip / 0 失败）；typecheck + lint + prettier 全绿。（当前全库基线：169 项 / 48 套件 / 28 文件，165 过 / 4 既有 skip）
 
 ## 遗留
 
